@@ -59,10 +59,12 @@ pub fn build(config: &Config) -> Result<Arc<dyn Backend>, FactoryError> {
         #[cfg(not(feature = "vnc"))]
         BackendKind::Vnc => Err(FactoryError::NotCompiledIn("vnc")),
 
-        // SPICE is feature-gated and deferred: its image codecs -- QUIC and
-        // GLZ -- have no Rust implementations, and GLZ is stateful across
-        // images, so the backend needs an FFI binding to `spice-common` or a
-        // port of its decoders (`docs/spice-protocol.md` §5.1).
+        // SPICE is feature-gated and still deferred, but no longer on the
+        // codecs: `solstice-spice-codec` decodes QUIC, LZ and GLZ, which was
+        // the gating item (`docs/roadmap.md` §2.2). What is left is the
+        // protocol above them -- the channel link handshake, the display
+        // channel's 2D rasteriser, and the agent (`docs/roadmap.md` §2.3,
+        // milestones M1 to M3 and M6).
         BackendKind::Spice => Err(FactoryError::NotImplemented("spice")),
     }
 }

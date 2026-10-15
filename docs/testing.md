@@ -280,10 +280,12 @@ From `xf86-video-qxl/scripts/Xspice`:
 --audio-fifo-dir     playback channel fed from PulseAudio module-pipe-sink
 ```
 
-`--image-compression` offers exactly the choices QEMU's `-spice` does. That is
-the lever for the risk flagged in `spice-protocol.md` §5.1 — QUIC and GLZ have
-no Rust implementations and GLZ is stateful across images. Force each one
-rather than hoping the server's heuristics pick it:
+`--image-compression` offers exactly the choices QEMU's `-spice` does. The
+decoders now exist — `crates/solstice-spice-codec`, tested differentially
+against the real C encoders (§4.3) — so this is no longer about whether the
+codec can be read at all. It is about whether a *server* agrees, which is a
+separate question the vectors cannot answer. Force each one rather than hoping
+the server's heuristics pick it:
 
 ```sh
 Xspice --port 5930 --disable-ticketing --image-compression off  --streaming-video off  # baseline
@@ -294,7 +296,9 @@ Xspice --port 5930 --disable-ticketing --image-compression auto_glz --streaming-
 
 Build the SPICE backend against `--image-compression off` first, then add
 codecs one flag at a time. GLZ needs *long* sessions, not single frames — its
-history window is the whole point and the bugs are in window management.
+history window is the whole point and the bugs are in window management, which
+is exactly the part frozen vectors cannot exercise: they replay a window of
+eight images, and a real session churns thousands.
 `--streaming-video all` is the one that breaks naive compositing, because
 streams are clipped sub-rectangles layered over the draw commands; turn it on
 early enough to find that out cheaply.
@@ -317,6 +321,35 @@ QEMU this covers the protocol well, but it does **not** cover QXL guest-driver
 behaviour — a real VM's driver emits different draw-command mixes than the
 Xspice video driver does. Worth one manual QEMU run before a release, not a CI
 job.
+
+### 4.3 The image codecs, without a server
+
+`crates/solstice-spice-codec` is a from-scratch port of QUIC, LZ and GLZ, and
+nothing about those codecs can be checked by reading the code: QUIC's Golomb
+model evolves pseudo-randomly in lockstep with the encoder, and GLZ's
+dictionary spans the session. A round-trip against a Rust encoder would only
+prove the port is self-consistent with itself.
+
+So the oracle is the C, the same way FEC's is `nanors` (§2.3).
+`tests/vectors/spice/dump.c` links `spice-common`'s QUIC and LZ and records
+both the compressed bytes **and** the pixels the C decoder makes of them;
+`glz-dump.c` links `spice-server`'s GLZ encoder. The 278 cases are frozen as
+gzipped JSON so CI needs no C toolchain, no glib and no network —
+`tests/vectors/spice/README.md` has the build and the reasoning, including the
+one place the expected pixels are derived rather than C-generated.
+
+A GLZ vector is a **window**, not an image: a sequence encoded through one
+dictionary, which must be replayed through one decoder in order. One of the
+windows uses a dictionary too small to hold its own sequence, so images are
+evicted and the release path runs rather than just the lookups.
+
+Two things this deliberately does not do, and the second is the one to
+remember:
+
+- It does not test the codecs under a *server's* choices. The images are this
+  repository's, not a guest's. §4 and §4.2 are still the real test.
+- **It cannot test a long GLZ session.** That is what `--image-compression glz`
+  against Xspice is for, and why the staged plan puts GLZ last.
 
 ---
 
@@ -362,13 +395,21 @@ on push:      T0 unit/property                      ~20 s
 nightly:      T4 Xvnc  × encodings × security       ~10 min
               T4 Xspice × image-compression × streaming-video × vdagent  ~10 min
               T4 loss injection sweep               ~10 min
-              T5 cargo-fuzz on the five parsers     ~2 h
+              T5 cargo-fuzz on the seven parsers    ~2 h
 ```
 
 The nightly tier is now a sweep over *one* server's flags rather than a matrix
 of servers, which is both faster and more deterministic — the same binary with
 a different flag isolates the variable properly, where swapping servers
 confounds it.
+
+The two SPICE codec targets are worth running first when the budget is short.
+Both have already paid for themselves in minutes rather than hours:
+`spice_quic` found a 23-byte header asking the decoder for a 151 MiB image,
+and `spice_lz` found a width whose stride overflowed a `u32` before anything
+had a chance to reject it. Both now have named regression tests; neither was
+reachable from the differential vectors, because the C encoders do not emit
+malformed headers.
 
 Two practical constraints:
 

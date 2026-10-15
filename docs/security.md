@@ -295,10 +295,30 @@ plaintext SPICE connection the same as a plaintext VNC one — loopback only.
    normally trusted — but if the backend is a VM the user does not fully
    control, it is an inbound attack surface. Decompression bombs are the
    obvious one: enforce output-size limits.
-5. **FFI undoes Rust's guarantees.** An `openh264`, FFmpeg, `spice-common` or
-   `nanors` binding puts C back in the data path for attacker-influenced input.
-   Keep the `unsafe` boundary thin, validate before crossing it, and consider
+
+   The SPICE codecs are implemented rather than bound to
+   (`crates/solstice-spice-codec`, `docs/roadmap.md` §2.2), which puts them
+   inside `#![forbid(unsafe_code)]` and makes this item about *cost* rather
+   than about memory safety. Three limits carry it: every LZ and GLZ offset
+   and length is bounds-checked before use; the GLZ window is capped, because
+   its size is the server's choice; and the image itself is capped, because
+   two header fields decide how much work a decode is before any of it can be
+   validated. **A display channel should set `Limits::max_pixels` from the
+   surface it is drawing into** — the default is a generous fallback, not a
+   policy.
+5. **FFI undoes Rust's guarantees.** An `openh264`, FFmpeg or `nanors`
+   binding puts C back in the data path for attacker-influenced input. Keep
+   the `unsafe` boundary thin, validate before crossing it, and consider
    running the encoder in a separate process if the threat model warrants it.
+
+   This is the argument that decided against an FFI binding to
+   `spice-common` for the image codecs. It is worth being precise about why,
+   because the conclusion is not the usual one: the C decoders *do* bound
+   their back-references and run lengths — with `spice_assert` and
+   `spice_extra_assert`, which compile out in release builds. On a release
+   build an LZ stream whose first instruction is a back-reference reads before
+   the start of its own buffer. Keeping the boundary thin would not have
+   helped, because the part most worth validating was on the far side of it.
 6. **UPnP / NAT-PMP.** Sunshine can punch its own holes. **Do not implement
    this.** Automatically making a service internet-reachable is a decision for
    the operator.
