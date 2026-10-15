@@ -1,0 +1,16 @@
+[package]
+name = "solstice-backend"
+description = "Backend-neutral seam: framebuffer, damage, input and audio types shared by the VNC and SPICE backends"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+bytes.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[lints.rust]
+missing_docs = "warn"

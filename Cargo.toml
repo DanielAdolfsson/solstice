@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+exclude = ["fuzz"]
+members = [
+    "crates/solstice",
+    "crates/solstice-gamestream",
+    "crates/solstice-backend",
+    "crates/solstice-vnc",
+    "crates/solstice-video",
+    "crates/solstice-input",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/phyrondev/solstice"
+
+[workspace.dependencies]
+solstice-backend = { path = "crates/solstice-backend" }
+solstice-gamestream = { path = "crates/solstice-gamestream" }
+solstice-input = { path = "crates/solstice-input" }
+solstice-video = { path = "crates/solstice-video" }
+solstice-vnc = { path = "crates/solstice-vnc" }
+
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+tokio = "1"
+serde = { version = "1", features = ["derive"] }
+
+# RSA key generation is unusably slow in an unoptimised build, and the pairing
+# tests generate keys. Optimise just those crates in the dev profile.
+[profile.dev.package.rsa]
+opt-level = 3
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+
+[workspace.metadata]
+# `fuzz/` is its own workspace: cargo-fuzz builds it with a nightly toolchain
+# and its own profile, and pulling libfuzzer into the main lockfile would make
+# a stable `cargo test` depend on a nightly-only crate.

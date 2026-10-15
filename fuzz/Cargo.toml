@@ -1,0 +1,45 @@
+[package]
+name = "solstice-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+solstice-gamestream = { path = "../crates/solstice-gamestream" }
+solstice-vnc = { path = "../crates/solstice-vnc" }
+solstice-backend = { path = "../crates/solstice-backend" }
+tokio = { version = "1", features = ["rt", "macros", "io-util"] }
+
+[[bin]]
+name = "rtsp_message"
+path = "fuzz_targets/rtsp_message.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sdp_announce"
+path = "fuzz_targets/sdp_announce.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "input_batch"
+path = "fuzz_targets/input_batch.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "control_envelope"
+path = "fuzz_targets/control_envelope.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rfb_rect"
+path = "fuzz_targets/rfb_rect.rs"
+test = false
+doc = false

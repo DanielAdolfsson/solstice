@@ -1,0 +1,59 @@
+# cargo-deny policy.
+#
+# Solstice is **GPL-3.0-or-later**, which decides how to read this file.
+#
+# Dependency licences must be compatible with GPL-3 — permissive licences are,
+# one-way, and so is GPL-3 itself. That is a looser constraint than it was when
+# the project was MIT/Apache, where a GPL dependency would have been a licence
+# conflict. It is *not* a reason to stop paying attention: a GPL dependency is
+# now legal but still a deliberate choice, and the bans below keep it one.
+#
+# Not compatible, and so absent from the allow list: GPL-2.0-only (no "or
+# later" upgrade path to 3), and anything with an advertising clause.
+
+[licenses]
+version = 2
+allow = [
+    # Permissive, all one-way compatible with GPL-3.
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+    # Same licence as the project.
+    "GPL-3.0-only",
+    "GPL-3.0-or-later",
+    "LGPL-2.1-or-later",
+    "LGPL-3.0-or-later",
+]
+confidence-threshold = 0.9
+# The list above is the *compatible* set, not the *encountered* set. GPL-3,
+# LGPL and MPL-2.0 are allowed because they would be fine if they turned up,
+# and saying so is the policy; cargo-deny would otherwise warn about each one
+# no dependency happens to use today.
+unused-allowed-license = "allow"
+
+
+[bans]
+multiple-versions = "allow"
+# Now a dependency-weight decision rather than a licence one. Both pull a large
+# native build into what is otherwise a cc-and-nothing-else tree, and both
+# belong behind the `ffmpeg` feature when that feature exists. Remove the entry
+# deliberately, with the feature, rather than by accident.
+deny = [
+    { name = "ffmpeg-sys-next" },
+    { name = "x264" },
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

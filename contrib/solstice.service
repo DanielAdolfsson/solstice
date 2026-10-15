@@ -1,0 +1,71 @@
+# Hardened systemd unit for Solstice.
+#
+# Solstice converts network packets into keystrokes on someone's desktop:
+# authentication *is* the security boundary and there is nothing behind it. The
+# hardening below is the least-privilege half of `docs/security.md` §6.7, which
+# cites GHSA-fp6g-27w5-489j -- untrusted GUI modules executing with Sunshine's
+# Linux capabilities -- as the cautionary case.
+#
+# Install:
+#   sudo useradd --system --home /var/lib/solstice --shell /usr/sbin/nologin solstice
+#   sudo install -d -o solstice -g solstice -m 0750 /var/lib/solstice
+#   sudo install -D -m 0644 contrib/solstice.service /etc/systemd/system/solstice.service
+#   sudo install -D -m 0640 -o root -g solstice \
+#        contrib/solstice.example.toml /etc/solstice/solstice.toml
+#   sudo systemctl daemon-reload && sudo systemctl enable --now solstice
+
+[Unit]
+Description=Solstice: a Moonlight host that bridges to VNC or SPICE
+Documentation=https://github.com/phyrondev/solstice
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=solstice
+Group=solstice
+ExecStart=/usr/local/bin/solstice --config /etc/solstice/solstice.toml run
+Restart=on-failure
+RestartSec=5s
+
+# No capabilities at all: Solstice binds ports above 1024 and touches nothing
+# privileged.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+
+# The only writable path, and it holds the host key and the paired-client list.
+StateDirectory=solstice
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/solstice
+
+# IPv4 and IPv6 only. No netlink, no packet sockets, no unix sockets to
+# anywhere that is not ours.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Solstice never launches a process -- that is the deliberate difference from
+# Sunshine, whose worst CVEs are command injection from its config UI.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @reboot @swap @obsolete
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

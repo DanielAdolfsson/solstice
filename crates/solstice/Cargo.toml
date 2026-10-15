@@ -1,0 +1,53 @@
+[package]
+name = "solstice"
+description = "A proxy that lets a Moonlight client connect to a VNC or SPICE desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+default-run = "solstice"
+
+[features]
+default = ["vnc", "openh264"]
+vnc = ["dep:solstice-vnc"]
+openh264 = ["solstice-video/openh264"]
+# SPICE is deliberately excludable along with its dependency tree; the backend
+# itself is not implemented yet (see README).
+spice = []
+
+[dependencies]
+solstice-backend.workspace = true
+solstice-gamestream.workspace = true
+solstice-video.workspace = true
+solstice-vnc = { workspace = true, optional = true }
+
+bytes.workspace = true
+serde = { workspace = true }
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["full"] }
+
+clap = { version = "4", features = ["derive", "env"] }
+toml = "0.9"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pki-types = "1"
+rustls-pemfile = "2.2"
+rusty_enet = "0.4"
+humantime-serde = "1"
+ipnet = { version = "2", features = ["serde"] }
+hex = "0.4"
+rand = "0.9"
+async-trait = "0.1.92"
+humantime = "2.4.0"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+solstice-gamestream.workspace = true
+openh264 = "0.9"
+rustls-pemfile = "2.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints.rust]
+missing_docs = "warn"

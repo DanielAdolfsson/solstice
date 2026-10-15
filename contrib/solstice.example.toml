@@ -1,0 +1,51 @@
+# Solstice configuration.
+#
+# Every value below is the default; the file exists to document them. Read
+# docs/security.md before changing `server.bind` or `security.allow_pairing_from`.
+
+[server]
+name      = "solstice"
+# Not 0.0.0.0. Put Solstice behind WireGuard or Tailscale instead -- the
+# GameStream pairing step is gated by a four-digit PIN over plaintext HTTP.
+bind      = "127.0.0.1"
+port      = 47989          # every other port is a fixed offset from this
+state_dir = "/var/lib/solstice"
+app_title = "Desktop"
+
+[security]
+# Require SS_ENC_VIDEO | SS_ENC_AUDIO and refuse clients that will not
+# negotiate them. The stream is someone's screen, not a game.
+require_encryption = true
+# Pairing is opened by `solstice pair --pin NNNN`, never by the config file.
+pairing_enabled    = false
+pairing_window     = "60s"
+max_pair_attempts  = 3
+# Empty means loopback only. Widen this deliberately, if at all.
+allow_pairing_from = []
+
+[limits]
+max_sessions     = 1
+max_width        = 1920
+max_height       = 1080
+max_fps          = 60
+max_bitrate_kbps = 20000
+
+[video]
+encoder        = "openh264"
+fec_percentage = 20
+
+[audio]
+# The RFB backend has no audio, so this sends Opus silence.
+enabled = true
+
+[backend]
+# "vnc", "spice" (not implemented) or "testpattern".
+kind = "testpattern"
+
+[backend.vnc]
+host     = "127.0.0.1"
+port     = 5900
+# "none" and "vncauth" are refused against anything but loopback.
+security = "vencrypt"
+# password = "..."
+# ca_file  = "/etc/solstice/vnc-ca.pem"

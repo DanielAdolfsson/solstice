@@ -1,0 +1,24 @@
+[package]
+name = "solstice-video"
+description = "Colour conversion, the synthetic frame clock, and the H.264 encoder abstraction"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["openh264"]
+# BSD-2 licensed, with Cisco's binary patent grant. The default because it is
+# the lightest encoder to build, not for licence reasons -- Solstice is
+# GPL-3.0-or-later, so a GPL encoder would be compatible too. See
+# PROJECT-LAYOUT.md Sec 4.
+openh264 = ["dep:openh264"]
+
+[dependencies]
+solstice-backend.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+openh264 = { version = "0.9", optional = true }
+
+[lints.rust]
+missing_docs = "warn"
