@@ -422,49 +422,50 @@ async fn guest_eventually(guest: &Guest, script: &str, wanted: &str) -> Result<S
     Err(format!("`{script}` never produced {wanted:?}; last saw: {last:?}"))
 }
 
-/// `docs/roadmap.md` §2.7's first bullet, reopened with a sharper question.
+/// `docs/roadmap.md` §2.7's first bullet: the client half is now validated,
+/// and the guest half cannot be validated in this configuration.
 ///
-/// Ignored, deliberately, and the reason is the finding: **a correct
-/// `MONITORS_CONFIG` reaches QEMU and nothing happens.** What was established,
-/// in order, each by measurement rather than inference:
+/// Ignored because it cannot pass here, not because it is unfinished. What is
+/// established, each by measurement:
 ///
-/// - A real `spice-vdagent` and `spice-vdagentd` do run in the guest and do
-///   connect. The server grants the agent tunnel 10 tokens, the guest
-///   announces its capabilities, and `can_resize()` becomes true. (Getting
-///   this far needed three fixes to the guest: `spice-vdagentd` takes `-x`,
-///   not `-X`; it needs the `uinput` module loaded or it starts and then
-///   cannot inject; and it needs `/run/spice-vdagentd/` to exist and a
-///   machine-id, or it fails quietly on each.)
-/// - Solstice then emits exactly one 48-byte `AGENT_DATA`: a 20-byte
-///   `VDAgentMessage` header and a 28-byte body of
-///   `num_of_monitors=1, flags=0, height, width, depth=32, x=0, y=0`, in that
-///   order, which is what `vd_agent.h` specifies. Tokens are available and the
-///   message is drained rather than queued.
-/// - `spice-vdagentd` running at `-d -d` logs **no inbound client message at
-///   all** -- not this one, not the capability announcement.
-/// - The QXL device does not see it either: the kernel's preferred mode stays
-///   at its default. An earlier reading of mine that it *had* changed was
-///   wrong, and wrong in an instructive way -- the test had asked for
-///   1024x768, which is already this device's default preferred mode, so the
-///   observation carried no information. Asking for 1152x864 instead makes
-///   the signal unambiguous, and it never arrives.
+/// - A real `spice-vdagent` and `spice-vdagentd` run and connect, the server
+///   grants the agent tunnel 10 tokens, the guest announces its capabilities,
+///   `can_resize()` becomes true, and mouse mode flips to `Client`. (Getting
+///   there needed three guest fixes, each of which fails silently:
+///   `spice-vdagentd` takes `-x` not `-X`; it needs the `uinput` module; and
+///   it needs `/run/spice-vdagentd/` plus a machine-id.)
 ///
-/// So the client→guest-agent direction is not working end to end, and the
-/// break is at or after QEMU's `spice-server`. Ruled out so far: the message
-/// encoding, the capability gate (`VD_AGENT_CAP_MONITORS_CONFIG` is
-/// announced), token starvation, and the `AGENT_START` token count (tried
-/// both `u32::MAX` and 10).
+/// - **Solstice's agent tunnel is correct.** A `CLIPBOARD_GRAB` emitted in the
+///   same drain, immediately before the monitors config, arrives at
+///   `spice-vdagentd` and is forwarded to `spice-vdagent`. So the
+///   `VDAgentMessage` framing, the `AGENT_DATA` carriage and the token flow
+///   all work; this was the question that mattered and it is answered.
 ///
-/// What this needs next is a reference client -- `remote-viewer` resizing the
-/// same guest -- to say whether Solstice is at fault or this configuration
-/// cannot do it. That is a host package, so it is a decision rather than a
-/// step. Until then this test is the record of the question, runnable with
-/// `--ignored`, rather than a red suite or a deleted finding.
+/// - The `MONITORS_CONFIG` itself is well-formed: one 48-byte `AGENT_DATA`,
+///   a 20-byte header and a 28-byte body of `num_of_monitors=1, flags=0,
+///   height, width, depth=32, x=0, y=0`, exactly as `vd_agent.h` specifies.
 ///
-/// `a_resize_is_declined_without_the_agent` is unaffected and still passes:
-/// the refusal path never depended on this.
+/// - It never reaches the agent, and that is `spice-server` behaving as
+///   designed: it intercepts `VD_AGENT_MONITORS_CONFIG` rather than
+///   forwarding it, and applies it to the QXL device itself. The device then
+///   does not act on it -- the kernel's preferred mode never moves.
+///
+/// - **A reference client cannot resize this guest either.** `remote-viewer`,
+///   with auto-resize enabled, scales the display instead and sends no
+///   monitors config at all, while its other agent messages (max-clipboard,
+///   volume sync, clipboard grab) arrive normally. A known-good client
+///   declining to even try is its own evidence about the guest side.
+///
+/// So the remaining gap is QEMU's QXL monitors-config handling in this
+/// configuration, not Solstice. What stays genuinely unvalidated is the
+/// *response* path -- that Solstice tracks a geometry change the guest
+/// actually makes -- which needs a guest that can resize at all. Worth
+/// revisiting with a different QXL device configuration, or a `virtio-gpu`
+/// guest, before concluding anything about the backend.
+///
+/// `a_resize_is_declined_without_the_agent` is unaffected and still passes.
 #[tokio::test]
-#[ignore = "unresolved: a correct MONITORS_CONFIG reaches QEMU and is dropped; see the comment"]
+#[ignore = "QEMU's QXL does not act on a monitors config here; remote-viewer cannot resize this guest either"]
 async fn a_real_agent_grants_and_applies_a_resize() {
     let Some(guest) = start(800, 600, "off", "off") else {
         return;
