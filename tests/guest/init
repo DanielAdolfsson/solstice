@@ -120,6 +120,19 @@ OUTPUT=${OUTPUT#card0-}
 ) &
 log "mode watcher on $OUTPUT"
 
+# A truncated initramfs is survivable in the worst way: the guest boots, X
+# starts, and binaries are simply missing. That looks like anything except
+# what it is, so check rather than discover it later.
+missing=
+for tool in solstice-draw xdpyinfo xrandr; do
+    command -v "$tool" >/dev/null || missing="$missing $tool"
+done
+if [ -n "$missing" ]; then
+    log "FATAL: missing$missing -- the initramfs did not unpack completely;"
+    log "FATAL: the guest almost certainly has too little memory."
+    while :; do sleep 3600; done
+fi
+
 solstice-draw fill 000000
 log "ready"
 

@@ -205,7 +205,11 @@ impl Default for GuestConfig {
         Self {
             width: 1280,
             height: 720,
-            // The guest is an initramfs, so the whole rootfs lives in RAM.
+            // The guest is an initramfs, so the whole rootfs lives in RAM and
+            // the kernel needs room to unpack it. Below about 1 GiB the
+            // unpack truncates, which the guest survives in a way that looks
+            // like anything but a memory problem -- see the check in
+            // `tests/guest/init`.
             memory_mb: 1024,
             spice: None,
             vnc: false,
@@ -257,6 +261,7 @@ impl GuestConfig {
 pub struct Guest {
     child: Child,
     dir: PathBuf,
+    _slot: Slot,
     qmp: Mutex<proto::Channel>,
     qga: Mutex<proto::Channel>,
     spice_port: Option<u16>,
@@ -286,6 +291,91 @@ pub fn image_dir() -> PathBuf {
     cache.join("solstice/guest")
 }
 
+/// A cross-process cap on how many guests run at once.
+///
+/// `cargo test` runs each test binary as its own process, so an in-process
+/// semaphore would not see the other binaries' guests. Three crates now boot
+/// guests, and on a machine with a few gigabytes free the result is a suite
+/// that passes alone and fails together -- the worst kind of flake, because
+/// every individual test looks correct.
+///
+/// A slot is a directory, because `create_dir` is atomic and needs no
+/// dependency and no `unsafe`. A slot whose owning process is gone is
+/// reclaimed *and its guest killed*: `Drop` cleans up a guest when a test
+/// fails, but not when the test process itself is killed -- an interrupted
+/// `cargo test` otherwise leaves a gigabyte of QEMU behind, and a few of
+/// those turn every later run into a memory-pressure flake that looks like a
+/// bug in whatever test drew the short straw.
+struct Slot(PathBuf);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl Slot {
+    /// Record the guest this slot is holding, so a later run can kill it if
+    /// this process does not survive to do so itself.
+    fn record_guest(&self, pid: u32) {
+        let _ = std::fs::write(self.0.join("qemu"), pid.to_string());
+    }
+}
+
+fn process_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// How many guests may run at once: `SOLSTICE_GUEST_PARALLEL`, or a figure
+/// derived from how much memory the machine actually has free right now.
+fn slot_count() -> usize {
+    if let Some(n) = std::env::var("SOLSTICE_GUEST_PARALLEL")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        return n.max(1);
+    }
+    // A guest is 1 GiB plus QEMU's own overhead; leave a gigabyte for
+    // everything else on the machine.
+    (available_mb().saturating_sub(1024) / 1280).clamp(1, 4)
+}
+
+/// Block until a slot is free, then hold it until the guest is dropped.
+fn acquire_slot() -> Slot {
+    let root = std::env::temp_dir().join("solstice-guest-slots");
+    let _ = std::fs::create_dir_all(&root);
+    let slots = slot_count();
+    loop {
+        for i in 0..slots {
+            let path = root.join(format!("slot-{i}"));
+            if std::fs::create_dir(&path).is_ok() {
+                let _ = std::fs::write(path.join("pid"), std::process::id().to_string());
+                return Slot(path);
+            }
+            // Reclaim a slot whose owner is gone, taking its guest with it.
+            let owner = std::fs::read_to_string(path.join("pid"))
+                .ok()
+                .and_then(|p| p.trim().parse::<u32>().ok());
+            if owner.is_some_and(process_alive) {
+                continue;
+            }
+            if let Some(stale) = std::fs::read_to_string(path.join("qemu"))
+                .ok()
+                .and_then(|p| p.trim().parse::<u32>().ok())
+                .filter(|&pid| process_alive(pid))
+            {
+                let _ = Command::new("kill")
+                    .arg(stale.to_string())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            let _ = std::fs::remove_dir_all(&path);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// A free loopback port.
 ///
 /// The old `Xspice` harness hard-coded one port per test, which collides the
@@ -304,8 +394,24 @@ fn free_port() -> Result<u16> {
     Err(Error::Timeout("finding a free loopback port".to_owned()))
 }
 
+/// Megabytes of memory the machine says are available right now.
+fn available_mb() -> usize {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|info| {
+            info.lines()
+                .find(|l| l.starts_with("MemAvailable:"))?
+                .split_whitespace()
+                .nth(1)?
+                .parse::<usize>()
+                .ok()
+        })
+        .map(|kb| kb / 1024)
+        .unwrap_or(usize::MAX)
+}
+
 /// Why the guest cannot be started here, if it cannot.
-fn unavailable() -> Option<String> {
+fn unavailable(need_mb: u32) -> Option<String> {
     let runnable = Command::new("qemu-system-x86_64")
         .arg("-version")
         .stdout(Stdio::null())
@@ -323,6 +429,17 @@ fn unavailable() -> Option<String> {
                 dir.join(file).display()
             ));
         }
+    }
+    // Not enough free memory is a missing prerequisite like any other, and
+    // skipping says so. Booting anyway produces a guest whose initramfs
+    // truncates, which fails later and looks like nothing of the sort.
+    let available = available_mb();
+    let need = need_mb as usize + 256;
+    if available < need {
+        return Some(format!(
+            "only {available} MiB of memory are available and this guest needs \
+             about {need} MiB; close something or set GuestConfig::memory_mb"
+        ));
     }
     None
 }
@@ -349,7 +466,7 @@ impl Guest {
     /// Missing prerequisites skip; a guest that fails to boot panics, because
     /// that is a broken image rather than an absent tool.
     pub fn start(config: GuestConfig) -> Option<Self> {
-        if let Some(why) = unavailable() {
+        if let Some(why) = unavailable(config.memory_mb) {
             println!("skipping: {why}");
             return None;
         }
@@ -361,6 +478,8 @@ impl Guest {
     }
 
     fn boot(config: GuestConfig) -> Result<Self> {
+        // Taken before QEMU starts and held until the guest is dropped.
+        let slot = acquire_slot();
         let dir = std::env::temp_dir().join(format!(
             "solstice-guest-{}-{:?}",
             std::process::id(),
@@ -435,6 +554,7 @@ impl Guest {
         }
 
         let child = qemu.spawn()?;
+        slot.record_guest(child.id());
 
         let mut qmp = proto::Channel::connect(&sock("qmp.sock"), "QMP", Duration::from_secs(20))?;
         qmp.qmp_handshake()?;
@@ -444,6 +564,7 @@ impl Guest {
         let guest = Self {
             child,
             dir,
+            _slot: slot,
             qmp: Mutex::new(qmp),
             qga: Mutex::new(qga),
             spice_port,
@@ -472,9 +593,15 @@ impl Guest {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+        let console = std::fs::read_to_string(self.dir.join("console.log")).unwrap_or_default();
+        let hint = if console.contains("Initramfs unpacking failed") {
+            "\n\nthe initramfs did not unpack: the guest has too little memory \
+             for it. Raise GuestConfig::memory_mb."
+        } else {
+            ""
+        };
         Err(Error::Timeout(format!(
-            "waiting for the guest to serve X; console said:\n{}",
-            std::fs::read_to_string(self.dir.join("console.log")).unwrap_or_default()
+            "waiting for the guest to serve X; console said:\n{console}{hint}"
         )))
     }
 
