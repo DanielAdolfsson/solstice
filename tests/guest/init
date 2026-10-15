@@ -30,7 +30,9 @@ GEOMETRY=$(sed -n 's/.*solstice\.geometry=\([0-9]*x[0-9]*\).*/\1/p' /proc/cmdlin
 sed -i "s/@GEOMETRY@/$GEOMETRY/" /etc/X11/xorg.conf
 log "geometry $GEOMETRY"
 
-for m in qxl virtio_console virtio_pci evdev; do modprobe "$m" 2>/dev/null; done
+# uinput is what spice-vdagentd injects absolute pointer events through;
+# without it the daemon starts and then cannot do its job.
+for m in qxl virtio_console virtio_pci evdev uinput; do modprobe "$m" 2>/dev/null; done
 
 udevd --daemon 2>/dev/null
 udevadm trigger --type=subsystems --action=add 2>/dev/null
@@ -60,10 +62,21 @@ log "X on $DISPLAY after $(cut -d' ' -f1 /proc/uptime)s"
 # launcher cannot start them -- so this is the part of the guest that buys the
 # agent coverage in roadmap.md 2.7.
 if [ -e /dev/virtio-ports/com.redhat.spice.0 ]; then
-    spice-vdagentd -X 2>/dev/null &
-    sleep 0.3
-    spice-vdagent -x 2>/dev/null &
-    log "spice-vdagent started"
+    # Three things this needs that are easy to get wrong, because the daemon
+    # fails quietly on each: the uinput module above, a directory to put its
+    # socket in, and a machine-id, without which its dbus proxy cannot start
+    # and it falls back to guessing display ids. A fixed id is deliberate --
+    # this guest is supposed to be identical on every boot.
+    mkdir -p /run/spice-vdagentd
+    [ -s /etc/machine-id ] || echo 5015713ce5a84f2d9d1a7f2c4b6e8a10 > /etc/machine-id
+    # Both run in the foreground with debug logging, redirected to files. A
+    # test guest has no syslog, and when a resize or a clipboard round-trip
+    # fails these logs are the only account of why -- so they are worth
+    # having unconditionally rather than behind a flag nobody remembers.
+    spice-vdagentd -x -d > /var/log/vdagentd.log 2>&1 &
+    sleep 0.5
+    spice-vdagent -x -d > /var/log/vdagent.log 2>&1 &
+    log "spice-vdagentd and spice-vdagent started"
 else
     log "no spice vdagent port; agent not started"
 fi

@@ -407,3 +407,117 @@ async fn a_resize_is_declined_without_the_agent() {
     assert!(!session.request_resize(1280, 720).await.unwrap());
     session.close().await;
 }
+
+/// Wait for a condition on the guest, polling rather than sleeping.
+async fn guest_eventually(guest: &Guest, script: &str, wanted: &str) -> Result<String, String> {
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    let mut last = String::new();
+    while tokio::time::Instant::now() < deadline {
+        last = guest.sh(script).unwrap_or_default();
+        if last.contains(wanted) {
+            return Ok(last);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Err(format!("`{script}` never produced {wanted:?}; last saw: {last:?}"))
+}
+
+/// `docs/roadmap.md` §2.7's first bullet, reopened with a sharper question.
+///
+/// Ignored, deliberately, and the reason is the finding: **a correct
+/// `MONITORS_CONFIG` reaches QEMU and nothing happens.** What was established,
+/// in order, each by measurement rather than inference:
+///
+/// - A real `spice-vdagent` and `spice-vdagentd` do run in the guest and do
+///   connect. The server grants the agent tunnel 10 tokens, the guest
+///   announces its capabilities, and `can_resize()` becomes true. (Getting
+///   this far needed three fixes to the guest: `spice-vdagentd` takes `-x`,
+///   not `-X`; it needs the `uinput` module loaded or it starts and then
+///   cannot inject; and it needs `/run/spice-vdagentd/` to exist and a
+///   machine-id, or it fails quietly on each.)
+/// - Solstice then emits exactly one 48-byte `AGENT_DATA`: a 20-byte
+///   `VDAgentMessage` header and a 28-byte body of
+///   `num_of_monitors=1, flags=0, height, width, depth=32, x=0, y=0`, in that
+///   order, which is what `vd_agent.h` specifies. Tokens are available and the
+///   message is drained rather than queued.
+/// - `spice-vdagentd` running at `-d -d` logs **no inbound client message at
+///   all** -- not this one, not the capability announcement.
+/// - The QXL device does not see it either: the kernel's preferred mode stays
+///   at its default. An earlier reading of mine that it *had* changed was
+///   wrong, and wrong in an instructive way -- the test had asked for
+///   1024x768, which is already this device's default preferred mode, so the
+///   observation carried no information. Asking for 1152x864 instead makes
+///   the signal unambiguous, and it never arrives.
+///
+/// So the client→guest-agent direction is not working end to end, and the
+/// break is at or after QEMU's `spice-server`. Ruled out so far: the message
+/// encoding, the capability gate (`VD_AGENT_CAP_MONITORS_CONFIG` is
+/// announced), token starvation, and the `AGENT_START` token count (tried
+/// both `u32::MAX` and 10).
+///
+/// What this needs next is a reference client -- `remote-viewer` resizing the
+/// same guest -- to say whether Solstice is at fault or this configuration
+/// cannot do it. That is a host package, so it is a decision rather than a
+/// step. Until then this test is the record of the question, runnable with
+/// `--ignored`, rather than a red suite or a deleted finding.
+///
+/// `a_resize_is_declined_without_the_agent` is unaffected and still passes:
+/// the refusal path never depended on this.
+#[tokio::test]
+#[ignore = "unresolved: a correct MONITORS_CONFIG reaches QEMU and is dropped; see the comment"]
+async fn a_real_agent_grants_and_applies_a_resize() {
+    let Some(guest) = start(800, 600, "off", "off") else {
+        return;
+    };
+    let session = session(guest.spice_port()).await;
+    assert_eq!(session.dimensions(), (800, 600));
+
+    // The agent connects once a client attaches, so its capabilities arrive
+    // shortly after `connect` returns rather than during it. This part works.
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while tokio::time::Instant::now() < deadline && !session.can_resize() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        session.can_resize(),
+        "spice-vdagent is running, so the server should have advertised \
+         MONITORS_CONFIG; the guest said: {}",
+        guest.sh("pgrep -a spice-vdagent").unwrap_or_default()
+    );
+
+    assert!(
+        session
+            .request_resize(1152, 864)
+            .await
+            .expect("the session should still be up"),
+        "a resize was declined with the agent running"
+    );
+
+    // 1152x864 deliberately, not 1024x768: the latter is already this
+    // device's default preferred mode, so asking for it would be
+    // indistinguishable from nothing happening.
+    guest_eventually(&guest, "head -1 /sys/class/drm/card0-Virtual-1/modes", "1152x864")
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the request never reached the guest's device: {e}\n--- vdagentd ---\n{}",
+                guest.sh("tail -20 /var/log/vdagentd.log").unwrap_or_default()
+            )
+        });
+
+    guest_eventually(&guest, "xdpyinfo | grep dimensions", "1152x864")
+        .await
+        .unwrap_or_else(|e| panic!("the guest never changed mode: {e}"));
+
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while tokio::time::Instant::now() < deadline && session.dimensions() != (1152, 864) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        session.dimensions(),
+        (1152, 864),
+        "the guest resized but the client's geometry did not follow"
+    );
+
+    session.close().await;
+}
