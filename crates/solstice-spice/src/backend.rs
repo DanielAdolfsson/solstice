@@ -314,6 +314,16 @@ impl Backend for SpiceBackend {
 /// connection open forever.
 const SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How long to wait for the primary surface after the channels are up.
+///
+/// `connect` returning before the display channel has said how big the
+/// desktop is would hand the pipeline a 0x0 geometry for the first frames.
+/// RFB has no equivalent problem because `ServerInit` carries the size in
+/// the handshake; SPICE sends it as an ordinary message on another socket.
+/// A server that never sends one is still usable -- the size arrives as a
+/// `Resize` event later -- so this expires rather than failing.
+const FIRST_SURFACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Dial, link every channel the server offers, and start the session.
 pub async fn connect(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<SpiceSession> {
     tokio::time::timeout(SETUP_TIMEOUT, connect_inner(dialer, config))
@@ -420,7 +430,17 @@ async fn connect_inner(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<S
         ));
     }
 
-    let input = Arc::new(Mutex::new(InputState::new(1, 1)));
+    // Seeded from the mode `MAIN_INIT` reported, not left at the default.
+    // The setup loop above has already consumed `MAIN_INIT`, so the
+    // `MouseMode` outcome it produced will never reach `main_task` -- and a
+    // session left in server mode sends relative deltas, which a server
+    // whose only pointer is a tablet silently drops. `Xspice` is exactly
+    // that server.
+    let input = Arc::new(Mutex::new({
+        let mut state = InputState::new(1, 1);
+        state.set_mode(main.mouse_mode());
+        state
+    }));
     let (inputs_out, inputs_out_rx) = mpsc::channel::<OutMessage>(256);
     if available(channel_type::INPUTS) {
         let (stream, mini) = link_channel(
@@ -476,7 +496,7 @@ async fn connect_inner(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<S
         connected.clone(),
     ));
 
-    Ok(SpiceSession {
+    let session = SpiceSession {
         fb,
         events,
         main,
@@ -486,7 +506,19 @@ async fn connect_inner(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<S
         dimensions,
         connected,
         audio: Mutex::new(audio),
-    })
+    };
+
+    // Give the display channel a moment to deliver the primary surface, so
+    // `dimensions()` is meaningful to the first caller.
+    let deadline = tokio::time::Instant::now() + FIRST_SURFACE_TIMEOUT;
+    while session.dimensions() == (0, 0) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    if session.dimensions() == (0, 0) {
+        tracing::warn!("the display channel has not reported a primary surface yet");
+    }
+
+    Ok(session)
 }
 
 /// Keep the main channel running after setup.

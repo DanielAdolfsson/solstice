@@ -40,6 +40,7 @@ zune-jpeg = "0.4"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+solstice-input.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [lints.rust]

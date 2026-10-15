@@ -207,6 +207,37 @@ async fn a_mouse_button_arrives_with_spices_own_numbering() {
     );
 }
 
+/// A real `spice-server` reports client mouse mode in `MAIN_INIT` itself,
+/// not in a later `MAIN_MOUSE_MODE`. `MAIN_INIT` is consumed by the setup
+/// loop inside `connect`, so an implementation that only applied the mode
+/// from the running main-channel task would stay in server mode forever --
+/// and server mode sends relative deltas, which a server whose only pointer
+/// is a tablet drops silently. `Xspice` is exactly that server, and this is
+/// the regression test for having been caught by it.
+#[tokio::test]
+async fn the_mouse_mode_from_main_init_is_in_force_before_connect_returns() {
+    let mock = MockConfig {
+        mouse_mode: solstice_spice::protocol::mouse_mode::CLIENT,
+        ..MockConfig::default()
+    };
+    let (session, _server) = session_with(mock).await;
+    assert_eq!(
+        session.mouse_mode(),
+        solstice_spice::inputs::MouseMode::Client,
+        "the mode MAIN_INIT reported must be applied, not just later ones"
+    );
+}
+
+/// `connect` should not hand back a session whose geometry is still zero:
+/// RFB carries the size in its handshake, SPICE sends it as an ordinary
+/// message on another socket, and the pipeline reads `dimensions()`
+/// immediately.
+#[tokio::test]
+async fn the_primary_surface_has_arrived_before_connect_returns() {
+    let (session, _server) = session_with(MockConfig::default()).await;
+    assert_eq!(session.dimensions(), (64, 48));
+}
+
 #[tokio::test]
 async fn client_mouse_mode_turns_absolute_input_into_positions() {
     let (session, server) = session_with(MockConfig::default()).await;

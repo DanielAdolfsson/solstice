@@ -220,6 +220,7 @@ impl DisplayChannel {
     }
 
     fn message(&mut self, kind: u16, body: &[u8]) -> Result<()> {
+        tracing::trace!(kind, len = body.len(), "spice display message");
         match kind {
             display_msg::MODE => {
                 // Pre-surface servers announce the primary this way. Treat it

@@ -14,11 +14,14 @@ negotiate encrypted RTSP, and receive an encrypted, FEC-protected H.264 stream
 of a real VNC desktop, which decodes to the right pixels. That path is a test
 (`a_client_receives_the_pixels_of_a_real_vnc_desktop`), not a claim.
 
-**Both backends are implemented.** The SPICE one is complete — channel links,
-the 2D rasteriser, all six image types, video streams, the guest agent and
-audio — but it has never been answered by a real `spice-server`, only by a
-mock and by fuzzers. That gap is the honest headline and it is written up in
-[docs/roadmap.md §2.6](docs/roadmap.md#26-the-remaining-risk-stated-plainly).
+**Both backends work against a real server.** The SPICE one is complete —
+channel links, the 2D rasteriser, all six image types, video streams, the
+guest agent and audio — and `tests/real_server.rs` drives it against a live
+`Xspice`, which links the same `spice-server` library QEMU does: every image
+codec forced in turn, MJPEG streams, and input verified against the guest's
+own event stream. What has *not* been exercised is a real `spice-vdagent` and
+a QEMU guest's QXL driver, which is written up in
+[docs/roadmap.md §2.7](docs/roadmap.md#27-what-is-still-unvalidated).
 
 See [Status](#status) for the full picture, including what is deliberately
 absent.
@@ -32,7 +35,7 @@ source). No cmake, no nasm, no system libraries.
 
 ```sh
 cargo build --release
-cargo test --workspace        # 646 tests, about 20 s
+cargo test --workspace        # 655 tests, about 20 s
 cargo clippy --workspace --all-targets
 ```
 
@@ -123,13 +126,13 @@ Each of these is written up in [docs/roadmap.md](docs/roadmap.md) with a plan,
 the tests that would finish it, and what is already known to be hard. The
 summaries below are just the shape of it.
 
-- **SPICE against a real server.** The backend is implemented and feature-gated;
-  what has not happened is a `spice-server` ever answering it. The test that
-  would close this exists — `crates/solstice-spice/tests/real_server.rs`
-  drives `Xspice` with each `--image-compression` flag in turn — and skips
-  with a printed note because `Xspice` is not installed. It is the cheapest
-  high-value thing left in the whole repository.
-  [The account](docs/roadmap.md#26-the-remaining-risk-stated-plainly).
+- **The SPICE guest agent, against a real agent.** `MONITORS_CONFIG` resize
+  and the clipboard are implemented and tested against the mock, but Debian's
+  `Xspice` cannot run `spice-vdagent` (`--vdagent` dies on an undefined
+  variable, and the packaged driver never binds the agent sockets), so no
+  real agent has answered. A QEMU guest would close this and the QXL
+  draw-command-mix question together.
+  [The list](docs/roadmap.md#27-what-is-still-unvalidated).
 - **`DRAW_COMPOSITE`, GL scanout, and two cursor types** on the SPICE side.
   Each is a deliberate omission rather than a gap, and the capability is not
   advertised in any of the three cases, so a conforming server will not send

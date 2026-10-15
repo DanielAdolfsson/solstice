@@ -282,32 +282,38 @@ real unbounded allocation or out-of-bounds index in under two minutes, all
 four on the SPICE side, all four now with named regression tests. That is a
 reasonable argument that the nightly tier would find more.
 
-### The SPICE backend has never met a SPICE server
+### What a real SPICE server found, and what it still cannot reach
 
-The largest open item, and the newest. `crates/solstice-spice` implements the
-link handshake, the 2D rasteriser, every image type, video streams, the guest
-agent and audio — verified against `spice.proto`'s message layouts, against
-the C's own raster-operation mapping, against the reference client's behaviour
-where the wire format does not determine it, and against a mock server written
-from the same reading. What has not happened is a real `spice-server` ever
-answering it: `Xspice` is not installed on the machine it was written on, so
-`crates/solstice-spice/tests/real_server.rs` has only ever skipped.
+`crates/solstice-spice` was written against `spice.proto`, the C's own
+raster-operation mapping, and the reference client's behaviour — then tested
+against a mock written from the same reading. Pointing it at a live `Xspice`
+found two bugs within an afternoon, and both were in the *join* between
+pieces rather than in any one of them, which is what a real peer is for:
 
-This is structurally the same gap as the GameStream one below — a wrong
-assumption made consistently at both ends of a test passes — and it has the
-same answer. `docs/roadmap.md` §2.6 is the plan, in order of value.
+1. **The mouse mode in `MAIN_INIT` was thrown away.** A real server reports
+   client mouse mode in `MAIN_INIT` itself; the mock granted it in a later
+   `MAIN_MOUSE_MODE`, and `MAIN_INIT` is consumed by the setup loop inside
+   `connect`. The session stayed in server mode and sent relative deltas,
+   which `Xspice` drops because its only pointer is a tablet. The pointer did
+   not move at all.
+2. **`connect` returned before the primary surface arrived**, handing the
+   first caller of `dimensions()` a `0x0` geometry.
 
-The two things most likely to be wrong, in order:
+A third of the afternoon went to a bug that was **not** in the client: a
+throwaway probe treated two seconds of silence as end-of-session, which
+looked exactly like "the server never sends incremental updates". Writing an
+independent 80-line Python SPICE client was what settled it — and that is the
+general lesson, because the same symptom had three plausible causes on the
+client side and one on the server's.
 
-1. **The raster-operation mappings.** `ropd_descriptor_to_rop` and the ROP3
-   truth-table indexing are both transcribed from C that exists nowhere else.
-   The ROP3 convention at least has an oracle — `rop3.c`'s own self-test
-   constants are reproduced as a test over all 256 opcodes — but the `ropd`
-   collapse has only the transcription.
-2. **The `SpiceImage` descriptor layouts.** Pointer members are 32-bit
-   offsets into the message body, and the fixed parts are unpadded. One wrong
-   field width shifts everything after it, and the symptom would be a corrupt
-   picture rather than an error.
+What `Xspice` still cannot reach: a real `spice-vdagent` (Debian's launcher
+cannot start one) and a QXL guest driver's mix of draw commands. `DRAW_ROP3`,
+`DRAW_STROKE` and `DRAW_TEXT` have therefore never been seen from a real
+server, and the raster-operation mapping behind them — `ropd_descriptor_to_rop`,
+transcribed from C that exists nowhere else — has only its transcription and
+a unit test for an oracle. The ROP3 truth table at least has `rop3.c`'s own
+self-test constants, reproduced as a test over all 256 opcodes.
+`docs/roadmap.md` §2.7.
 
 ### The whole path is tested, but only against one real server
 

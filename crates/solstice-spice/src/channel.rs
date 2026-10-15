@@ -332,6 +332,7 @@ pub async fn writer_task<W: AsyncWrite + Unpin>(
 ) {
     let mut serial: u64 = 1;
     while let Some(message) = outgoing.recv().await {
+        tracing::trace!(kind = message.kind, len = message.body.len(), "spice send");
         let mut frame = Writer::with_capacity(FULL_HEADER + message.body.len());
         if mini {
             frame.u16(message.kind).u32(message.body.len() as u32);

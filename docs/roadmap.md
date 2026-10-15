@@ -17,16 +17,15 @@ protocols.
 
 ## Order
 
-Both halves of this project now have the same shape of gap, and it is not a
-missing feature: **neither has met the real thing.** The GameStream host has
-never been connected to by a real Moonlight, and the SPICE backend has never
-been answered by a real `spice-server`. Everything else on this list is worth
-less than closing those two, and both are cheap.
+The biggest remaining gap is not a missing feature: **the GameStream host has
+never been connected to by a real Moonlight.** The SPICE backend had the same
+gap and it is now closed (§2.6) -- which is the argument for closing this one,
+because doing it found two real bugs in a day.
 
 | | Item | Size | Blocked on |
 |---|---|---|---|
 | 1 | [Tight encoding](#1-tight-encoding-rfb) | ~1 week | nothing |
-| 2 | [SPICE backend](#2-spice-backend) | **implemented**; validation outstanding (§2.6) | nothing — `apt install xserver-xspice` |
+| 2 | [SPICE backend](#2-spice-backend) | **implemented and validated against `Xspice`** (§2.6); the agent and a QEMU guest are what is left (§2.7) | nothing |
 | 3 | [Validate against real Moonlight](#3-validate-against-real-moonlight) | days | nothing — **do this before 1** |
 | 4 | [Captured golden vectors](#4-captured-sunshine--moonlight-vectors) | days | §3 |
 | 5 | [`solstice pair` management socket](#5-solstice-pair-and-a-management-socket) | ~2 days | nothing |
@@ -34,9 +33,8 @@ less than closing those two, and both are cheap.
 | 7 | [ENet: audit or reimplement](#7-enet-audit-or-reimplement) | 1–3 weeks | §3 |
 | 8 | [Smaller items](#8-smaller-items) | varies | |
 
-§3 is listed third but should go first in wall-clock terms, alongside §2.6:
-they are the two places where a wrong assumption made consistently at both
-ends of a test currently passes.
+§3 should go first. It is the one place left where a wrong assumption made
+consistently at both ends of a test still passes.
 
 ---
 
@@ -147,10 +145,12 @@ fuzzable). Tight should follow that split, with four streams instead of one.
 
 ## 2. SPICE backend
 
-**Implemented.** `crates/solstice-spice`, behind the `spice` Cargo feature.
-`backend.kind = "spice"` builds a working backend rather than reporting
-itself unimplemented. What is left is validation against a real server and
-the handful of deliberate gaps in §2.5 — not milestones.
+**Implemented and working against a real server.** `crates/solstice-spice`,
+behind the `spice` Cargo feature. `backend.kind = "spice"` builds a working
+backend, and `tests/real_server.rs` drives it against a live `Xspice` — the
+same `spice-server` library QEMU links — across every image codec, video
+streams, and input (§2.6). What is left is the guest agent, a QEMU guest and
+audio (§2.7), plus the deliberate omissions in §2.5.
 
 ### Why it was worth it
 
@@ -287,7 +287,7 @@ question for the pipeline and is not yet answered.
 
 ### 2.4 How it is tested
 
-- **206 unit and mock tests** in the crate, plus the 88 in
+- **213 unit and mock tests** in the crate, plus the 88 in
   `solstice-spice-codec`.
 - **A mock server** (`mock.rs`, `tests/mock_server.rs`) that mints a real
   1024-bit RSA key and decrypts a real ticket, so the OAEP path is exercised
@@ -300,10 +300,10 @@ question for the pipeline and is not yet answered.
   rectangle asked for a 174 GB allocation on a 64 × 48 surface, and a
   zero-stride stencil mask that indexed an empty row. Both have named
   regression tests.
-- **`tests/real_server.rs`** drives `Xspice` with `--image-compression` forced
-  to `off`, `quic`, `lz`, `lz4` and `glz` in turn, plus
-  `--streaming-video all`. It skips with a printed note when `Xspice` is not
-  installed.
+- **`tests/real_server.rs`** drives a live `Xspice`: every image codec, video
+  streams, input against an `xev` oracle, and the resize refusal. §2.6 is the
+  account of what it covers and what it found. It skips with a printed note
+  when `Xspice` is not installed.
 
 ### 2.5 What is deliberately not implemented
 
@@ -333,37 +333,98 @@ Each of these is a decision, not an oversight.
   seam has nowhere to put it: GameStream has no clipboard channel. The
   plumbing is there for when something wants it.
 
-### 2.6 The remaining risk, stated plainly
+### 2.6 Validated against a real server
 
-**No SPICE server has ever answered this code.** `Xspice` is not installed on
-the machine it was written on, so `tests/real_server.rs` has only ever
-skipped. Everything above is verified against the *specification* — the
-`spice.proto` message layouts, the C's own raster-operation mapping, the
-reference client's behaviour where the wire format does not determine it —
-and against a mock written from the same reading. A wrong assumption made in
-both places passes.
+**`Xspice` has answered it.** `crates/solstice-spice/tests/real_server.rs`
+runs nine tests against a live `spice-server` -- the same library QEMU links
+-- and they pass. What that covers:
 
-This is the same risk §3 names for the GameStream half, and it has the same
-answer: run it against the real thing. In order of value:
+| | |
+|---|---|
+| Link and session | the handshake, the RSA-OAEP ticket, capability negotiation, `MAIN_INIT`, `CHANNELS_LIST`, four channels, the ack window |
+| Display | surfaces, draw commands, incremental updates, every pixel of a repaint |
+| Image codecs | `off`, `quic`, `lz`, `glz`, `auto_glz`, each forced with `--image-compression`, each decoding to exactly the right colour across all 307,200 pixels |
+| Video streams | `--streaming-video all`, MJPEG negotiated by `PREFERRED_VIDEO_CODEC_TYPE`, decoded and composited into a clipped sub-rectangle |
+| Input | pointer and keyboard reaching the guest, verified with `xev -root` as the oracle |
+| Mouse mode | client mode granted and in force; the tablet receives absolute positions |
 
-1. **`apt install xserver-xspice` and run `tests/real_server.rs`.** Minutes of
-   work, and it is the single highest-value thing left on this item.
-2. **A manual QEMU run with a real QXL guest driver.** `Xspice` shares
-   `spice-server` with QEMU so the protocol is the same code, but the *mix* of
-   draw commands a real guest driver emits is not
-   (`docs/testing.md` §4.2). Worth one run before a release, not a CI job.
-3. **A GLZ soak.** The vectors replay a window of eight images; a real session
-   churns thousands, and window management is exactly what frozen vectors
-   cannot exercise. `glz_survives_enough_window_churn_to_evict` is the short
-   version; the long one is a nightly job.
+Every test connects to a **black** screen, repaints it **while connected**,
+and asserts the pixels. That shape matters: a client that only ever sees the
+screen as it was at connect time can be completely broken for incremental
+updates and still pass, which is the mistake the first draft of that file
+made.
 
-Two smaller unknowns, both of which need a server to answer:
+#### Two bugs it found that the mock could not
 
-- **Nothing is tuned.** The rasteriser's inner loops are per-pixel closures
-  and the codec row loops are a direct translation. Whether that costs
-  anything measurable against compositing and H.264 encoding is unknown
-  because it has not been measured — and it should be measured against a real
-  frame rather than guessed at.
+Both were in the join between the pieces rather than in any one of them,
+which is exactly what a real peer is for.
+
+1. **The mouse mode in `MAIN_INIT` was being thrown away.** A real
+   `spice-server` reports client mouse mode in `MAIN_INIT` itself; the mock
+   granted it in a later `MAIN_MOUSE_MODE`. `MAIN_INIT` is consumed by the
+   setup loop inside `connect`, so the mode never reached the input state and
+   the session stayed in server mode -- sending relative deltas, which
+   `Xspice` drops on the floor because its only pointer is a tablet. The
+   pointer did not move at all.
+2. **`connect` returned before the primary surface arrived**, so the first
+   caller of `dimensions()` got `0x0`. RFB has no equivalent problem because
+   `ServerInit` carries the size in the handshake; SPICE sends it as an
+   ordinary message on another socket.
+
+Both have regression tests in `tests/mock_server.rs`, written so the mock now
+reproduces the real server's behaviour rather than its own.
+
+#### Running them
+
+`Xspice` needs more care than `Xvnc` did, and the test file carries the
+recipe. Two traps in the Debian packaging, both of which look like client
+bugs at first:
+
+- **`Xspice --auto` crashes.** The `xorg.conf` it generates omits the
+  driver's buffer-size options, the QXL driver computes a surface of size
+  zero and aborts inside `malloc`. The test writes its own configuration,
+  which is also the only way to set the geometry -- there is no `--geometry`
+  flag.
+- **`--vdagent` cannot be used without `--auto`**, where it dies on an
+  undefined `temp_dir`. Setting `SpiceVdagentEnabled` in the configuration
+  by hand does not help either: the installed driver never binds the agent
+  sockets.
+
+```sh
+sudo apt install xserver-xspice x11-xserver-utils x11-utils xterm
+cargo test -p solstice-spice --test real_server -- --test-threads=2
+```
+
+### 2.7 What is still unvalidated
+
+Smaller than it was, and each item says what would close it.
+
+- **The guest agent.** `MONITORS_CONFIG` resize, client-mode absolute mouse
+  *through the agent*, and the clipboard are exercised against the mock but
+  not against a real agent, because this `Xspice` build cannot run one (see
+  above). The protocol side is unit-tested; what is untested is a real
+  `spice-vdagent` answering. A QEMU guest would close this and the QXL item
+  below at the same time.
+- **QXL guest-driver behaviour.** `Xspice` shares `spice-server` with QEMU,
+  so the protocol is the same code -- but the *mix* of draw commands a real
+  VM's QXL driver emits is not. `docs/testing.md` §4.2 calls this one manual
+  QEMU run before a release, not a CI job, and that is still the right call.
+  `DRAW_ROP3`, `DRAW_STROKE` and `DRAW_TEXT` in particular have not been seen
+  from any real server; `Xspice` renders through the frame buffer and sends
+  `DRAW_COPY` and `DRAW_FILL`.
+- **Audio.** The playback channel is unit-tested and `Xspice` can feed it
+  from a PulseAudio pipe sink (`--audio-fifo-dir`), which has not been set
+  up. The open question is not whether Opus arrives but whether it can be
+  **repacketised rather than transcoded**, which depends on the frame
+  duration matching `x-nv-aqos.packetDuration` -- a pipeline question
+  (`docs/spice-protocol.md` §7).
+- **A long GLZ soak.** The codec tests repaint once. GLZ's dictionary spans
+  the session and the bugs are in window management, which needs thousands of
+  images rather than one. A nightly job, not a merge gate.
+- **Nothing is tuned.** The rasteriser's inner loops are per-pixel closures.
+  A debug build keeps up with a scrolling terminal over MJPEG; nothing
+  heavier has been measured, and it should be measured against a real frame
+  rather than guessed at.
 - **GLZ out-of-order images are refused, not awaited.** `spice-gtk` blocks on
   a coroutine when a match refers to an image that has not arrived. With one
   display channel the case does not arise, because one channel delivers in
@@ -374,8 +435,11 @@ Two smaller unknowns, both of which need a server to answer:
 
 ## 3. Validate against real Moonlight
 
-**Do this first.** It is cheap and everything else assumes the host half is
-correct.
+**Do this first.** It is cheap, everything else assumes the host half is
+correct, and the SPICE half of this project just demonstrated what the
+exercise is worth: pointing the backend at a real `spice-server` for the
+first time found two bugs in an afternoon, neither of which any mock could
+have caught (§2.6).
 
 The end-to-end tests use a client written from the same research as the server,
 so a wrong assumption made at *both* ends passes. `moonlight-embedded

@@ -307,15 +307,34 @@ early enough to find that out cheaply.
 client-mode absolute mouse are all testable without building a guest image.
 Test with it on *and* off — all three degrade when the agent is absent.
 
-**Status: written, never run.** `crates/solstice-spice/tests/real_server.rs`
-does all of the above — `off`, `quic`, `lz`, `lz4`, `glz`, plus
-`--streaming-video all` and the no-agent resize — and skips with a printed
-note, because `Xspice` is not installed on the machine the backend was
-written on. That makes the mock (§4.1) the only peer the client has ever
-spoken to, and a wrong assumption shared by the client and the mock passes.
-`apt install xserver-xspice` and running that file is the single
-highest-value test action available in this repository
-(`docs/roadmap.md` §2.6).
+**Status: running and passing.** `crates/solstice-spice/tests/real_server.rs`
+does all of the above — `off`, `quic`, `lz`, `glz`, `auto_glz`, plus
+`--streaming-video all`, input against an `xev` oracle, and the no-agent
+resize refusal. `docs/roadmap.md` §2.6 is the account, including the two bugs
+it found that the mock could not.
+
+**The shape of each test is the part worth copying.** Connect to a *black*
+screen, repaint it *while connected*, then assert every pixel. A client that
+only ever sees the screen as it was at connect time can be completely broken
+for incremental updates and still pass a test that connects after the content
+exists — which is the mistake the first draft of that file made, and it took
+an independent 80-line Python client to prove where the fault was not.
+
+Two traps in Debian's `Xspice`, both of which look like client bugs:
+
+- `--auto` crashes: the `xorg.conf` it generates omits the driver's
+  buffer-size options, so the QXL driver sizes surface 0 at zero and aborts
+  in `malloc`. Write the configuration by hand — which is also the only way
+  to set the geometry, since there is no `--geometry` flag.
+- `--vdagent` cannot be used without `--auto`, where it dies on an undefined
+  `temp_dir`; and setting `SpiceVdagentEnabled` by hand does not help,
+  because the packaged driver never binds the agent sockets. The agent is
+  therefore untested against a real agent — see `docs/roadmap.md` §2.7.
+
+```sh
+sudo apt install xserver-xspice x11-xserver-utils x11-utils xterm
+cargo test -p solstice-spice --test real_server -- --test-threads=2
+```
 
 ### 4.1 Mock SPICE server
 
@@ -346,17 +365,16 @@ the wrong message.
 
 ### 4.2 Known gaps
 
-Two, and the first is larger than it was.
+**`Xspice` does not cover QXL guest-driver behaviour.** Since it shares
+`spice-server` with QEMU it covers the protocol well, but a real VM's driver
+emits a different *mix* of draw commands than the Xspice video driver does —
+which renders through the frame buffer and sends mostly `DRAW_COPY` and
+`DRAW_FILL`. `DRAW_ROP3`, `DRAW_STROKE` and `DRAW_TEXT` have therefore never
+been seen from a real server. Worth one manual QEMU run before a release, not
+a CI job.
 
-**No real server has answered the client at all** — see the status note in §4
-above. Everything the SPICE backend does is verified against the
-specification and against a mock written from the same reading of it.
-
-**`Xspice` would not close the second gap either.** Since it shares
-`spice-server` with QEMU it covers the protocol well, but it does **not**
-cover QXL guest-driver behaviour — a real VM's driver emits different
-draw-command mixes than the Xspice video driver does. Worth one manual QEMU
-run before a release, not a CI job.
+**The guest agent has no real peer here**, for the packaging reason in §4
+above. A QEMU guest would close this and the QXL gap in the same run.
 
 ### 4.3 The image codecs, without a server
 
