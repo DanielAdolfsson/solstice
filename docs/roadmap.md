@@ -25,7 +25,7 @@ because doing it found two real bugs in a day.
 | | Item | Size | Blocked on |
 |---|---|---|---|
 | 1 | [Tight encoding](#1-tight-encoding-rfb) | ~1 week | nothing |
-| 2 | [SPICE backend](#2-spice-backend) | **implemented and validated against `Xspice`** (§2.6); the agent and a QEMU guest are what is left (§2.7) | nothing |
+| 2 | [SPICE backend](#2-spice-backend) | **implemented and validated against a real QEMU guest**, agent included (§2.6); what is left is in §2.7 | nothing |
 | 3 | [Validate against real Moonlight](#3-validate-against-real-moonlight) | days | nothing — **do this before 1** |
 | 4 | [Captured golden vectors](#4-captured-sunshine--moonlight-vectors) | days | §3 |
 | 5 | [`solstice pair` management socket](#5-solstice-pair-and-a-management-socket) | ~2 days | nothing |
@@ -133,7 +133,8 @@ fuzzable). Tight should follow that split, with four streams instead of one.
   in the style of `zrle.rs`'s tests.
 - A four-stream continuity test, and a reset-mid-session test.
 - The mock server (`mock.rs`) can emit Tight, so `mock_server.rs` covers it.
-- `real_server.rs` gains a case that offers **only** Tight to `Xvnc`, which is
+- `real_server.rs` gains a case that offers **only** Tight to the guest's
+  RFB server, which is
   the cleanest way to get deterministic per-encoding coverage from one server
   (`docs/testing.md` §3.1).
 - `encoding_bench.rs` gains a Tight row, so the performance claim in
@@ -147,10 +148,11 @@ fuzzable). Tight should follow that split, with four streams instead of one.
 
 **Implemented and working against a real server.** `crates/solstice-spice`,
 behind the `spice` Cargo feature. `backend.kind = "spice"` builds a working
-backend, and `tests/real_server.rs` drives it against a live `Xspice` — the
-same `spice-server` library QEMU links — across every image codec, video
-streams, and input (§2.6). What is left is the guest agent, a QEMU guest and
-audio (§2.7), plus the deliberate omissions in §2.5.
+backend, and `tests/real_server.rs` drives it against a live `spice-server`
+inside a booted QEMU guest — across every image codec, video streams, input,
+and a real `spice-vdagent` (§2.6). What is left is the clipboard, the QXL
+draw-command assertions and audio (§2.7), plus the deliberate omissions in
+§2.5.
 
 ### Why it was worth it
 
@@ -291,7 +293,7 @@ question for the pipeline and is not yet answered.
   `solstice-spice-codec`.
 - **A mock server** (`mock.rs`, `tests/mock_server.rs`) that mints a real
   1024-bit RSA key and decrypts a real ticket, so the OAEP path is exercised
-  rather than stubbed. It covers the negative cases `docs/testing.md` §4.1
+  rather than stubbed. It covers the negative cases `docs/testing.md` §4.2
   names: a wrong password, a link error, `NEED_SECURED`, a server with no
   display channel, a `SpiceDataHeader` whose `size` overruns, and both header
   framings.
@@ -300,10 +302,11 @@ question for the pipeline and is not yet answered.
   rectangle asked for a 174 GB allocation on a 64 × 48 surface, and a
   zero-stride stencil mask that indexed an empty row. Both have named
   regression tests.
-- **`tests/real_server.rs`** drives a live `Xspice`: every image codec, video
-  streams, input against an `xev` oracle, and the resize refusal. §2.6 is the
-  account of what it covers and what it found. It skips with a printed note
-  when `Xspice` is not installed.
+- **`tests/real_server.rs`** drives a live `spice-server` in a QEMU guest:
+  every image codec, video streams, input against an `xev` oracle, and both
+  the agent-granted resize and the refusal without one. §2.6 is the account
+  of what it covers and what it found. It skips with a printed note when
+  QEMU or the guest image is absent.
 
 ### 2.5 What is deliberately not implemented
 
@@ -335,18 +338,22 @@ Each of these is a decision, not an oversight.
 
 ### 2.6 Validated against a real server
 
-**`Xspice` has answered it.** `crates/solstice-spice/tests/real_server.rs`
-runs nine tests against a live `spice-server` -- the same library QEMU links
--- and they pass. What that covers:
+**A real QEMU guest has answered it.** `crates/solstice-spice/tests/real_server.rs`
+runs ten tests against a live `spice-server` inside a booted guest, and they
+pass. This was `Xspice` first, which links the same library and covered the
+protocol well; the guest was what it took to reach everything *above* the
+protocol, because the packaged `Xspice` launcher cannot start a
+`spice-vdagent` at all. What it covers:
 
 | | |
 |---|---|
 | Link and session | the handshake, the RSA-OAEP ticket, capability negotiation, `MAIN_INIT`, `CHANNELS_LIST`, four channels, the ack window |
 | Display | surfaces, draw commands, incremental updates, every pixel of a repaint |
-| Image codecs | `off`, `quic`, `lz`, `glz`, `auto_glz`, each forced with `--image-compression`, each decoding to exactly the right colour across all 307,200 pixels |
-| Video streams | `--streaming-video all`, MJPEG negotiated by `PREFERRED_VIDEO_CODEC_TYPE`, decoded and composited into a clipped sub-rectangle |
+| Image codecs | `off`, `quic`, `lz`, `glz`, `auto_glz`, each forced with `image-compression=`, each decoding to exactly the right colour across every pixel |
+| Video streams | `streaming-video=all`, MJPEG negotiated by `PREFERRED_VIDEO_CODEC_TYPE`, decoded and composited into a clipped sub-rectangle |
 | Input | pointer and keyboard reaching the guest, verified with `xev -root` as the oracle |
-| Mouse mode | client mode granted and in force; the tablet receives absolute positions |
+| Mouse mode | client mode granted and in force **by a real `spice-vdagent`**; absolute positions land where they were sent |
+| The agent | `MONITORS_CONFIG` resize granted, applied by the guest, and the new geometry tracked back by the client (virtio-gpu; see `testing.md` §4.1) |
 
 Every test connects to a **black** screen, repaints it **while connected**,
 and asserts the pixels. That shape matters: a client that only ever sees the
@@ -363,9 +370,8 @@ which is exactly what a real peer is for.
    `spice-server` reports client mouse mode in `MAIN_INIT` itself; the mock
    granted it in a later `MAIN_MOUSE_MODE`. `MAIN_INIT` is consumed by the
    setup loop inside `connect`, so the mode never reached the input state and
-   the session stayed in server mode -- sending relative deltas, which
-   `Xspice` drops on the floor because its only pointer is a tablet. The
-   pointer did not move at all.
+   the session stayed in server mode -- sending relative deltas, which a
+   tablet-only server drops on the floor. The pointer did not move at all.
 2. **`connect` returned before the primary surface arrived**, so the first
    caller of `dimensions()` got `0x0`. RFB has no equivalent problem because
    `ServerInit` carries the size in the handshake; SPICE sends it as an
@@ -376,48 +382,44 @@ reproduces the real server's behaviour rather than its own.
 
 #### Running them
 
-`Xspice` needs more care than `Xvnc` did, and the test file carries the
-recipe. Two traps in the Debian packaging, both of which look like client
-bugs at first:
-
-- **`Xspice --auto` crashes.** The `xorg.conf` it generates omits the
-  driver's buffer-size options, the QXL driver computes a surface of size
-  zero and aborts inside `malloc`. The test writes its own configuration,
-  which is also the only way to set the geometry -- there is no `--geometry`
-  flag.
-- **`--vdagent` cannot be used without `--auto`**, where it dies on an
-  undefined `temp_dir`. Setting `SpiceVdagentEnabled` in the configuration
-  by hand does not help either: the installed driver never binds the agent
-  sockets.
+The guest is built once and cached; the tests skip with a printed note when
+it or QEMU is absent.
 
 ```sh
-sudo apt install xserver-xspice x11-xserver-utils x11-utils xterm
-cargo test -p solstice-spice --test real_server -- --test-threads=2
+./tests/guest/build-image.sh
+cargo test -p solstice-spice --test real_server -- --test-threads=4
 ```
+
+`docs/testing.md` §4.0 carries the part worth knowing before writing a new
+one: QEMU drops guest damage while no display client is attached, so a test
+must connect *before* it repaints, and the guest needs its own painter
+because `xsetroot -solid` does not survive the process that issued it.
 
 ### 2.7 What is still unvalidated
 
-Smaller than it was, and each item says what would close it.
+Smaller than it was. Each item says what would close it.
 
-- **The guest agent.** `MONITORS_CONFIG` resize, client-mode absolute mouse
-  *through the agent*, and the clipboard are exercised against the mock but
-  not against a real agent, because this `Xspice` build cannot run one (see
-  above). The protocol side is unit-tested; what is untested is a real
-  `spice-vdagent` answering. A QEMU guest would close this and the QXL item
-  below at the same time.
-- **QXL guest-driver behaviour.** `Xspice` shares `spice-server` with QEMU,
-  so the protocol is the same code -- but the *mix* of draw commands a real
-  VM's QXL driver emits is not. `docs/testing.md` §4.2 calls this one manual
-  QEMU run before a release, not a CI job, and that is still the right call.
-  `DRAW_ROP3`, `DRAW_STROKE` and `DRAW_TEXT` in particular have not been seen
-  from any real server; `Xspice` renders through the frame buffer and sends
-  `DRAW_COPY` and `DRAW_FILL`.
-- **Audio.** The playback channel is unit-tested and `Xspice` can feed it
-  from a PulseAudio pipe sink (`--audio-fifo-dir`), which has not been set
-  up. The open question is not whether Opus arrives but whether it can be
-  **repacketised rather than transcoded**, which depends on the frame
-  duration matching `x-nv-aqos.packetDuration` -- a pipeline question
-  (`docs/spice-protocol.md` §7).
+- **The clipboard is not reachable.** `agent.rs` has `clipboard_grab`,
+  `clipboard_request`, `clipboard_data` and `clipboard_release`, and nothing
+  above them exposes any of it -- a session cannot offer, request or send a
+  payload. So this is not an untested feature, it is an unfinished one, and
+  what it needs is API rather than a test. (Resize and client-mode absolute
+  mouse, the other two agent items, are now validated against a real
+  `spice-vdagent`; see §2.6.)
+- **The QXL draw-command mix is reachable but not asserted.**
+  `DRAW_ROP3`, `DRAW_STROKE` and `DRAW_TEXT` had never been seen from any
+  real server, because `Xspice` renders through the frame buffer and emits
+  `DRAW_COPY` and `DRAW_FILL` for everything. The guest can now emit all
+  three on demand -- `solstice-draw stroke|text|rop3` drives the core X11
+  primitives straight through the QXL driver. What is missing is on our side:
+  the display channel keeps no record of which command kinds it has executed,
+  so a test can provoke them but cannot assert they arrived. A small counter
+  on `DisplayChannel`, exposed on the session, closes this.
+- **Audio.** The playback channel is unit-tested and the guest ships
+  `alsa-utils`, but the open question is not whether Opus arrives: it is
+  whether it can be **repacketised rather than transcoded**, which depends on
+  the frame duration matching `x-nv-aqos.packetDuration` -- a pipeline
+  question (`docs/spice-protocol.md` §7).
 - **A long GLZ soak.** The codec tests repaint once. GLZ's dictionary spans
   the session and the bugs are in window management, which needs thousands of
   images rather than one. A nightly job, not a merge gate.
@@ -430,6 +432,17 @@ Smaller than it was, and each item says what would close it.
   display channel the case does not arise, because one channel delivers in
   order. A multi-monitor guest with several display channels would need the
   window shared and the wait reinstated.
+
+Two things that are *not* on this list, because they turned out to be
+properties of the environment rather than of the backend:
+
+- **QXL cannot be resized by any client here**, Solstice or `remote-viewer`.
+  Established by controlled experiment; `docs/testing.md` §4.1 has the
+  account, and the agent tests use virtio-gpu for this reason.
+- **Fence and ContinuousUpdates have no third-party server** now that the RFB
+  tier is QEMU's server, which implements neither. Covered by the mock, which
+  is weaker in the specific way §3 warns about, and recorded in
+  `docs/testing.md` §3.1.
 
 ---
 

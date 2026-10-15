@@ -32,7 +32,7 @@ matters for testing, but as a *reference host* to diff against — §2.4.
 | T0 | Unit + property tests on pure functions | every push | seconds |
 | T1 | Golden vectors from captured real traffic | every push | seconds |
 | T2 | Mock peers — our own fake client and fake servers | every push | < 1 min |
-| T3 | Real implementations, lightweight (Xvnc, Xspice, headless Moonlight) | every push | ~5 min |
+| T3 | Real implementations (one QEMU guest, headless Moonlight) | every push | ~1 min |
 | T4 | Server flag sweeps + loss injection | nightly | ~30 min |
 | T5 | Fuzzing | nightly / continuous | hours |
 | T6 | Manual (GUI clients, subjective quality) | release gate | — |
@@ -168,60 +168,53 @@ a published advisory against Sunshine, so the test names can cite them.
 
 ---
 
-## 3. The RFB side — two poles, not a matrix
+## 3. The RFB side — one real server and a mock
 
 Solstice is an RFB *client*. It does not care whether the server's pixels came
 from X11, Wayland or a VM — the axis that actually matters is **which RFB
 implementation** it is talking to, because each supports a different slice of
 the encoding and pseudo-encoding space.
 
-(Worth being precise: XWayland is not a substitute for a Wayland VNC server.
-XWayland runs X11 *clients* on a Wayland compositor — it is the client side.
-`Xvnc` is a self-contained X server and involves neither Wayland nor XWayland.
-Dropping `wayvnc` is justified by the implementation-coverage argument below,
-not by XWayland.)
+This used to be TigerVNC's `Xvnc`, chosen as a deliberately feature-rich pole.
+It is now QEMU's own RFB server, running on the same guest the SPICE tests
+use (§4). The reason is not that QEMU's server is richer — it is poorer — but
+that **one guest serves both backends**, which replaces two X-server launchers
+and their separate quirks with a single harness, and buys the SPICE side
+things no X server could offer at all.
 
-Rather than sampling six servers, use two deliberately opposite poles:
+### 3.1 QEMU's RFB server — what it actually supports
 
-| Pole | What | Role |
-|---|---|---|
-| **TigerVNC `Xvnc`** | feature-rich real server | everything we want to use, present |
-| **Mock RFB server** | minimal, pedantic, ours | nothing optional present; strict about ordering |
+Probed directly rather than assumed, by offering each encoding in isolation
+and recording what came back:
 
-### 3.1 TigerVNC `Xvnc` — the real server
+| | |
+|---|---|
+| **Encodings** | Raw, Hextile, zlib, Tight, ZRLE served natively; ZYWRLE answers as ZRLE |
+| **Absent** | RRE, CoRRE, ZlibHex — all fall back to Raw |
+| **CopyRect** | inconclusive on a static screen, which offers no copy to describe |
+| **Pseudo** | ExtendedDesktopSize (−308), LEDState (−261), QEMUAudio (−259), and **QEMU Extended Key Event (−258)** |
+| **Absent pseudo** | **Fence (−312) and ContinuousUpdates (−313)** — a ClientFence makes the server close the connection |
+| **Security** | configuration, not capability: `None` by default, VncAuth with a password, VeNCrypt with TLS credentials |
 
-Self-contained X server with a VNC frontend. No Xvfb, no compositor, no VM.
+−258 is the one that mattered most. Scancodes are Solstice's primary keyboard
+path (`bridging-design.md` §4.1), QEMU invented that pseudo-encoding, and
+without it the only real-server coverage would be the keysym fallback.
+
+**What the move cost, stated plainly.** `backend.rs`'s continuous-updates path
+no longer runs against a third-party server. It is still covered by the mock
+below, which offers both and tests the negative — but only against an
+implementation of our own reading of the spec, which is exactly the class of
+mistake `roadmap.md` §3 warns about. That is a deliberate, recorded trade.
 
 ```sh
-Xvnc :1 -geometry 1280x720 -depth 24 -SecurityTypes None -rfbport 5901 &
-DISPLAY=:1 ./tests/tools/barcode-pattern &
-
-# VeNCrypt path
-Xvnc :1 -SecurityTypes VeNCrypt,X509Vnc -X509Cert cert.pem -X509Key key.pem
+./tests/guest/build-image.sh
+cargo test -p solstice-vnc --test real_server -- --test-threads=4
 ```
-
-It covers every axis Solstice actually depends on:
-
-- **Encodings** — Raw, CopyRect, RRE, Hextile, Tight, Tight+JPEG, ZRLE
-  (`common/rfb/*Encoder.cxx`). Force each one individually by offering only
-  that encoding in `SetEncodings`; that is the cleanest way to get
-  deterministic per-encoding coverage from a single server.
-- **Security** — None, VncAuth, VeNCrypt/X509, RSA-AES. Assert that Solstice
-  *refuses* the first two off-loopback per `security.md` §4.1. A refusal test
-  is a security test.
-- **Flow control** — Fence (−312) and ContinuousUpdates (−313).
-- **Input** — **QEMU Extended Key Event (−258) is supported server-side**.
-  `SConnection.cxx:393` advertises it whenever the client requests the
-  pseudo-encoding, and `SMsgReader::readQEMUMessage` parses it. This matters:
-  scancodes are Solstice's *primary* keyboard path (`bridging-design.md` §4.1),
-  and without this we would only ever exercise the keysym fallback against a
-  real server.
-- **Geometry** — DesktopSize and ExtendedDesktopSize.
 
 ### 3.2 Mock RFB server — the opposite pole
 
 A single real server risks coding to *that server's* quirks and shipping a
-client that only works with TigerVNC. The cheap guard is not another daemon —
+client that only works with QEMU's. The cheap guard is not another daemon —
 it is a deliberately minimal server of our own:
 
 - Raw encoding only; no Tight, no ZRLE, no CopyRect
@@ -241,8 +234,8 @@ inject the same with the mock advertising no -258
 ```
 
 Table-driven over the whole VK→scancode and VK→keysym tables, instant, no X
-server. Keep one real-server smoke test (`xev`/`xdotool` observing an `Xvnc`
-session) to catch what the mock's own assumptions would hide.
+server. Keep one real-server smoke test (`xev` observing the guest) to catch
+what the mock's own assumptions would hide.
 
 ### 3.3 What we are knowingly not testing
 
@@ -254,89 +247,81 @@ real bug is reported against one.
 | `wayvnc` / `neatvnc` | TRLE (15), Open H.264 (50), ExtendedClipboard, ExtMouseButtons | Solstice implements neither TRLE nor encoding 50 (`rfb-vnc-protocol.md` §7 rejects H.264 passthrough as an architecture) |
 | `x11vnc` / libvncserver | a second Tight implementation, **and a real server lacking −258** (libvncserver implements QEMU ext key events in `libvncclient` only) | the mock covers the no-−258 keysym path deliberately and more strictly |
 | TurboVNC | JPEG subsampling / fine-grained quality pseudo-encodings | quality knobs, not correctness |
-| QEMU `-vnc` | QEMU Audio (−259), VNC over unix socket | audio is silence on the RFB backend in v1 |
+| TigerVNC `Xvnc` | **Fence (−312) and ContinuousUpdates (−313) against a third-party server**, RRE/CoRRE, RSA-AES | the flow-control paths are covered by the mock; see §3.1 for why this trade was taken, and `roadmap.md` §3 for why it is not free |
 
 ---
 
-## 4. The SPICE side — Xspice only
+## 4. The SPICE side — a real QEMU guest
 
-QEMU is not needed here either. **Xspice links the same `spice-server` library
-QEMU does**, so the display-channel and image-codec behaviour is literally the
-same code — and it exposes the same configuration knobs, without a VM, a guest
-OS, or nested virtualisation.
-
-From `xf86-video-qxl/scripts/Xspice`:
+This used to be `Xspice`, which links the same `spice-server` library QEMU
+does and could therefore cover the protocol without a VM. It covered it well,
+and `-spice` exposes the same knobs its launcher did — `image-compression`,
+`streaming-video`, the WAN compression pair — so nothing was given up by
+moving:
 
 ```
---image-compression  off | auto_glz | auto_lz | quic | glz | lz
---streaming-video    off | all | filter
---video-codecs       encoder:codec;...   (spice:mjpeg default; gstreamer mjpeg/vp8/h264)
---jpeg-wan-compression / --zlib-glz-wan-compression   auto | never | always
---disable-ticketing | --password
---tls-port --x509-dir --x509-cert-file --x509-key-file --dh-file --tls-ciphers
---vdagent            launches spice-vdagent + vdagentd
---numheads           multiple virtual heads
---deferred-fps       rate-limit the dirty-rect stream
---audio-fifo-dir     playback channel fed from PulseAudio module-pipe-sink
+image-compression  off | auto_glz | auto_lz | quic | glz | lz
+streaming-video    off | all | filter
+jpeg-wan-compression / zlib-glz-wan-compression   auto | never | always
+video-codec, playback-compression, agent-mouse, seamless-migration
+password-secret | tls-port | x509-* | sasl
 ```
 
-`--image-compression` offers exactly the choices QEMU's `-spice` does. The
-decoders now exist — `crates/solstice-spice-codec`, tested differentially
-against the real C encoders (§4.3) — so this is no longer about whether the
-codec can be read at all. It is about whether a *server* agrees, which is a
-separate question the vectors cannot answer. Force each one rather than hoping
-the server's heuristics pick it:
+What `Xspice` could not reach was everything *above* the protocol. Its
+packaged launcher cannot start a `spice-vdagent` at all — `--vdagent` requires
+`--auto`, and `--auto` crashes — so the agent had no real peer. And its video
+driver renders through the frame buffer, so every draw command it ever sent
+was a `DRAW_COPY` or a `DRAW_FILL`.
 
-```sh
-Xspice --port 5930 --disable-ticketing --image-compression off  --streaming-video off  # baseline
-Xspice --port 5930 --disable-ticketing --image-compression quic --streaming-video off
-Xspice --port 5930 --disable-ticketing --image-compression glz  --streaming-video off  # stateful
-Xspice --port 5930 --disable-ticketing --image-compression auto_glz --streaming-video all
-```
+### 4.0 The shape every test must keep
 
-Build the SPICE backend against `--image-compression off` first, then add
-codecs one flag at a time. GLZ needs *long* sessions, not single frames — its
-history window is the whole point and the bugs are in window management, which
-is exactly the part frozen vectors cannot exercise: they replay a window of
-eight images, and a real session churns thousands.
-`--streaming-video all` is the one that breaks naive compositing, because
-streams are clipped sub-rectangles layered over the draw commands; turn it on
-early enough to find that out cheaply.
+**Connect first, repaint second.** QEMU renders guest damage into its console
+surface only while a display client is attached: a repaint performed with
+nothing connected is dropped outright, with no error anywhere, and a client
+connecting afterwards is served a stale surface. This was already the right
+shape for a different reason — a client that only ever sees the screen as it
+was at connect time can be completely broken for incremental updates and still
+pass — and against QEMU it is also mandatory.
 
-`--vdagent` is a genuine bonus: clipboard, `MONITORS_CONFIG` resize and
-client-mode absolute mouse are all testable without building a guest image.
-Test with it on *and* off — all three degrade when the agent is absent.
+`connect` returning is slightly earlier than the attach, so the tests
+re-issue the paint rather than asserting on the race. Waiting for a damage
+event instead does *not* work: the server's first update can precede
+`subscribe`, and the wait simply hangs.
 
-**Status: running and passing.** `crates/solstice-spice/tests/real_server.rs`
-does all of the above — `off`, `quic`, `lz`, `glz`, `auto_glz`, plus
-`--streaming-video all`, input against an `xev` oracle, and the no-agent
-resize refusal. `docs/roadmap.md` §2.6 is the account, including the two bugs
-it found that the mock could not.
+Two more things the guest had to be taught, each of which fails silently:
 
-**The shape of each test is the part worth copying.** Connect to a *black*
-screen, repaint it *while connected*, then assert every pixel. A client that
-only ever sees the screen as it was at connect time can be completely broken
-for incremental updates and still pass a test that connects after the content
-exists — which is the mistake the first draft of that file made, and it took
-an independent 80-line Python client to prove where the fault was not.
+- `xsetroot -solid` does not work against this X server. It exits 0, leaves
+  `_XSETROOT_ID` unset, and the root reverts to black the moment it exits,
+  because the background is only retained for a client that asked for
+  `RetainPermanent`. `tests/guest/draw-helper.c` does.
+- `spice-vdagentd` takes `-x`, not `-X`; it needs the `uinput` module; and it
+  needs `/run/spice-vdagentd/` and a machine-id. Miss any one and the daemon
+  is simply absent, which looks exactly like a client that failed to
+  negotiate.
 
-Two traps in Debian's `Xspice`, both of which look like client bugs:
+### 4.1 Which display device, and why it matters
 
-- `--auto` crashes: the `xorg.conf` it generates omits the driver's
-  buffer-size options, so the QXL driver sizes surface 0 at zero and aborts
-  in `malloc`. Write the configuration by hand — which is also the only way
-  to set the geometry, since there is no `--geometry` flag.
-- `--vdagent` cannot be used without `--auto`, where it dies on an undefined
-  `temp_dir`; and setting `SpiceVdagentEnabled` by hand does not help,
-  because the packaged driver never binds the agent sockets. The agent is
-  therefore untested against a real agent — see `docs/roadmap.md` §2.7.
+`GuestConfig::display` picks between two, and the choice is not cosmetic.
 
-```sh
-sudo apt install xserver-xspice x11-xserver-utils x11-utils xterm
-cargo test -p solstice-spice --test real_server -- --test-threads=2
-```
+| | `Qxl` (default) | `VirtioGpu` |
+|---|---|---|
+| What it is | the device a real SPICE guest has | generic KMS, `modesetting` X driver |
+| Image codecs, draw commands, streams | **yes — use this** | not representative |
+| Agent resize | **cannot**: no client can resize a QXL guest here, `remote-viewer` included | **yes — use this** |
+| `spice-vdagent` output map | falls back to "using output index as display id" | maps the connector properly |
 
-### 4.1 Mock SPICE server
+The resize asymmetry was established by controlled experiment, not inferred:
+`remote-viewer` against a freshly booted QXL guest also only scales, while
+both it and Solstice resize a virtio-gpu guest correctly.
+
+QEMU does not forward a client's `MONITORS_CONFIG` to the agent in either
+case — `ui/spice-display.c` registers a `QXLInstance` per console for *every*
+display device, so the message is handed to the device rather than the agent.
+The device makes the requested mode preferred and fires a hotplug event, and
+**userspace is expected to apply it**. On a desktop that is the session's job;
+`tests/guest/init` runs a small loop that stands in for one.
+
+### 4.2 Mock SPICE server
 
 Same rationale as §3.2, for the same negative tests: truncated
 `SpiceLinkMess`, bad magic, wrong `connection_id` on a secondary channel,
@@ -363,20 +348,33 @@ next person too: **message numbers are per-channel namespaces.** 101 is
 `CLIENT_INFO` on the main one. A recorder that filters by type alone finds
 the wrong message.
 
-### 4.2 Known gaps
+### 4.3 Known gaps
 
-**`Xspice` does not cover QXL guest-driver behaviour.** Since it shares
-`spice-server` with QEMU it covers the protocol well, but a real VM's driver
-emits a different *mix* of draw commands than the Xspice video driver does —
-which renders through the frame buffer and sends mostly `DRAW_COPY` and
-`DRAW_FILL`. `DRAW_ROP3`, `DRAW_STROKE` and `DRAW_TEXT` have therefore never
-been seen from a real server. Worth one manual QEMU run before a release, not
-a CI job.
+Smaller than they were. `roadmap.md` §2.7 is the live list; these are the
+ones that are properties of *this harness* rather than of the backend.
 
-**The guest agent has no real peer here**, for the packaging reason in §4
-above. A QEMU guest would close this and the QXL gap in the same run.
+**QXL cannot resize.** See §4.1 — not a client limitation, and not worth
+chasing further, since virtio-gpu serves the agent tests properly.
 
-### 4.3 The image codecs, without a server
+**The clipboard cannot be tested at all**, because it is not plumbed to the
+session: `agent.rs` has `clipboard_grab`/`request`/`data`/`release` and
+nothing above it exposes them. That is missing production API, not a missing
+test.
+
+**The draw-command mix is reachable but not yet asserted.** The guest emits
+`DRAW_STROKE`, `DRAW_TEXT` and `DRAW_ROP3` on demand via `solstice-draw`, so
+the long-standing problem of never having seen them from a real server is
+solved. What is missing is observability on the client side: the display
+channel keeps no record of which command kinds it has executed, so a test can
+drive them but cannot assert they arrived.
+
+**Audio is unexercised.** The guest has `alsa-utils` and QEMU can carry the
+playback channel, but the open question is not whether Opus arrives — it is
+whether it can be **repacketised rather than transcoded**, which depends on
+the frame duration matching `x-nv-aqos.packetDuration` (`spice-protocol.md`
+§7).
+
+### 4.4 The image codecs, without a server
 
 `crates/solstice-spice-codec` is a from-scratch port of QUIC, LZ and GLZ, and
 nothing about those codecs can be checked by reading the code: QUIC's Golomb
@@ -402,8 +400,9 @@ remember:
 
 - It does not test the codecs under a *server's* choices. The images are this
   repository's, not a guest's. §4 and §4.2 are still the real test.
-- **It cannot test a long GLZ session.** That is what `--image-compression glz`
-  against Xspice is for, and why the staged plan puts GLZ last.
+- **It cannot test a long GLZ session.** That is what `image-compression=glz`
+  against the guest is for: the dictionary spans the session and the bugs are
+  in window management, which needs thousands of images rather than one.
 
 ---
 
@@ -436,46 +435,51 @@ keyframe must actually come out of the encoder on the next frame.
 
 ## 6. CI shape
 
-One container image: `tigervnc-standalone-server`, `xspice`, `ffmpeg`, the
-probe client and the barcode generator. No QEMU, no compositor, no VM — which
-is what keeps the image small and the jobs fast.
+One container image for T0–T2: `ffmpeg`, the probe client and the barcode
+generator. T3 and above need `qemu-system-x86_64` and the guest image, which
+`tests/guest/build-image.sh` produces — unprivileged, no installer, about
+four minutes cold.
 
 ```
 on push:      T0 unit/property                      ~20 s
               T1 golden vectors                     ~10 s
               T2 mock client + mock RFB/SPICE       ~40 s
-              T3 Xvnc  + probe client               ~3 min
-              T3 Xspice + probe client              ~2 min
-nightly:      T4 Xvnc  × encodings × security       ~10 min
-              T4 Xspice × image-compression × streaming-video × vdagent  ~10 min
+              T3 both backends against the guest    ~45 s
+nightly:      T4 image-compression × streaming-video × agent sweeps  ~10 min
               T4 loss injection sweep               ~10 min
+              T4 encoding cost measurement          ~1 min
               T5 cargo-fuzz on the nine parsers     ~2 h
 ```
 
-The nightly tier is now a sweep over *one* server's flags rather than a matrix
-of servers, which is both faster and more deterministic — the same binary with
-a different flag isolates the variable properly, where swapping servers
-confounds it.
+The guest is one artifact, not a per-test build, so cache it rather than
+rebuild it:
 
-The four SPICE targets are worth running first when the budget is short. All
-of them have paid for themselves in minutes rather than hours:
+```yaml
+- uses: actions/cache@v4
+  with:
+    path: ~/.cache/solstice/guest
+    key: guest-${{ hashFiles('tests/guest/packages', 'tests/guest/packages.build',
+                             'tests/guest/init', 'tests/guest/xorg.conf',
+                             'tests/guest/draw-helper.c', 'tests/guest/build-image.sh') }}
+- run: ./tests/guest/build-image.sh      # a no-op on a cache hit
+```
 
-| Target | What it found |
-|---|---|
-| `spice_quic` | a 23-byte header asking the decoder for a 151 MiB image |
-| `spice_lz` | a width whose stride overflowed a `u32` before anything could reject it |
-| `spice_draw` | a `COPY_BITS` whose destination rectangle asked for a 174 GB allocation on a 64 × 48 surface |
-| `spice_draw` | a stencil mask with a zero stride and a non-zero width, which indexed an empty row |
+Not Git LFS. The image is a derived artifact and LFS charges twice for that:
+every rebuild adds a ~130 MB blob that stays in history, and every checkout
+spends LFS bandwidth. The free tier is 1 GB of each. If cache eviction (7
+days unused) becomes a problem, promote the artifact to a GitHub Release or
+GHCR keyed by the same hash.
 
-Each now has a named regression test. None was reachable from the
-differential vectors, because the C encoders do not emit malformed headers —
-which is the general point about why both kinds of test are needed.
+Three practical constraints:
 
-Two practical constraints:
-
-- **No nested virtualisation** on most hosted runners. This is a large part of
-  why Xvnc and Xspice are the right choices: neither needs KVM, a guest OS, or
-  a disk image.
+- **Nested virtualisation.** The guest boots in about five seconds with
+  `/dev/kvm` and well under a minute without it, under TCG. Either is fine
+  nightly; only the first is comfortable on every push. Whether hosted
+  runners expose `/dev/kvm` should be checked rather than assumed.
+- **Memory.** Each guest wants about 1 GiB, and below that the initramfs
+  unpacks *partially* — a guest that boots, starts X and is quietly missing
+  binaries. The harness refuses to start one when the machine is short, and
+  caps how many run at once based on what is actually free.
 - **No GPU**, so hardware encoder paths (VAAPI/NVENC) cannot be covered in
   hosted CI. Keep them behind feature flags and test them on a self-hosted
   runner or manually at release.
@@ -488,22 +492,28 @@ Extending `PROJECT-LAYOUT.md` §1:
 
 ```
 tests/
+├── guest/                   # the QEMU guest the T3 tests run against
+│   ├── build-image.sh       # unprivileged build; no installer is ever booted
+│   ├── packages             # runtime package set, pinned to an Alpine branch
+│   ├── packages.build       # toolchain, installed then removed again
+│   ├── manifest.lock        # resolved versions; a mismatch means it is stale
+│   ├── init                 # PID 1: X, spice-vdagent, qemu-ga, mode watcher
+│   ├── xorg.conf            # geometry and driver substituted from the cmdline
+│   └── draw-helper.c        # solstice-draw: fill, stroke, text, rop3
 ├── vectors/
 │   ├── fec/                 # nanors differential vectors (see the FEC work)
-│   ├── pairing/             # lifted from Sunshine's test_http_pairing.cpp
+│   ├── spice/               # QUIC/LZ/GLZ differential vectors
 │   └── capture/             # golden Sunshine↔Moonlight transcripts
-├── mocks/
-│   ├── moonlight_client/    # hostile client, T2
-│   ├── rfb_server/          # recording RFB server, T2
-│   └── spice_server/        # recording SPICE server, T2
-├── tools/
-│   ├── mlc-probe/           # moonlight-common-c + the three debug flags
-│   └── barcode-pattern/     # the on-screen test pattern
-└── integration/
-    ├── vnc_matrix.rs
-    ├── spice_matrix.rs
-    └── loss_injection.rs
+└── tools/
+    ├── gen_fec_vectors.py
+    └── gen_spice_vectors.py
+
+crates/solstice-test-guest/  # boots the guest and drives it; dev-only
 ```
+
+The guest image itself is built into `~/.cache/solstice/guest` and is not in
+the repository — `manifest.lock` is what is committed, so a stale image is
+loud rather than silent.
 
 ---
 

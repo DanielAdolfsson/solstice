@@ -17,10 +17,10 @@ of a real VNC desktop, which decodes to the right pixels. That path is a test
 **Both backends work against a real server.** The SPICE one is complete —
 channel links, the 2D rasteriser, all six image types, video streams, the
 guest agent and audio — and `tests/real_server.rs` drives it against a live
-`Xspice`, which links the same `spice-server` library QEMU does: every image
-codec forced in turn, MJPEG streams, and input verified against the guest's
-own event stream. What has *not* been exercised is a real `spice-vdagent` and
-a QEMU guest's QXL driver, which is written up in
+a **real QEMU guest** — every image codec forced in turn, MJPEG streams,
+input verified against the guest's own event stream, and a real
+`spice-vdagent` granting and applying a resize. What has *not* been exercised
+is written up in
 [docs/roadmap.md §2.7](docs/roadmap.md#27-what-is-still-unvalidated).
 
 See [Status](#status) for the full picture, including what is deliberately
@@ -35,9 +35,23 @@ source). No cmake, no nasm, no system libraries.
 
 ```sh
 cargo build --release
-cargo test --workspace        # 655 tests, about 20 s
+cargo test --workspace        # 660 tests, about 30 s
 cargo clippy --workspace --all-targets
 ```
+
+The tests that need a real server build and boot a small QEMU guest. They
+skip with a printed note if it is absent, so the suite runs without one — but
+to actually exercise them:
+
+```sh
+./tests/guest/build-image.sh      # ~4 min cold, then cached
+```
+
+It needs `qemu-system-x86_64`, `curl` and unprivileged user namespaces, and
+runs entirely without `sudo`: no installer is ever booted, the root
+filesystem is assembled on the host and packed as a stateless initramfs. The
+guest serves **both** backends — QEMU's RFB server and `spice-server` with a
+real `spice-vdagent` — so one image covers the whole T3 tier.
 
 The default features are `vnc` and `openh264`. SPICE is **not** on by default:
 it is excludable at compile time along with its whole dependency tree — the
@@ -76,7 +90,7 @@ pointed at a client before any desktop is involved.
 | [docs/spice-protocol.md](docs/spice-protocol.md) | SPICE channels, link handshake, the display command stream, and why this backend is the optional one |
 | [docs/bridging-design.md](docs/bridging-design.md) | Where the protocols meet: the frame-clock problem, the encode pipeline, input translation, latency budget, build order |
 | [docs/security.md](docs/security.md) | Threat analysis of all three protocols and of the bridge itself, with a direct answer on internet exposure |
-| [docs/testing.md](docs/testing.md) | How to test and mock this: tiers, a headless Moonlight client, `Xvnc` and `Xspice` as the only real servers needed, loss injection, and what is deliberately not covered |
+| [docs/testing.md](docs/testing.md) | How to test and mock this: tiers, a headless Moonlight client, one QEMU guest serving both backends, loss injection, and what is deliberately not covered |
 | [docs/implementation-notes.md](docs/implementation-notes.md) | **What building it settled**: which research claims held, which were wrong, and what the benchmarks say |
 | [docs/roadmap.md](docs/roadmap.md) | **The work that is not done**, in enough detail to start on: why, what exactly, where it plugs in, and the tests that finish it |
 | [PROJECT-LAYOUT.md](PROJECT-LAYOUT.md) | The Cargo workspace as built, crate responsibilities, feature flags, and where each piece of the protocol lives |
@@ -126,12 +140,11 @@ Each of these is written up in [docs/roadmap.md](docs/roadmap.md) with a plan,
 the tests that would finish it, and what is already known to be hard. The
 summaries below are just the shape of it.
 
-- **The SPICE guest agent, against a real agent.** `MONITORS_CONFIG` resize
-  and the clipboard are implemented and tested against the mock, but Debian's
-  `Xspice` cannot run `spice-vdagent` (`--vdagent` dies on an undefined
-  variable, and the packaged driver never binds the agent sockets), so no
-  real agent has answered. A QEMU guest would close this and the QXL
-  draw-command-mix question together.
+- **The SPICE clipboard.** It is implemented in `agent.rs` and tested against
+  the mock, but nothing above it exposes it: there is no way for a session to
+  grab, request or send a clipboard payload, so it cannot be tested end to
+  end. That is missing API rather than a missing test. Resize and client-mode
+  absolute mouse *are* now validated against a real `spice-vdagent`.
   [The list](docs/roadmap.md#27-what-is-still-unvalidated).
 - **`DRAW_COMPOSITE`, GL scanout, and two cursor types** on the SPICE side.
   Each is a deliberate omission rather than a gap, and the capability is not
@@ -197,8 +210,8 @@ The strategy is in [docs/testing.md](docs/testing.md); what exists today:
 | T0 | Unit and property tests on pure functions | throughout; 381 total |
 | T1 | **Differential FEC vectors against the real `nanors`** | `tests/vectors/fec/`, `crates/solstice-gamestream/tests/fec_vectors.rs` |
 | T2 | The RFB client against a deliberately minimal recording mock server | `crates/solstice-vnc/tests/mock_server.rs` |
-| T3 | The RFB client against **TigerVNC's `Xvnc`**, the feature-rich pole — skipped with a note when it is not installed | `crates/solstice-vnc/tests/real_server.rs` |
-| T3 | **The whole stack end to end**: pair, launch, RTSP, decrypt, reassemble, decode H.264 — twice, once against the colour-bar generator reading the frame counter off the picture, and once against a real `Xvnc` desktop checking the pixels are the colour it was painted | `crates/solstice/tests/end_to_end.rs` |
+| T3 | The RFB client against **QEMU's RFB server**, on the same guest the SPICE tests use — skipped with a note when QEMU or the guest image is absent | `crates/solstice-vnc/tests/real_server.rs` |
+| T3 | **The whole stack end to end**: pair, launch, RTSP, decrypt, reassemble, decode H.264 — twice, once against the colour-bar generator reading the frame counter off the picture, and once against a real guest desktop checking the pixels are the colour it was painted | `crates/solstice/tests/end_to_end.rs` |
 | T5 | Five `cargo-fuzz` targets over the parsers the CVEs lived in | `fuzz/fuzz_targets/` |
 
 Two `#[ignore]`d benchmarks measure where the CPU goes --
@@ -209,10 +222,9 @@ the backend encoding is not where the performance is.
 `docs/implementation-notes.md` §3 has the numbers.
 
 Both poles of the RFB testing earned their keep: the fuzzer found an integer
-underflow in the ZRLE palette-RLE path reachable from any server, and the real
-server found a livelock the mock could not — `Xvnc` sends an
-ExtendedDesktopSize rectangle on every full update, which the client was
-treating as a resize. `docs/implementation-notes.md` §1 has both.
+underflow in the ZRLE palette-RLE path reachable from any server, and a real
+server found a livelock the mock could not — it sends an ExtendedDesktopSize
+rectangle on every full update, which the client was treating as a resize. `docs/implementation-notes.md` §1 has both.
 
 The FEC vectors are the ones worth explaining. Moonlight's Reed–Solomon must
 match `nanors` byte-for-byte or recovery silently corrupts video under packet
