@@ -422,39 +422,35 @@ async fn guest_eventually(guest: &Guest, script: &str, wanted: &str) -> Result<S
     Err(format!("`{script}` never produced {wanted:?}; last saw: {last:?}"))
 }
 
-/// The same resize on QXL, which does not work and is not understood.
+/// The same resize on QXL, which no client can do here.
 ///
-/// The virtio-gpu case above passes, so the client is not the obvious
-/// suspect -- the same code, the same message, the same guest userspace.
-/// But a reference client *can* move this device: connecting `remote-viewer`
-/// to a long-running QXL guest and dragging the window moved
-/// `/sys/class/drm/card0-Virtual-1/modes` to `1023x717`, its client area.
-/// (It still only scaled, because that guest predated the mode watcher and
-/// so had nobody to apply the new preferred mode -- but the device had
-/// plainly accepted the config.) Solstice's request moves it to nothing, at
-/// any size, ever.
+/// Ignored because the device cannot serve it in this configuration, which
+/// was established by controlled experiment rather than inferred. Pointing
+/// `remote-viewer` at a freshly booted QXL guest -- same image, same age,
+/// same guest userspace as this test's -- also only scales: the guest's
+/// resolution does not change. Against virtio-gpu the same client resizes
+/// correctly, and so does Solstice. **Solstice therefore behaves exactly as
+/// the reference client does on both devices**, which is the result that
+/// matters; the earlier suspicion that it had a QXL-specific bug came from
+/// comparing a fresh guest against a long-lived one and is withdrawn.
 ///
-/// Neither client's monitors config reaches `spice-vdagent`, which is
-/// expected: `ui/spice-display.c` registers a `QXLInstance` per console, so
-/// `spice-server` hands the message to the device rather than forwarding it.
-/// On QXL that is `interface_client_monitors_config` in `hw/display/qxl.c`,
-/// which has several silent refusal paths.
+/// (A long-running QXL guest did once accept a monitors config from
+/// remote-viewer, moving its preferred mode to the window's client area. A
+/// fresh one does not, from either client. Whatever changes in that guest
+/// over time is a QEMU/QXL curiosity and not a property of this client.)
 ///
-/// Ruled out by experiment, in order: the message encoding (verified byte by
-/// byte against `vd_agent.h`); the capability gate; token starvation; the
-/// `AGENT_START` token count; the requested size (swept, including the exact
-/// `1023x717` remote-viewer used); guest settling time (0 s, 15 s, 45 s);
-/// and the `flags`, `depth` and `num_of_monitors` fields (swept).
+/// Along the way, ruled out as causes on our side: the message encoding,
+/// verified byte by byte against `vd_agent.h`; the capability gate; token
+/// starvation; the `AGENT_START` token count; the requested size; guest
+/// settling time; and the `flags`, `depth` and `num_of_monitors` fields.
 ///
-/// What has *not* been separated is the client from the guest instance:
-/// remote-viewer succeeded against a long-lived guest, Solstice failed
-/// against fresh ones. Pointing remote-viewer at a freshly booted QXL guest
-/// would decide it -- if it also fails, the variable is the guest, not the
-/// client. Until then this stays ignored rather than asserted either way.
+/// The practical consequence is in [`Display`]: agent tests use
+/// `VirtioGpu`, and `Qxl` stays the default for the image-codec and
+/// draw-command tests, which need the device a real SPICE guest has.
 ///
 /// `a_resize_is_declined_without_the_agent` is unaffected and still passes.
 #[tokio::test]
-#[ignore = "unresolved: QXL ignores our monitors config though remote-viewer can move the same device"]
+#[ignore = "QXL cannot resize here; remote-viewer fails identically on a fresh QXL guest"]
 async fn a_real_agent_grants_and_applies_a_resize() {
     resize_test(Display::Qxl).await;
 }
