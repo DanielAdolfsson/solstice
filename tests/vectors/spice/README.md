@@ -82,6 +82,12 @@ The script refuses to write a set that has stopped covering an image type, has
 non-contiguous GLZ window ids, or no longer exercises LZ's far-distance
 escape.
 
+**Both dump programs are deterministic**, and regenerating reproduces the
+committed `vectors.json.gz` byte for byte. That is the point of the test
+images being built from a fixed xorshift rather than `rand()`: it means the
+committed blob is auditable. A reviewer who does not want to take 409 KiB of
+opaque base64 on trust can rebuild it and `cmp`.
+
 ## What the images are chosen for
 
 | Pattern | Reaches |
