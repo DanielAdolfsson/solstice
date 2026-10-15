@@ -1344,6 +1344,7 @@ dependencies = [
  "serde",
  "solstice-backend",
  "solstice-gamestream",
+ "solstice-spice-codec",
  "solstice-video",
  "solstice-vnc",
  "thiserror",
@@ -1399,6 +1400,16 @@ dependencies = [
 [[package]]
 name = "solstice-input"
 version = "0.1.0"
+
+[[package]]
+name = "solstice-spice-codec"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "solstice-video"

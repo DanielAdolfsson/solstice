@@ -217,15 +217,41 @@ Client → server (`enums.h:521-529`): `DISPLAY_INIT 101`, `STREAM_REPORT 102`,
 ### 5.1 Images
 
 `DRAW_*` messages carry `SpiceImage`s whose descriptor selects a compression
-scheme: **QUIC** (SPICE's own wavelet-ish codec), **LZ**, **GLZ** (LZ with a
+scheme: **QUIC** (SPICE's own lossless codec), **LZ**, **GLZ** (LZ with a
 cross-image history window), **JPEG**, **JPEG + LZ alpha**, **ZLIB-over-GLZ**,
 **LZ4**, or raw bitmap.
 
-QUIC and GLZ are the problem. Both are SPICE-specific, neither has a Rust
-implementation, and GLZ is *stateful across images* — you cannot decode one
-message in isolation. Any serious SPICE backend needs `spice-common`'s decoders
-or a port of them. A client can bias the server away from them with
-`PREFERRED_COMPRESSION`, but cannot forbid them.
+QUIC and GLZ were the problem: both are SPICE-specific, neither had a Rust
+implementation, and GLZ is *stateful across images* — a message cannot be
+decoded in isolation. A client can bias the server away from them with
+`PREFERRED_COMPRESSION` but cannot forbid them, and QEMU's default
+`image-compression=auto_glz` picks between the two per image, so neither can
+be skipped for real use.
+
+**This is now `crates/solstice-spice-codec`** — QUIC, LZ and GLZ ported to
+Rust from `spice-common` and `spice-gtk`, verified against the real C encoders
+by the differential vectors in `tests/vectors/spice/`. `docs/roadmap.md` §2.2
+is the full account, including what the port does that the C does not. The
+short version of what is worth knowing here:
+
+- **QUIC** is not a wavelet codec, whatever its reputation. It is Starosolski's
+  SFALIC: predict each channel from `(left + above) / 2`, code the residual
+  with an adaptive Golomb-Rice model, and switch to a melcode run mode on flat
+  ground. The model is never transmitted — both ends evolve it in lockstep on
+  a schedule driven by a fixed 256-entry table — so a single desynchronised
+  bit corrupts the rest of the image rather than one pixel.
+- **GLZ's window is the client's problem, not the server's.** Its size is the
+  server's choice, and a client that grows to match has handed a stranger its
+  allocator. The decoder caps the window and reports a miss if a match wants
+  something it has dropped; a miss is not recoverable per-image, so the
+  display channel has to reset.
+- **Two 32-bit header fields decide how much work a decode is**, before any
+  of it can be validated. The decoder takes a pixel ceiling, and the display
+  channel should set it from the surface being drawn into rather than leave
+  the default: a bitmap cannot legitimately be larger than its destination.
+
+Still outside the crate, deliberately: **JPEG**, **LZ4** and **ZLIB** have
+Rust crates and should use them.
 
 ### 5.2 Video streams
 
@@ -307,11 +333,13 @@ experimentally before relying on it.
    trait shaped around "one socket, one read loop" will not fit SPICE.
 2. **Compositing is mandatory and harder than RFB's.** Draw commands,
    multiple surfaces, QUIC/GLZ/LZ4 images, plus overlaid video streams, all
-   have to be rendered into one framebuffer before encoding.
-3. **The image codecs are the gating item.** QUIC and GLZ have no Rust
-   implementations. Realistic paths: FFI to `spice-common`, port the decoders,
-   or constrain the server (`PREFERRED_COMPRESSION`) and accept a fallback to
-   software rendering when something unsupported arrives.
+   have to be rendered into one framebuffer before encoding. This is now the
+   gating item.
+3. ~~**The image codecs are the gating item.**~~ Done:
+   `crates/solstice-spice-codec` (§5.1). What it does not cover is the
+   `SpiceImage` descriptor around the stream, the palette the indexed types
+   index into, and the surface the result is blitted onto — all of which
+   belong to the display channel.
 4. **Input is the easy part**, and shares a scancode table with the VNC
    backend.
 5. **The agent is what makes it good.** `MONITORS_CONFIG` to match Moonlight's
@@ -326,4 +354,6 @@ itself as a pure-Rust SPICE client with WASM support, but it is a component of
 suggests very little production exposure. Read it before depending on it;
 expect to need the image decoders it may not have.
 
-This is the main reason SPICE is scoped as optional and deferred.
+The image decoders are no longer a reason to defer: they are written
+(§5.1). SPICE stays optional because of §8 items 1, 2 and 5 — the
+multi-connection session shape, the 2D rasteriser, and the agent.

@@ -12,6 +12,7 @@ libfuzzer-sys = "0.4"
 solstice-gamestream = { path = "../crates/solstice-gamestream" }
 solstice-vnc = { path = "../crates/solstice-vnc" }
 solstice-backend = { path = "../crates/solstice-backend" }
+solstice-spice-codec = { path = "../crates/solstice-spice-codec" }
 tokio = { version = "1", features = ["rt", "macros", "io-util"] }
 
 [[bin]]
@@ -41,5 +42,17 @@ doc = false
 [[bin]]
 name = "rfb_rect"
 path = "fuzz_targets/rfb_rect.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "spice_quic"
+path = "fuzz_targets/spice_quic.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "spice_lz"
+path = "fuzz_targets/spice_lz.rs"
 test = false
 doc = false

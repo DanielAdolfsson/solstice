@@ -12,7 +12,8 @@ Moonlight ──GameStream──▶ Solstice ──RFB / SPICE──▶ remote d
 **Status: it works end to end.** A Moonlight-shaped client can pair, launch,
 negotiate encrypted RTSP, and receive an encrypted, FEC-protected H.264 stream
 of a real VNC desktop, which decodes to the right pixels. That path is a test
-(`a_client_receives_the_pixels_of_a_real_vnc_desktop`), not a claim. SPICE is not implemented.
+(`a_client_receives_the_pixels_of_a_real_vnc_desktop`), not a claim. The SPICE
+backend is not implemented; its image codecs are.
 See [Status](#status) for the full picture, including what is deliberately
 absent.
 
@@ -30,7 +31,8 @@ cargo clippy --workspace --all-targets
 ```
 
 The default features are `vnc` and `openh264`. SPICE is excludable at compile
-time along with its dependency tree, and so is the encoder:
+time along with its dependency tree — including `solstice-spice-codec`, which
+the `spice` feature pulls in — and so is the encoder:
 
 ```sh
 cargo build --no-default-features --features vnc      # no H.264 encoder
@@ -105,11 +107,14 @@ Each of these is written up in [docs/roadmap.md](docs/roadmap.md) with a plan,
 the tests that would finish it, and what is already known to be hard. The
 summaries below are just the shape of it.
 
-- **SPICE.** Feature-gated and deferred, as the research recommended: its image
-  codecs — QUIC and GLZ — have no Rust implementations and GLZ is stateful
-  across images, so the backend needs an FFI binding to `spice-common` or a
-  port of its decoders. `backend.kind = "spice"` reports this rather than
-  failing obscurely. [Staged plan](docs/roadmap.md#2-spice-backend), M1–M7.
+- **The SPICE backend.** Feature-gated and deferred — but no longer on its
+  image codecs, which used to be the thing gating it. QUIC, LZ and GLZ are
+  implemented in `solstice-spice-codec`: pure Rust, no `unsafe`, and verified
+  against the real C encoders by 278 differential vectors. What is missing is
+  the protocol above them — the channel link handshake, the display channel's
+  2D rasteriser, and the agent. `backend.kind = "spice"` reports this rather
+  than failing obscurely. [Staged plan](docs/roadmap.md#2-spice-backend),
+  M1–M7, and [the codec account](docs/roadmap.md#22-the-image-codecs--settled-and-ported).
 - **Tight encoding** on the RFB side. Solstice does not advertise it, so a
   conforming server will not send it; a server that sends it anyway gets an
   error rather than a guess. ZRLE covers the same ground.
