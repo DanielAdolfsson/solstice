@@ -932,6 +932,7 @@ dependencies = [
  "libfuzzer-sys",
  "solstice-backend",
  "solstice-gamestream",
+ "solstice-spice-codec",
  "solstice-vnc",
  "tokio",
 ]
@@ -969,6 +970,13 @@ dependencies = [
 [[package]]
 name = "solstice-input"
 version = "0.1.0"
+
+[[package]]
+name = "solstice-spice-codec"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "solstice-vnc"
