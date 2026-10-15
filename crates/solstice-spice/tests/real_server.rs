@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use solstice_backend::{BackendEvent, InputEvent, KeyEvent, Session};
 use solstice_spice::backend::{connect, SpiceConfig, SpiceSecurity, TcpDialer};
-use solstice_test_guest::{Guest, GuestConfig, Spice};
+use solstice_test_guest::{Display, Guest, GuestConfig, Spice};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -467,7 +467,23 @@ async fn guest_eventually(guest: &Guest, script: &str, wanted: &str) -> Result<S
 #[tokio::test]
 #[ignore = "QEMU's QXL does not act on a monitors config here; remote-viewer cannot resize this guest either"]
 async fn a_real_agent_grants_and_applies_a_resize() {
-    let Some(guest) = start(800, 600, "off", "off") else {
+    resize_test(Display::Qxl).await;
+}
+
+/// The same thing on `virtio-gpu`, where `spice-server` has no QXL instance
+/// to hand the monitors config to and should forward it to the agent instead.
+#[tokio::test]
+async fn a_real_agent_grants_and_applies_a_resize_on_virtio_gpu() {
+    resize_test(Display::VirtioGpu).await;
+}
+
+async fn resize_test(display: Display) {
+    let Some(guest) = Guest::start(
+        GuestConfig::new()
+            .geometry(800, 600)
+            .display(display)
+            .spice(Spice::new().image_compression("off")),
+    ) else {
         return;
     };
     let session = session(guest.spice_port()).await;
@@ -497,18 +513,15 @@ async fn a_real_agent_grants_and_applies_a_resize() {
     // 1152x864 deliberately, not 1024x768: the latter is already this
     // device's default preferred mode, so asking for it would be
     // indistinguishable from nothing happening.
-    guest_eventually(&guest, "head -1 /sys/class/drm/card0-Virtual-1/modes", "1152x864")
+    guest_eventually(&guest, "xdpyinfo | grep dimensions", "1152x864")
         .await
         .unwrap_or_else(|e| {
             panic!(
-                "the request never reached the guest's device: {e}\n--- vdagentd ---\n{}",
-                guest.sh("tail -20 /var/log/vdagentd.log").unwrap_or_default()
+                "{display:?}: the guest never changed mode: {e}\n--- drm preferred ---\n{}\n--- drm modes ---\n{}",
+                guest.sh("head -1 /sys/class/drm/card0-Virtual-1/modes").unwrap_or_default(),
+                guest.sh("head -c 90 /sys/class/drm/card0-Virtual-1/modes | tr '\\n' ' '").unwrap_or_default(),
             )
         });
-
-    guest_eventually(&guest, "xdpyinfo | grep dimensions", "1152x864")
-        .await
-        .unwrap_or_else(|e| panic!("the guest never changed mode: {e}"));
 
     let deadline = tokio::time::Instant::now() + TIMEOUT;
     while tokio::time::Instant::now() < deadline && session.dimensions() != (1152, 864) {

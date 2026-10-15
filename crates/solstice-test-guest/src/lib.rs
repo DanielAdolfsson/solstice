@@ -156,6 +156,39 @@ impl Spice {
     }
 }
 
+/// Which display device the guest gets.
+///
+/// This is not a cosmetic choice. `spice-server` intercepts a client's
+/// `VD_AGENT_MONITORS_CONFIG` to hand it to a QXL instance rather than
+/// forwarding it to `spice-vdagent`, so on [`Display::Qxl`] a resize request
+/// never reaches the agent and the device does not act on it either. With no
+/// QXL instance the message falls through to the agent, which applies the
+/// mode itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Display {
+    /// `-vga qxl` with the `qxl` X driver. What a real SPICE guest has, and
+    /// what the image-codec and draw-command tests want.
+    Qxl,
+    /// `-vga virtio` with the generic KMS `modesetting` X driver.
+    VirtioGpu,
+}
+
+impl Display {
+    fn vga(self) -> &'static str {
+        match self {
+            Self::Qxl => "qxl",
+            Self::VirtioGpu => "virtio",
+        }
+    }
+
+    fn x_driver(self) -> &'static str {
+        match self {
+            Self::Qxl => "qxl",
+            Self::VirtioGpu => "modesetting",
+        }
+    }
+}
+
 /// How to start the guest.
 #[derive(Clone, Debug)]
 pub struct GuestConfig {
@@ -164,6 +197,7 @@ pub struct GuestConfig {
     memory_mb: u32,
     spice: Option<Spice>,
     vnc: bool,
+    display: Display,
 }
 
 impl Default for GuestConfig {
@@ -175,6 +209,7 @@ impl Default for GuestConfig {
             memory_mb: 1024,
             spice: None,
             vnc: false,
+            display: Display::Qxl,
         }
     }
 }
@@ -202,6 +237,12 @@ impl GuestConfig {
     /// Serve RFB on [`Guest::vnc_socket`].
     pub fn vnc(mut self) -> Self {
         self.vnc = true;
+        self
+    }
+
+    /// Pick the display device; see [`Display`].
+    pub fn display(mut self, display: Display) -> Self {
+        self.display = display;
         self
     }
 
@@ -341,14 +382,13 @@ impl Guest {
             .args([
                 "-append",
                 &format!(
-                    "console=ttyS0 quiet solstice.geometry={}x{}",
-                    config.width, config.height
+                    "console=ttyS0 quiet solstice.geometry={}x{} solstice.xdriver={}",
+                    config.width,
+                    config.height,
+                    config.display.x_driver()
                 ),
             ])
-            // QXL regardless of which protocol is under test: it is the
-            // device a real SPICE guest has, and the VNC server renders the
-            // same console surface either way.
-            .args(["-vga", "qxl"])
+            .args(["-vga", config.display.vga()])
             .args(["-qmp", &format!("unix:{},server=on,wait=off", sock("qmp.sock").display())])
             .args([
                 "-chardev",

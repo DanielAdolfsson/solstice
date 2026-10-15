@@ -27,12 +27,17 @@ mount -t tmpfs    -o nosuid,nodev        shm    /dev/shm
 # is one substitution into a fixed config.
 GEOMETRY=$(sed -n 's/.*solstice\.geometry=\([0-9]*x[0-9]*\).*/\1/p' /proc/cmdline)
 [ -n "$GEOMETRY" ] || GEOMETRY=1280x720
-sed -i "s/@GEOMETRY@/$GEOMETRY/" /etc/X11/xorg.conf
-log "geometry $GEOMETRY"
+# `solstice.xdriver=` picks the X driver, because the display device is not
+# always QXL: virtio-gpu has no dedicated driver and goes through the generic
+# KMS `modesetting` one, which xorg-server ships itself.
+XDRIVER=$(sed -n 's/.*solstice\.xdriver=\([a-z]*\).*/\1/p' /proc/cmdline)
+[ -n "$XDRIVER" ] || XDRIVER=qxl
+sed -i -e "s/@GEOMETRY@/$GEOMETRY/" -e "s/@XDRIVER@/$XDRIVER/" /etc/X11/xorg.conf
+log "geometry $GEOMETRY, X driver $XDRIVER"
 
 # uinput is what spice-vdagentd injects absolute pointer events through;
 # without it the daemon starts and then cannot do its job.
-for m in qxl virtio_console virtio_pci evdev uinput; do modprobe "$m" 2>/dev/null; done
+for m in qxl virtio_gpu virtio_console virtio_pci evdev uinput; do modprobe "$m" 2>/dev/null; done
 
 udevd --daemon 2>/dev/null
 udevadm trigger --type=subsystems --action=add 2>/dev/null
@@ -80,6 +85,40 @@ if [ -e /dev/virtio-ports/com.redhat.spice.0 ]; then
 else
     log "no spice vdagent port; agent not started"
 fi
+
+# Apply the mode the host asks for.
+#
+# QEMU does not forward a client's MONITORS_CONFIG to spice-vdagent: it
+# registers a QXLInstance per console even for non-QXL devices, consumes the
+# message there, and turns it into a UI-info hint to the display device. The
+# guest's kernel driver then makes the requested mode preferred and fires a
+# hotplug event -- and *userspace* is expected to apply it. On a desktop guest
+# that is the session's job (mutter, kwin, a display manager); this guest has
+# no desktop, so this loop stands in for one.
+#
+# Measured, not assumed: with virtio-gpu, requesting 1152x864 moves
+# /sys/class/drm/card0-Virtual-1/modes to 1152x864. With QXL it does not move
+# at all, which is why the QXL resize test stays ignored.
+#
+# Only reacts to the preferred mode *changing*. The device's default
+# preference is not the geometry this guest was asked to boot at, so acting on
+# the initial value would resize every guest away from its configured size
+# before any test connected.
+OUTPUT=$(basename "$(find /sys/class/drm -maxdepth 1 -name 'card*-*-1' | head -1)")
+OUTPUT=${OUTPUT#card0-}
+(
+    last=$(head -1 "/sys/class/drm/card0-$OUTPUT/modes" 2>/dev/null)
+    while :; do
+        want=$(head -1 "/sys/class/drm/card0-$OUTPUT/modes" 2>/dev/null)
+        if [ -n "$want" ] && [ "$want" != "$last" ]; then
+            xrandr --output "$OUTPUT" --mode "$want" 2>/dev/null ||
+                xrandr --output "$OUTPUT" --mode "$want" --rate 60 2>/dev/null
+            last=$want
+        fi
+        sleep 0.4
+    done
+) &
+log "mode watcher on $OUTPUT"
 
 solstice-draw fill 000000
 log "ready"
