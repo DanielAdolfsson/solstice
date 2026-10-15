@@ -307,6 +307,16 @@ early enough to find that out cheaply.
 client-mode absolute mouse are all testable without building a guest image.
 Test with it on *and* off — all three degrade when the agent is absent.
 
+**Status: written, never run.** `crates/solstice-spice/tests/real_server.rs`
+does all of the above — `off`, `quic`, `lz`, `lz4`, `glz`, plus
+`--streaming-video all` and the no-agent resize — and skips with a printed
+note, because `Xspice` is not installed on the machine the backend was
+written on. That makes the mock (§4.1) the only peer the client has ever
+spoken to, and a wrong assumption shared by the client and the mock passes.
+`apt install xserver-xspice` and running that file is the single
+highest-value test action available in this repository
+(`docs/roadmap.md` §2.6).
+
 ### 4.1 Mock SPICE server
 
 Same rationale as §3.2, for the same negative tests: truncated
@@ -314,13 +324,39 @@ Same rationale as §3.2, for the same negative tests: truncated
 ack-window violations, and a `SpiceDataHeader` whose `size` overruns the
 payload.
 
-### 4.2 Known gap
+Built: `crates/solstice-spice/src/mock.rs`, driven by
+`tests/mock_server.rs`. It is a *real* link peer rather than a stub — it
+mints a 1024-bit RSA key per session, hands over the DER public key, and
+decrypts the ticket the client sends back, so the OAEP path is exercised
+rather than faked. Which is also why the workspace optimises `rsa` even in
+debug builds: unoptimised key generation takes seconds per connection, and a
+session opens four of them.
 
-Xspice is the only SPICE server tested. Since it shares `spice-server` with
-QEMU this covers the protocol well, but it does **not** cover QXL guest-driver
-behaviour — a real VM's driver emits different draw-command mixes than the
-Xspice video driver does. Worth one manual QEMU run before a release, not a CI
-job.
+It offers nothing optional, for the same reason the RFB mock does: raw
+bitmaps only, no image compression, no streams unless a test pushes one. And
+it records every client message, which is what makes input testable precisely
+— inject a Moonlight key event at one end, assert on the exact scancode that
+came out the other.
+
+One trap it surfaced immediately, worth repeating because it will catch the
+next person too: **message numbers are per-channel namespaces.** 101 is
+`KEY_DOWN` on the inputs channel, `DISPLAY_INIT` on the display one and
+`CLIENT_INFO` on the main one. A recorder that filters by type alone finds
+the wrong message.
+
+### 4.2 Known gaps
+
+Two, and the first is larger than it was.
+
+**No real server has answered the client at all** — see the status note in §4
+above. Everything the SPICE backend does is verified against the
+specification and against a mock written from the same reading of it.
+
+**`Xspice` would not close the second gap either.** Since it shares
+`spice-server` with QEMU it covers the protocol well, but it does **not**
+cover QXL guest-driver behaviour — a real VM's driver emits different
+draw-command mixes than the Xspice video driver does. Worth one manual QEMU
+run before a release, not a CI job.
 
 ### 4.3 The image codecs, without a server
 
@@ -395,7 +431,7 @@ on push:      T0 unit/property                      ~20 s
 nightly:      T4 Xvnc  × encodings × security       ~10 min
               T4 Xspice × image-compression × streaming-video × vdagent  ~10 min
               T4 loss injection sweep               ~10 min
-              T5 cargo-fuzz on the seven parsers    ~2 h
+              T5 cargo-fuzz on the nine parsers     ~2 h
 ```
 
 The nightly tier is now a sweep over *one* server's flags rather than a matrix
@@ -403,13 +439,19 @@ of servers, which is both faster and more deterministic — the same binary with
 a different flag isolates the variable properly, where swapping servers
 confounds it.
 
-The two SPICE codec targets are worth running first when the budget is short.
-Both have already paid for themselves in minutes rather than hours:
-`spice_quic` found a 23-byte header asking the decoder for a 151 MiB image,
-and `spice_lz` found a width whose stride overflowed a `u32` before anything
-had a chance to reject it. Both now have named regression tests; neither was
-reachable from the differential vectors, because the C encoders do not emit
-malformed headers.
+The four SPICE targets are worth running first when the budget is short. All
+of them have paid for themselves in minutes rather than hours:
+
+| Target | What it found |
+|---|---|
+| `spice_quic` | a 23-byte header asking the decoder for a 151 MiB image |
+| `spice_lz` | a width whose stride overflowed a `u32` before anything could reject it |
+| `spice_draw` | a `COPY_BITS` whose destination rectangle asked for a 174 GB allocation on a 64 × 48 surface |
+| `spice_draw` | a stencil mask with a zero stride and a non-zero width, which indexed an empty row |
+
+Each now has a named regression test. None was reachable from the
+differential vectors, because the C encoders do not emit malformed headers —
+which is the general point about why both kinds of test are needed.
 
 Two practical constraints:
 

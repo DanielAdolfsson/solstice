@@ -271,11 +271,43 @@ for a real deployment, not for a greenfield.
 
 ### The fuzz targets have no corpus and no CI job
 
-Five targets exist and each runs clean for a minute
+Nine targets exist and each runs clean for a minute to a few
 (`rtsp_message`, `sdp_announce`, `input_batch`, `control_envelope`,
-`rfb_rect`). That is a smoke test, not the nightly tier `docs/testing.md` §6
-describes. There is no seed corpus, no persistent corpus, and nothing runs them
-unattended.
+`rfb_rect`, `spice_quic`, `spice_lz`, `spice_draw`, `spice_message`). That is
+a smoke test, not the nightly tier `docs/testing.md` §6 describes. There is no
+seed corpus, no persistent corpus, and nothing runs them unattended.
+
+The short runs have not been wasted: four of those targets have each found a
+real unbounded allocation or out-of-bounds index in under two minutes, all
+four on the SPICE side, all four now with named regression tests. That is a
+reasonable argument that the nightly tier would find more.
+
+### The SPICE backend has never met a SPICE server
+
+The largest open item, and the newest. `crates/solstice-spice` implements the
+link handshake, the 2D rasteriser, every image type, video streams, the guest
+agent and audio — verified against `spice.proto`'s message layouts, against
+the C's own raster-operation mapping, against the reference client's behaviour
+where the wire format does not determine it, and against a mock server written
+from the same reading. What has not happened is a real `spice-server` ever
+answering it: `Xspice` is not installed on the machine it was written on, so
+`crates/solstice-spice/tests/real_server.rs` has only ever skipped.
+
+This is structurally the same gap as the GameStream one below — a wrong
+assumption made consistently at both ends of a test passes — and it has the
+same answer. `docs/roadmap.md` §2.6 is the plan, in order of value.
+
+The two things most likely to be wrong, in order:
+
+1. **The raster-operation mappings.** `ropd_descriptor_to_rop` and the ROP3
+   truth-table indexing are both transcribed from C that exists nowhere else.
+   The ROP3 convention at least has an oracle — `rop3.c`'s own self-test
+   constants are reproduced as a test over all 256 opcodes — but the `ropd`
+   collapse has only the transcription.
+2. **The `SpiceImage` descriptor layouts.** Pointer members are 32-bit
+   offsets into the message body, and the fixed parts are unpadded. One wrong
+   field width shifts everything after it, and the symptom would be a corrupt
+   picture rather than an error.
 
 ### The whole path is tested, but only against one real server
 

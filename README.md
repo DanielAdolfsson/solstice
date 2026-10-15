@@ -12,8 +12,14 @@ Moonlight ──GameStream──▶ Solstice ──RFB / SPICE──▶ remote d
 **Status: it works end to end.** A Moonlight-shaped client can pair, launch,
 negotiate encrypted RTSP, and receive an encrypted, FEC-protected H.264 stream
 of a real VNC desktop, which decodes to the right pixels. That path is a test
-(`a_client_receives_the_pixels_of_a_real_vnc_desktop`), not a claim. The SPICE
-backend is not implemented; its image codecs are.
+(`a_client_receives_the_pixels_of_a_real_vnc_desktop`), not a claim.
+
+**Both backends are implemented.** The SPICE one is complete — channel links,
+the 2D rasteriser, all six image types, video streams, the guest agent and
+audio — but it has never been answered by a real `spice-server`, only by a
+mock and by fuzzers. That gap is the honest headline and it is written up in
+[docs/roadmap.md §2.6](docs/roadmap.md#26-the-remaining-risk-stated-plainly).
+
 See [Status](#status) for the full picture, including what is deliberately
 absent.
 
@@ -26,15 +32,17 @@ source). No cmake, no nasm, no system libraries.
 
 ```sh
 cargo build --release
-cargo test --workspace        # 381 tests, about 15 s
+cargo test --workspace        # 646 tests, about 20 s
 cargo clippy --workspace --all-targets
 ```
 
-The default features are `vnc` and `openh264`. SPICE is excludable at compile
-time along with its dependency tree — including `solstice-spice-codec`, which
-the `spice` feature pulls in — and so is the encoder:
+The default features are `vnc` and `openh264`. SPICE is **not** on by default:
+it is excludable at compile time along with its whole dependency tree — the
+image codecs, a JPEG decoder, LZ4 and zlib — none of which an RFB-only build
+needs. So is the encoder:
 
 ```sh
+cargo build --features spice                          # both backends
 cargo build --no-default-features --features vnc      # no H.264 encoder
 ```
 
@@ -100,6 +108,14 @@ pointed at a client before any desktop is involved.
   real certificate verification, Raw / CopyRect / RRE / Hextile / ZRLE,
   ContinuousUpdates and Fence where offered, ExtendedDesktopSize resize
   requests, and both keyboard paths.
+- **The SPICE backend**: the per-channel link handshake with its RSA-OAEP
+  ticket, TLS, both message framings and the ack window; a 2D rasteriser with
+  binary and ternary raster operations, clip regions, stencil masks, brushes,
+  scaled blits, strokes and raster glyphs; every image type SPICE defines —
+  raw in all eleven layouts, QUIC, LZ, GLZ, zlib-over-GLZ, JPEG, JPEG+alpha
+  and LZ4; MJPEG video streams composited over the draw output; the cursor
+  channel; `spice-vdagent` for exact-resolution resize and absolute mouse;
+  and Opus audio passed through rather than transcoded.
 
 ### Not implemented
 
@@ -107,14 +123,17 @@ Each of these is written up in [docs/roadmap.md](docs/roadmap.md) with a plan,
 the tests that would finish it, and what is already known to be hard. The
 summaries below are just the shape of it.
 
-- **The SPICE backend.** Feature-gated and deferred — but no longer on its
-  image codecs, which used to be the thing gating it. QUIC, LZ and GLZ are
-  implemented in `solstice-spice-codec`: pure Rust, no `unsafe`, and verified
-  against the real C encoders by 278 differential vectors. What is missing is
-  the protocol above them — the channel link handshake, the display channel's
-  2D rasteriser, and the agent. `backend.kind = "spice"` reports this rather
-  than failing obscurely. [Staged plan](docs/roadmap.md#2-spice-backend),
-  M1–M7, and [the codec account](docs/roadmap.md#22-the-image-codecs--settled-and-ported).
+- **SPICE against a real server.** The backend is implemented and feature-gated;
+  what has not happened is a `spice-server` ever answering it. The test that
+  would close this exists — `crates/solstice-spice/tests/real_server.rs`
+  drives `Xspice` with each `--image-compression` flag in turn — and skips
+  with a printed note because `Xspice` is not installed. It is the cheapest
+  high-value thing left in the whole repository.
+  [The account](docs/roadmap.md#26-the-remaining-risk-stated-plainly).
+- **`DRAW_COMPOSITE`, GL scanout, and two cursor types** on the SPICE side.
+  Each is a deliberate omission rather than a gap, and the capability is not
+  advertised in any of the three cases, so a conforming server will not send
+  them. [The list](docs/roadmap.md#25-what-is-deliberately-not-implemented).
 - **Tight encoding** on the RFB side. Solstice does not advertise it, so a
   conforming server will not send it; a server that sends it anyway gets an
   error rather than a guess. ZRLE covers the same ground.
@@ -226,6 +245,8 @@ specification:
 - [`moonlight-stream/moonlight-qt`](https://github.com/moonlight-stream/moonlight-qt) — TLS pinning behaviour
 - [`rfbproto/rfbproto`](https://github.com/rfbproto/rfbproto) — the living RFB spec, plus RFC 6143
 - [`spice/spice-protocol`](https://gitlab.freedesktop.org/spice/spice-protocol) — canonical SPICE wire headers
+- [`spice/spice-common`](https://gitlab.freedesktop.org/spice/spice-common) — `spice.proto`, the authoritative description of every SPICE message layout, plus the raster-operation mapping in `canvas_base.c` and `rop3.c`
+- [`spice/spice-gtk`](https://gitlab.freedesktop.org/spice/spice-gtk) — the reference client, for the behaviour the wire format does not determine
 - [`sleepybishop/nanors`](https://github.com/sleepybishop/nanors) — the client's Reed–Solomon implementation, now also the FEC oracle
 - [Sunshine security advisories](https://github.com/LizardByte/Sunshine/security)
 

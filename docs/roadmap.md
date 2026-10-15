@@ -17,24 +17,26 @@ protocols.
 
 ## Order
 
-The two the next session is most likely to want are §1 and §2. They are
-independent and §1 is much smaller, which makes it the better warm-up if the
-codebase is unfamiliar.
+Both halves of this project now have the same shape of gap, and it is not a
+missing feature: **neither has met the real thing.** The GameStream host has
+never been connected to by a real Moonlight, and the SPICE backend has never
+been answered by a real `spice-server`. Everything else on this list is worth
+less than closing those two, and both are cheap.
 
 | | Item | Size | Blocked on |
 |---|---|---|---|
 | 1 | [Tight encoding](#1-tight-encoding-rfb) | ~1 week | nothing |
-| 2 | [SPICE backend](#2-spice-backend) | 1–2 months | nothing — the codecs are done (§2.2) |
-| 3 | [Validate against real Moonlight](#3-validate-against-real-moonlight) | days | nothing — **do this before 1 or 2** |
+| 2 | [SPICE backend](#2-spice-backend) | **implemented**; validation outstanding (§2.6) | nothing — `apt install xserver-xspice` |
+| 3 | [Validate against real Moonlight](#3-validate-against-real-moonlight) | days | nothing — **do this before 1** |
 | 4 | [Captured golden vectors](#4-captured-sunshine--moonlight-vectors) | days | §3 |
 | 5 | [`solstice pair` management socket](#5-solstice-pair-and-a-management-socket) | ~2 days | nothing |
 | 6 | [The still-frame encode cost](#6-the-still-frame-encode-cost) | ~2 days | nothing |
 | 7 | [ENet: audit or reimplement](#7-enet-audit-or-reimplement) | 1–3 weeks | §3 |
 | 8 | [Smaller items](#8-smaller-items) | varies | |
 
-§3 is listed third but should probably go first in wall-clock terms: it is
-cheap, and everything else is built on the assumption that the host half is
-correct against a client that has never actually connected to it.
+§3 is listed third but should go first in wall-clock terms, alongside §2.6:
+they are the two places where a wrong assumption made consistently at both
+ends of a test currently passes.
 
 ---
 
@@ -145,41 +147,52 @@ fuzzable). Tight should follow that split, with four streams instead of one.
 
 ## 2. SPICE backend
 
-### Why
+**Implemented.** `crates/solstice-spice`, behind the `spice` Cargo feature.
+`backend.kind = "spice"` builds a working backend rather than reporting
+itself unimplemented. What is left is validation against a real server and
+the handful of deliberate gaps in §2.5 — not milestones.
 
-It is the native console protocol for QEMU/KVM, and it brings three things RFB
-cannot: **audio**, **agent-driven resize** (so Moonlight's requested mode is
-matched exactly instead of letterboxed), and **client-mode absolute mouse**.
-For bridging a VM it is the right protocol; `docs/spice-protocol.md` §8 is the
-full analysis.
+### Why it was worth it
 
-### 2.1 What already exists
+It is the native console protocol for QEMU/KVM, and it brings three things
+RFB cannot: **audio**, **agent-driven resize** (so Moonlight's requested mode
+is matched exactly instead of letterboxed), and **client-mode absolute
+mouse**. `docs/spice-protocol.md` §8 is the full analysis.
 
-Not starting from zero. The following need no change:
+### 2.1 What it is
 
-- the backend seam (`solstice-backend`) — `Session` is a handle, not a socket,
-  so SPICE's many-connections-per-session shape fits behind it unchanged. The
-  warning in `docs/spice-protocol.md` §8.1 is about a naively-shaped trait;
-  this one is not;
-- **the image codecs**, entirely: `solstice-spice-codec` decodes QUIC, LZ and
-  GLZ in pure Rust. This used to be §2.2, the gate on everything else. It is
-  now done — see below for what that decision turned out to be;
-- **input**, entirely: `SPICE_MSGC_INPUTS_KEY_DOWN` carries PC AT scancodes,
-  the same representation as RFB's pseudo-encoding −258, so `solstice-input`'s
-  VK→scancode table serves both backends with no new code;
-- the whole GameStream host half, encoder, frame clock and pipeline;
-- the config and factory plumbing — `backend.kind = "spice"` parses today and
-  returns `FactoryError::NotImplemented("spice")`
-  (`crates/solstice/src/backend_factory.rs`), and the `spice` Cargo feature
-  exists in `crates/solstice/Cargo.toml` and now pulls in
-  `solstice-spice-codec`, so the dependency tree stays excludable.
+| | |
+|---|---|
+| `wire.rs` | bounds-checked little-endian reading, and the 32-bit offsets SPICE uses instead of inline structures |
+| `link.rs` | the per-channel handshake and the RSA-OAEP/MGF1-SHA-1 ticket |
+| `channel.rs` | mini and full message headers, sub-message lists, `PING`/`NOTIFY`/`DISCONNECTING`, and the `SET_ACK` window |
+| `main_channel.rs` | `MAIN_INIT`, `CHANNELS_LIST`, mouse mode, the agent tunnel |
+| `agent.rs` | `spice-vdagent`: `MONITORS_CONFIG` resize, capability exchange, clipboard, token flow control |
+| `display/` | surfaces, the `DRAW_*` set, `COPY_BITS`, six image types, video streams, and the framebuffer the encoder reads |
+| `cursor.rs` | five of SPICE's seven cursor types, composited into the framebuffer |
+| `inputs.rs` | scancodes and pointer messages, with `MOUSE_MOTION_ACK` flow control |
+| `playback.rs` | guest audio; Opus is passed through rather than transcoded |
+| `backend.rs` | dialling every channel, and the `Backend`/`Session` implementation |
+| `mock.rs` | a deliberately minimal server that mints a real RSA key and decrypts a real ticket |
 
-### 2.2 The image codecs — settled, and ported
+Nothing in the backend seam had to change. `Session` is a handle rather than
+a socket, so SPICE's many-connections-per-session shape fits behind it
+unchanged — the warning in `docs/spice-protocol.md` §8.1 is about a naively
+shaped trait, and this was not one.
+
+Input needed no new table either: `SPICE_MSGC_INPUTS_KEY_DOWN` carries PC AT
+scancodes, the same representation as RFB's pseudo-encoding −258, so
+`solstice-input`'s VK→scancode table serves both backends. The one wrinkle is
+packing: `spice_make_scancode` byte-swaps an extended key so the
+little-endian `u32` reads `E0` then the code, which is the raw PS/2 byte
+sequence.
+
+### 2.2 The image codecs — settled, ported, and wired
 
 This section used to say the decision had to be made before any code was
-written, and recommended FFI to `spice-common`. **The port was done instead**,
-as `crates/solstice-spice-codec`: QUIC, LZ and GLZ, pure Rust, inside
-`#![forbid(unsafe_code)]`.
+written, and recommended FFI to `spice-common`. **The port was done
+instead**, as `crates/solstice-spice-codec`: QUIC, LZ and GLZ, pure Rust,
+inside `#![forbid(unsafe_code)]`.
 
 The table that recommended FFI costed a port at "weeks to months — a research
 project", and that was wrong in a specific way worth recording. The research
@@ -205,131 +218,157 @@ Why the port rather than the FFI, given the recommendation:
 - **The correctness risk a port carries is answerable.** It is answered by
   `tests/vectors/spice/`: 278 differential vectors generated by linking the
   actual C encoders — `spice-common` for QUIC and LZ, `spice-server` for GLZ —
-  and asserting the Rust decoder reproduces the C decoder's pixels. Both
-  halves of QUIC and LZ are pinned by the C; GLZ's are pinned by its own
-  input, since it is lossless.
-
-What the port is, concretely:
-
-| | |
-|---|---|
-| `quic.rs` | SFALIC derivative: `(a+b)/2` prediction, an adaptive Golomb-Rice model updated on a shared pseudo-random schedule, a melcode run mode |
-| `lz.rs` | FastLZ derivative counting in pixels rather than bytes, with eleven source layouts |
-| `glz.rs` | the same byte format with matches that reach into earlier images, plus the session-long window they reach into |
+  and asserting the Rust decoder reproduces the C decoder's pixels.
 
 Three things the port does that the C does not, all of them the point:
 
 1. **Bounds-checks every offset and length**, rather than asserting them away
    in release builds.
-2. **Caps the window.** Its size is the server's choice; `GlzWindow` drops its
-   oldest images past `Limits::glz_window_bytes` and reports
-   `Error::GlzWindowMiss` if a later match wants one back. A channel reset is
-   recoverable; an unbounded allocation is not.
-3. **Caps the image.** Two 32-bit header fields can ask for an image far
-   larger than any display, and the work is paid before anything is known to
-   be wrong — a fuzzer found a 23-byte QUIC stream claiming 96 × 393433 within
-   minutes. `Limits::max_pixels` defaults to just past 8K, and **the display
-   channel should lower it to the surface being drawn into**, which it knows
-   and the codec does not.
+2. **Caps the window.** `GlzWindow` drops its oldest images past
+   `Limits::glz_window_bytes` and reports `Error::GlzWindowMiss` if a later
+   match wants one back.
+3. **Caps the image.** `Limits::max_pixels` defaults to just past 8K, and the
+   display channel now **does** lower it to the surface being drawn into —
+   `display/commands.rs` passes `width * height` of the destination into every
+   decode, which is what the codec crate's documentation asked a caller to do.
 
-What is *not* done, and is the remaining risk:
+The schemes that already had Rust crates are in `display/image.rs` rather than
+the codec crate: raw bitmaps in all eleven `SpiceBitmapFmt` layouts, JPEG
+(`zune-jpeg`), JPEG-with-LZ-alpha, LZ4 (`lz4_flex`) and zlib-over-GLZ
+(`flate2`). LZ4 is the awkward one: SPICE frames it as big-endian
+length-prefixed **linked** blocks, so each block may match into the output of
+the ones before it, which is the external-dictionary mode of the block format.
 
-- **No real-guest traffic has been through it.** The vectors come from the
-  real C encoders, but driven by this repository's test images, not by a QXL
-  driver. `Xspice` and a manual QEMU run are still the next step
-  (`docs/testing.md` §4.2).
+### 2.3 What the staged plan turned into
+
+The plan was M1–M7. All seven landed; what each one actually cost is worth
+recording, because the estimates were not evenly wrong.
+
+**M1 — link and session.** As described. The two details that are easy to get
+wrong and are not in the headers: the auth-mechanism word is conditional on
+the server advertising `PROTOCOL_AUTH_SELECTION`, and the password is
+encrypted **with its NUL terminator**, so an empty password is one zero byte
+rather than none. Both come from `spice-gtk`'s `spice-channel.c`.
+
+**M2 — inputs and cursor.** Small, as predicted. `MOUSE_MOTION_ACK` allows
+`SPICE_INPUT_MOTION_ACK_BUNCH * 2` outstanding messages and releases four per
+ack; past the window motion is *accumulated* rather than dropped, so the
+pointer ends up in the right place however long the stall lasted.
+
+**M3 — display, raw images only.** The big one, as predicted. The rasteriser
+is `display/raster.rs`: the sixteen binary raster operations, the 256-entry
+ternary ones, clip regions, stencil masks, solid and pattern brushes, scaled
+blits with nearest and bilinear sampling, hairline strokes with flattened
+Béziers, and 1-, 4- and 8-bit raster glyphs. Two mappings had to be
+transcribed rather than derived — `ropd_descriptor_to_rop`
+(`canvas_base.c:152-306`) and the ROP3 truth-table convention, which
+`rop3.c`'s own self-test pins by evaluating each formula with
+`d = 0xAA, s = 0xCC, p = 0xF0`.
+
+**M4 — image codecs.** Wiring, as predicted; see §2.2.
+
+**M5 — video streams.** Smaller than expected, because the answer turned out
+to be "advertise one codec". A stream is decoded only to be composited and
+re-encoded, so the decoder is pure overhead and the cheapest correct one wins:
+MJPEG, which already had a decoder in the tree for SPICE's own JPEG images.
+A server that opens a stream in anything else is told so with the
+`STREAM_REPORT` the protocol defines for it — `num_frames = 0` with
+`num_drops = 0xffffffff` — and falls back to draw commands.
+
+**M6 — the agent.** `MONITORS_CONFIG`, capability exchange, and the clipboard
+messages. `request_resize` returns `false` when there is no agent, which is
+the same best-effort contract the RFB backend's `ExtendedDesktopSize` has.
+
+**M7 — audio.** Opus packets are forwarded as `AudioFormat::Opus` rather than
+decoded, which is the repacketise-not-transcode path §7 of the protocol notes
+hoped for. Whether the *pipeline* can actually repacketise them still depends
+on the frame duration lining up with `x-nv-aqos.packetDuration`, which is a
+question for the pipeline and is not yet answered.
+
+### 2.4 How it is tested
+
+- **206 unit and mock tests** in the crate, plus the 88 in
+  `solstice-spice-codec`.
+- **A mock server** (`mock.rs`, `tests/mock_server.rs`) that mints a real
+  1024-bit RSA key and decrypts a real ticket, so the OAEP path is exercised
+  rather than stubbed. It covers the negative cases `docs/testing.md` §4.1
+  names: a wrong password, a link error, `NEED_SECURED`, a server with no
+  display channel, a `SpiceDataHeader` whose `size` overruns, and both header
+  framings.
+- **Two fuzz targets**, `spice_draw` and `spice_message`. They have already
+  paid for themselves: `spice_draw` found a `COPY_BITS` whose destination
+  rectangle asked for a 174 GB allocation on a 64 × 48 surface, and a
+  zero-stride stencil mask that indexed an empty row. Both have named
+  regression tests.
+- **`tests/real_server.rs`** drives `Xspice` with `--image-compression` forced
+  to `off`, `quic`, `lz`, `lz4` and `glz` in turn, plus
+  `--streaming-video all`. It skips with a printed note when `Xspice` is not
+  installed.
+
+### 2.5 What is deliberately not implemented
+
+Each of these is a decision, not an oversight.
+
+- **`DRAW_COMPOSITE`.** The `COMPOSITE` capability is not advertised, so a
+  conforming server will not send it; one that does gets an error rather than
+  a guess. It is Porter-Duff with transforms and is the one draw command with
+  no simple reading.
+- **GL scanout.** `GL_SCANOUT_UNIX` and `GL_SCANOUT2_UNIX` pass a dmabuf file
+  descriptor and are local-only by construction. The capability is not
+  advertised and the messages are refused.
+- **`COLOR8` and `COLOR24` cursors.** `spice-gtk` does not decode them either
+  (`channel-cursor.c:302-305` falls through to "unimplemented cursor type"),
+  which is good evidence no server emits them.
+- **Stroke styling.** Dashes and line widths are parsed and ignored; every
+  stroke is a hairline. A stroke one pixel off is a smaller error than a
+  stroke that is missing.
+- **Migration.** There is nowhere to migrate a Moonlight session to.
+- **Horizontal scroll.** SPICE's button numbering has no horizontal wheel —
+  `SIDE` and `EXTRA` are the two thumb buttons, not tilt.
+- **Text events.** A scancode channel cannot express a code point the US
+  layout has no key for, so `InputEvent::Text` is dropped rather than
+  synthesised into the wrong keystrokes.
+- **The clipboard has no sink.** The agent's clipboard messages are
+  implemented and a guest offer surfaces as a `MainOutcome`, but the backend
+  seam has nowhere to put it: GameStream has no clipboard channel. The
+  plumbing is there for when something wants it.
+
+### 2.6 The remaining risk, stated plainly
+
+**No SPICE server has ever answered this code.** `Xspice` is not installed on
+the machine it was written on, so `tests/real_server.rs` has only ever
+skipped. Everything above is verified against the *specification* — the
+`spice.proto` message layouts, the C's own raster-operation mapping, the
+reference client's behaviour where the wire format does not determine it —
+and against a mock written from the same reading. A wrong assumption made in
+both places passes.
+
+This is the same risk §3 names for the GameStream half, and it has the same
+answer: run it against the real thing. In order of value:
+
+1. **`apt install xserver-xspice` and run `tests/real_server.rs`.** Minutes of
+   work, and it is the single highest-value thing left on this item.
+2. **A manual QEMU run with a real QXL guest driver.** `Xspice` shares
+   `spice-server` with QEMU so the protocol is the same code, but the *mix* of
+   draw commands a real guest driver emits is not
+   (`docs/testing.md` §4.2). Worth one run before a release, not a CI job.
+3. **A GLZ soak.** The vectors replay a window of eight images; a real session
+   churns thousands, and window management is exactly what frozen vectors
+   cannot exercise. `glz_survives_enough_window_churn_to_evict` is the short
+   version; the long one is a nightly job.
+
+Two smaller unknowns, both of which need a server to answer:
+
+- **Nothing is tuned.** The rasteriser's inner loops are per-pixel closures
+  and the codec row loops are a direct translation. Whether that costs
+  anything measurable against compositing and H.264 encoding is unknown
+  because it has not been measured — and it should be measured against a real
+  frame rather than guessed at.
 - **GLZ out-of-order images are refused, not awaited.** `spice-gtk` blocks on
-  a coroutine when a match refers to an image that has not arrived; this
-  decoder returns `Error::GlzWindowMiss`. With one display channel the case
-  does not arise, because one channel delivers in order. A multi-monitor guest
-  with several display channels would need the window shared and the wait
-  reinstated.
-- **Nothing is tuned.** The row loops are a direct translation, generic over a
-  pixel-layout trait rather than macro-expanded. Whether that costs anything
-  measurable against compositing and H.264 encoding is unknown, because it has
-  not been measured — and it should not be guessed at before M3 can produce a
-  frame to measure.
-
-### 2.3 Staged plan
-
-Each milestone is independently testable. `docs/testing.md` §4 is the test
-plan; `Xspice` links the same `spice-server` QEMU does, so no VM is needed.
-
-**M1 — link and session.** `SpiceLinkHeader/Mess/Reply`, capability
-negotiation, the RSA-OAEP/MGF1-SHA-1 ticket against the per-connection
-1024-bit key, and TLS on every channel (`docs/security.md` §4.2 requires it).
-Then `MAIN_INIT` (which allocates the `connection_id` every other channel must
-present), `CHANNELS_LIST`, and the framing: mini vs full header, per-channel
-serials, and **`SET_ACK` windows, which are not optional — the server stalls
-without them**.
-*Done when:* a mock SPICE server (`docs/testing.md` §4.1) and `Xspice
---disable-ticketing` both link, and the negative cases are covered — truncated
-`SpiceLinkMess`, bad magic, wrong `connection_id` on a secondary channel,
-ack-window violation, a `SpiceDataHeader` whose `size` overruns.
-
-**M2 — inputs and cursor.** Small. Reuses the scancode table. Needs
-`MOUSE_MOTION_ACK` flow control (at most 4 unacknowledged bunches,
-`protocol.h:113`).
-*Done when:* the table-driven input tests from `mock_server.rs` are mirrored
-against the SPICE mock.
-
-**M3 — display, raw images only.** Surfaces, `SURFACE_CREATE/DESTROY`, the
-`DRAW_*` set, `COPY_BITS`, invalidation, palettes — a 2D rasteriser with
-clipping, ROPs, brushes, masks and text glyphs. Run against
-`Xspice --image-compression off --streaming-video off`, where images arrive
-uncompressed and **no codec work is needed at all**.
-*Done when:* an end-to-end test in the shape of
-`a_client_receives_the_pixels_of_a_real_vnc_desktop` passes against `Xspice`.
-**This is a working backend but not yet a usable one** — a real QEMU guest
-still sends GLZ.
-
-**M4 — image codecs.** The decoders exist (§2.2); this milestone is wiring
-them to the `SpiceImage` descriptor and proving it against a server, one
-`--image-compression` flag at a time: `off`, `lz`, `lz4`, `quic`, `glz`, then
-`auto_glz`. LZ4 and JPEG have Rust crates and are not this crate's business.
-GLZ last, and with a soak test, because its window is the whole point and
-single frames prove nothing — a GLZ bug that only appears after an hour of
-window churn is exactly the bug the vectors cannot catch.
-
-**M5 — video streams.** `STREAM_CREATE/DATA/CLIP/DESTROY/DATA_SIZED`: clipped
-sub-rectangles the server classified as video, composited over the draw output,
-carrying MJPEG/VP8/H264/VP9/H265. Turn `--streaming-video all` on early enough
-to discover that naive compositing breaks (`docs/testing.md` §4).
-**Do not** try to forward SPICE's H.264 straight to Moonlight —
-`docs/spice-protocol.md` §5.2 explains why it cannot work: partial-screen,
-destroyable at any moment, no keyframe on demand.
-
-**M6 — the agent.** `MONITORS_CONFIG` to match Moonlight's requested mode,
-client-mode absolute mouse, clipboard. Test with `--vdagent` **on and off** —
-all three degrade when it is absent, and without it absolute coordinates must
-be converted to relative deltas with the pointer drift every SPICE client
-accepts.
-
-**M7 — audio.** `PLAYBACK` carries Opus, which GameStream also uses, so this
-may **repacketise without transcoding** — the one place SPICE is cheaper than
-RFB. Confirm the frame duration and channel layout line up with
-`x-nv-aqos.packetDuration` before relying on it (`docs/spice-protocol.md` §7).
-
-### 2.4 Known gotchas
-
-- All integers are **little-endian** — the opposite of RFB and of GameStream's
-  RTP headers. Three conventions in one process.
-- Message type numbers are **per-channel namespaces**; 1–99 are the common base
-  set and channel-specific types start at 101.
-- `GL_SCANOUT_UNIX` passes a dmabuf FD and is local-only by construction. Do
-  not advertise the capability.
-- `Xspice` does **not** cover QXL guest-driver behaviour: a real VM's driver
-  emits a different mix of draw commands. Worth one manual QEMU run before
-  release, not a CI job (`docs/testing.md` §4.2).
-- `spice-client` (0.2.0) exists on crates.io but is a component of
-  `quickemu-manager` with very little production exposure. Read it before
-  depending on it; it is unlikely to have the image decoders.
-- **The `SpiceImage` descriptor is not the codec stream.** The display channel
-  wraps each bitmap in a descriptor carrying its own width, height, format and
-  flags, and `solstice-spice-codec` takes only what is inside. Where the two
-  disagree, the descriptor is the one the rest of the protocol believes — and
-  the surface bounds come from the descriptor, which is what
-  `Limits::max_pixels` should be set from.
+  a coroutine when a match refers to an image that has not arrived. With one
+  display channel the case does not arise, because one channel delivers in
+  order. A multi-monitor guest with several display channels would need the
+  window shared and the wait reinstated.
 
 ---
 
