@@ -422,50 +422,39 @@ async fn guest_eventually(guest: &Guest, script: &str, wanted: &str) -> Result<S
     Err(format!("`{script}` never produced {wanted:?}; last saw: {last:?}"))
 }
 
-/// `docs/roadmap.md` §2.7's first bullet: the client half is now validated,
-/// and the guest half cannot be validated in this configuration.
+/// The same resize on QXL, which does not work and is not understood.
 ///
-/// Ignored because it cannot pass here, not because it is unfinished. What is
-/// established, each by measurement:
+/// The virtio-gpu case above passes, so the client is not the obvious
+/// suspect -- the same code, the same message, the same guest userspace.
+/// But a reference client *can* move this device: connecting `remote-viewer`
+/// to a long-running QXL guest and dragging the window moved
+/// `/sys/class/drm/card0-Virtual-1/modes` to `1023x717`, its client area.
+/// (It still only scaled, because that guest predated the mode watcher and
+/// so had nobody to apply the new preferred mode -- but the device had
+/// plainly accepted the config.) Solstice's request moves it to nothing, at
+/// any size, ever.
 ///
-/// - A real `spice-vdagent` and `spice-vdagentd` run and connect, the server
-///   grants the agent tunnel 10 tokens, the guest announces its capabilities,
-///   `can_resize()` becomes true, and mouse mode flips to `Client`. (Getting
-///   there needed three guest fixes, each of which fails silently:
-///   `spice-vdagentd` takes `-x` not `-X`; it needs the `uinput` module; and
-///   it needs `/run/spice-vdagentd/` plus a machine-id.)
+/// Neither client's monitors config reaches `spice-vdagent`, which is
+/// expected: `ui/spice-display.c` registers a `QXLInstance` per console, so
+/// `spice-server` hands the message to the device rather than forwarding it.
+/// On QXL that is `interface_client_monitors_config` in `hw/display/qxl.c`,
+/// which has several silent refusal paths.
 ///
-/// - **Solstice's agent tunnel is correct.** A `CLIPBOARD_GRAB` emitted in the
-///   same drain, immediately before the monitors config, arrives at
-///   `spice-vdagentd` and is forwarded to `spice-vdagent`. So the
-///   `VDAgentMessage` framing, the `AGENT_DATA` carriage and the token flow
-///   all work; this was the question that mattered and it is answered.
+/// Ruled out by experiment, in order: the message encoding (verified byte by
+/// byte against `vd_agent.h`); the capability gate; token starvation; the
+/// `AGENT_START` token count; the requested size (swept, including the exact
+/// `1023x717` remote-viewer used); guest settling time (0 s, 15 s, 45 s);
+/// and the `flags`, `depth` and `num_of_monitors` fields (swept).
 ///
-/// - The `MONITORS_CONFIG` itself is well-formed: one 48-byte `AGENT_DATA`,
-///   a 20-byte header and a 28-byte body of `num_of_monitors=1, flags=0,
-///   height, width, depth=32, x=0, y=0`, exactly as `vd_agent.h` specifies.
-///
-/// - It never reaches the agent, and that is `spice-server` behaving as
-///   designed: it intercepts `VD_AGENT_MONITORS_CONFIG` rather than
-///   forwarding it, and applies it to the QXL device itself. The device then
-///   does not act on it -- the kernel's preferred mode never moves.
-///
-/// - **A reference client cannot resize this guest either.** `remote-viewer`,
-///   with auto-resize enabled, scales the display instead and sends no
-///   monitors config at all, while its other agent messages (max-clipboard,
-///   volume sync, clipboard grab) arrive normally. A known-good client
-///   declining to even try is its own evidence about the guest side.
-///
-/// So the remaining gap is QEMU's QXL monitors-config handling in this
-/// configuration, not Solstice. What stays genuinely unvalidated is the
-/// *response* path -- that Solstice tracks a geometry change the guest
-/// actually makes -- which needs a guest that can resize at all. Worth
-/// revisiting with a different QXL device configuration, or a `virtio-gpu`
-/// guest, before concluding anything about the backend.
+/// What has *not* been separated is the client from the guest instance:
+/// remote-viewer succeeded against a long-lived guest, Solstice failed
+/// against fresh ones. Pointing remote-viewer at a freshly booted QXL guest
+/// would decide it -- if it also fails, the variable is the guest, not the
+/// client. Until then this stays ignored rather than asserted either way.
 ///
 /// `a_resize_is_declined_without_the_agent` is unaffected and still passes.
 #[tokio::test]
-#[ignore = "QEMU's QXL does not act on a monitors config here; remote-viewer cannot resize this guest either"]
+#[ignore = "unresolved: QXL ignores our monitors config though remote-viewer can move the same device"]
 async fn a_real_agent_grants_and_applies_a_resize() {
     resize_test(Display::Qxl).await;
 }
