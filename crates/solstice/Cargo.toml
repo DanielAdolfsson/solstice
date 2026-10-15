@@ -46,6 +46,7 @@ async-trait = "0.1.92"
 humantime = "2.4.0"
 
 [dev-dependencies]
+solstice-test-guest.workspace = true
 tokio = { workspace = true, features = ["full"] }
 solstice-gamestream.workspace = true
 openh264 = "0.9"

@@ -684,70 +684,48 @@ async fn a_client_pairs_launches_and_decodes_the_colour_bars() {
 /// The whole point of the project, in one test: a Moonlight-shaped client
 /// receives the pixels of a real VNC desktop.
 ///
-/// Skipped with a printed note when `Xvnc` is not installed.
+/// The desktop is a QEMU guest serving RFB, the same one the backend tests
+/// use. Skipped with a printed note when QEMU or the guest image is missing;
+/// `tests/guest/build-image.sh` builds it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_client_receives_the_pixels_of_a_real_vnc_desktop() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let _ = tracing_subscriber::fmt().with_env_filter("warn").try_init();
 
     const PORTS: Ports = Ports::from_base(49189);
-    const DISPLAY: u32 = 95;
-    const VNC_PORT: u16 = 5900 + DISPLAY as u16;
 
-    if std::process::Command::new("Xvnc")
-        .arg("-version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_err()
-    {
-        eprintln!("skipping: Xvnc is not installed (apt install tigervnc-standalone-server)");
+    let Some(guest) = solstice_test_guest::Guest::start(
+        solstice_test_guest::GuestConfig::new().geometry(640, 480).vnc(),
+    ) else {
         return;
-    }
-    let mut xvnc = std::process::Command::new("Xvnc")
-        .arg(format!(":{DISPLAY}"))
-        .args(["-geometry", "640x480"])
-        .args(["-depth", "24"])
-        .args(["-SecurityTypes", "None"])
-        .args(["-rfbport", &VNC_PORT.to_string()])
-        .arg("-localhost")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("could not start Xvnc");
+    };
 
-    // Paint the root a colour that is unambiguous after a lossy encode.
-    let mut painted = false;
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, VNC_PORT))
-            .await
-            .is_err()
-        {
-            continue;
-        }
-        if let Ok(status) = std::process::Command::new("xsetroot")
-            .env("DISPLAY", format!(":{DISPLAY}"))
-            .args(["-solid", "#0000ff"])
-            .status()
-        {
-            painted = status.success();
-        }
-        break;
-    }
-    if !painted {
-        eprintln!("skipping: could not paint the Xvnc root (apt install x11-xserver-utils)");
-        let _ = xvnc.kill();
-        let _ = xvnc.wait();
-        return;
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Paint the root a colour that is unambiguous after a lossy encode, and
+    // keep painting it. QEMU renders guest damage into its console surface
+    // only while a display client is attached, and nothing is attached until
+    // the daemon dials the backend -- so a single paint now would be dropped
+    // outright. Repainting until the frames are collected is what makes the
+    // colour reliably present once anyone is looking.
+    let painter = {
+        let guest = std::sync::Arc::new(guest);
+        let handle = std::sync::Arc::clone(&guest);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = handle.fill("0000ff");
+                std::thread::sleep(Duration::from_millis(400));
+            }
+        });
+        (guest, stop)
+    };
+    let (guest, stop) = painter;
 
     let mut config = Config::default();
     config.server.port = PORTS.http;
     config.backend.kind = BackendKind::Vnc;
     config.backend.vnc.host = "127.0.0.1".into();
-    config.backend.vnc.port = VNC_PORT;
+    config.backend.vnc.port = guest.vnc_port();
     // Loopback, which is the only place `none` is permitted.
     config.backend.vnc.security = solstice::config::VncSecurityKind::None;
     config.video.encoder = Encoder::OpenH264;
@@ -778,10 +756,8 @@ async fn a_client_receives_the_pixels_of_a_real_vnc_desktop() {
         );
     }
 
-    let _ = xvnc.kill();
-    let _ = xvnc.wait();
-    let _ = std::fs::remove_file(format!("/tmp/.X11-unix/X{DISPLAY}"));
-    let _ = std::fs::remove_file(format!("/tmp/.X{DISPLAY}-lock"));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    drop(guest);
     let _ = std::fs::remove_dir_all(&state_dir);
 }
 

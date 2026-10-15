@@ -1363,6 +1363,7 @@ dependencies = [
  "solstice-gamestream",
  "solstice-spice",
  "solstice-spice-codec",
+ "solstice-test-guest",
  "solstice-video",
  "solstice-vnc",
  "thiserror",
