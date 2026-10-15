@@ -1,0 +1,7 @@
+# Packages needed only to compile draw-helper.c during the image build.
+# build-image.sh installs these, compiles, then removes them again: they are
+# ~200 MiB that would otherwise sit in RAM on every boot, and the guest is an
+# initramfs so image size is memory the tests cannot use for anything else.
+build-base
+libx11-dev
+libxext-dev

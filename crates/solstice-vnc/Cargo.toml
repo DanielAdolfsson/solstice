@@ -24,6 +24,7 @@ webpki-roots = "1"
 rustls-pemfile = "2.2"
 
 [dev-dependencies]
+solstice-test-guest.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
