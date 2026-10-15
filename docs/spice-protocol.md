@@ -11,8 +11,13 @@ Research notes, October 2026. Sources:
 
 > **Direction.** Solstice is a **client** here, as it is for VNC.
 >
-> **Status.** SPICE is explicitly the *optional* backend. It is substantially
-> harder than RFB (see §7) and should be gated behind a Cargo feature.
+> **Status.** Implemented, as `crates/solstice-spice`, behind the `spice`
+> Cargo feature. It remains the *optional* backend: it is substantially
+> harder than RFB (§8), it pulls a larger dependency tree, and — the part
+> that matters — **it has never been answered by a real `spice-server`**.
+> `docs/roadmap.md` §2.6 is the account of that gap. Everything below
+> describes the protocol; what Solstice does about each part is noted
+> inline.
 
 ---
 
@@ -328,32 +333,72 @@ experimentally before relying on it.
 
 ## 8. Consequences for Solstice
 
+Written before the backend existed, and each one turned out to be right — so
+they are kept, with what actually happened noted against them.
+
 1. **Multi-connection, multi-threaded by nature.** Each channel is its own
    socket with its own ack window. The backend trait must tolerate this; a
    trait shaped around "one socket, one read loop" will not fit SPICE.
+   — *`Session` is a handle rather than a socket, so it needed no change.
+   The display and cursor channels share one queue and one owning task,
+   which is what makes moving the pointer able to repaint what was under
+   it without a third buffer.*
 2. **Compositing is mandatory and harder than RFB's.** Draw commands,
    multiple surfaces, QUIC/GLZ/LZ4 images, plus overlaid video streams, all
-   have to be rendered into one framebuffer before encoding. This is now the
-   gating item.
+   have to be rendered into one framebuffer before encoding. This was the
+   gating item and it was the largest piece. — *`display/raster.rs` and
+   `display/commands.rs`. The two things that had to be transcribed rather
+   than derived were `ropd_descriptor_to_rop` and the ROP3 truth-table
+   convention; neither is written down anywhere but the C.*
 3. ~~**The image codecs are the gating item.**~~ Done:
    `crates/solstice-spice-codec` (§5.1). What it does not cover is the
    `SpiceImage` descriptor around the stream, the palette the indexed types
    index into, and the surface the result is blitted onto — all of which
-   belong to the display channel.
+   belong to the display channel. — *All three are `display/image.rs`, which
+   also carries the schemes that already had Rust crates.*
 4. **Input is the easy part**, and shares a scancode table with the VNC
-   backend.
+   backend. — *It did. The only wrinkle was the packing: an extended key is
+   byte-swapped so the little-endian word reads `E0` then the code.*
 5. **The agent is what makes it good.** `MONITORS_CONFIG` to match Moonlight's
    requested resolution, client-mode absolute mouse, and clipboard all require
    `spice-vdagent` in the guest. Degrade gracefully when it is absent.
+   — *`request_resize` returns `false` without an agent, which is the same
+   best-effort contract RFB's `ExtendedDesktopSize` has, and absolute
+   coordinates become relative deltas with the drift that implies.*
 
 ### Crate options
 
 `spice-client` (0.2.0, updated 2025-10-04, ~5 k downloads) exists and bills
 itself as a pure-Rust SPICE client with WASM support, but it is a component of
 `quickemu-manager` rather than a general-purpose library and the download count
-suggests very little production exposure. Read it before depending on it;
-expect to need the image decoders it may not have.
+suggests very little production exposure.
 
-The image decoders are no longer a reason to defer: they are written
-(§5.1). SPICE stays optional because of §8 items 1, 2 and 5 — the
-multi-connection session shape, the 2D rasteriser, and the agent.
+It was not used. The same three reasons that argued for writing the RFB
+client directly apply here and more strongly: a bridge needs control over the
+update loop, zero-copy access to the framebuffer, and the ability to decline
+capabilities it cannot honour — and a SPICE client additionally has to hand
+the *display channel's* surface geometry down into the image decoders as a
+ceiling, which is not something a general-purpose client exposes.
+
+---
+
+## 9. What `crates/solstice-spice` does about all this
+
+| Section | Status |
+|---|---|
+| §2 link handshake | implemented, both with and without `PROTOCOL_AUTH_SELECTION`, over TLS or plaintext-to-loopback |
+| §3 framing | both headers, sub-message lists, and the `SET_ACK` window |
+| §4 main channel | `MAIN_INIT`, `CHANNELS_LIST`, mouse mode, name and uuid; migration ignored |
+| §4.1 mouse modes | client mode requested at `MAIN_INIT`; relative fallback with the usual drift when there is no agent |
+| §4.2 agent | `MONITORS_CONFIG`, capability exchange, clipboard messages, token flow control |
+| §5 display | surfaces, the `DRAW_*` set, `COPY_BITS`, clip regions, masks, brushes, raster operations, strokes and glyphs. `DRAW_COMPOSITE` is **not** implemented and its capability is not advertised |
+| §5.1 images | all of them: raw in eleven layouts, QUIC, LZ, GLZ, zlib-over-GLZ, JPEG, JPEG+alpha, LZ4 |
+| §5.2 streams | MJPEG only, by choice — a stream is decoded only to be re-encoded, so the cheapest correct decoder wins. Other codecs get the `STREAM_REPORT` the protocol defines for "cannot decode" |
+| §5.3 GL scanout | not advertised, and refused if sent |
+| §6 inputs | all of it, including `MOUSE_MOTION_ACK` flow control |
+| §7 audio | Opus forwarded as Opus; raw S16 forwarded as PCM |
+
+The cursor channel, which §1 lists as optional, is implemented and
+composited into the framebuffer — in client mouse mode the guest stops
+drawing its own pointer, so a bridge that skipped it would stream a desktop
+with no cursor.

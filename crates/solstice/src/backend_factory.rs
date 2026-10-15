@@ -59,13 +59,45 @@ pub fn build(config: &Config) -> Result<Arc<dyn Backend>, FactoryError> {
         #[cfg(not(feature = "vnc"))]
         BackendKind::Vnc => Err(FactoryError::NotCompiledIn("vnc")),
 
-        // SPICE is feature-gated and still deferred, but no longer on the
-        // codecs: `solstice-spice-codec` decodes QUIC, LZ and GLZ, which was
-        // the gating item (`docs/roadmap.md` §2.2). What is left is the
-        // protocol above them -- the channel link handshake, the display
-        // channel's 2D rasteriser, and the agent (`docs/roadmap.md` §2.3,
-        // milestones M1 to M3 and M6).
-        BackendKind::Spice => Err(FactoryError::NotImplemented("spice")),
+        #[cfg(feature = "spice")]
+        BackendKind::Spice => {
+            use crate::config::SpiceSecurityKind;
+            let spice = &config.backend.spice;
+            let security = match spice.security {
+                SpiceSecurityKind::Tls => solstice_spice::SpiceSecurity::Tls {
+                    password: spice.password.clone(),
+                    ca_file: spice.ca_file.clone(),
+                },
+                SpiceSecurityKind::Plain => {
+                    // Refused off-loopback at dial time, where the resolved
+                    // peer address is known; refusing the obvious case here
+                    // turns a runtime failure into a startup one.
+                    if !solstice_spice::backend::is_loopback(&spice.host) {
+                        return Err(FactoryError::Config(format!(
+                            "backend.spice.security = \"plain\" to {}: SPICE's ticket \
+                             is a password check, not a key exchange, so the display \
+                             and every keystroke would be in the clear. Use \"tls\", \
+                             or tunnel it (docs/security.md §4.2)",
+                            spice.host
+                        )));
+                    }
+                    solstice_spice::SpiceSecurity::Plain {
+                        password: spice.password.clone(),
+                    }
+                }
+            };
+            Ok(Arc::new(solstice_spice::SpiceBackend::new(
+                solstice_spice::SpiceConfig {
+                    host: spice.host.clone(),
+                    port: spice.port,
+                    security,
+                    limits: Default::default(),
+                    audio: spice.audio,
+                },
+            )))
+        }
+        #[cfg(not(feature = "spice"))]
+        BackendKind::Spice => Err(FactoryError::NotCompiledIn("spice")),
     }
 }
 
@@ -79,14 +111,36 @@ mod tests {
         assert_eq!(build(&config).unwrap().name(), "testpattern");
     }
 
+    #[cfg(not(feature = "spice"))]
     #[test]
-    fn spice_reports_itself_as_unimplemented_rather_than_failing_obscurely() {
+    fn spice_says_it_was_excluded_rather_than_failing_obscurely() {
         let mut config = Config::default();
         config.backend.kind = BackendKind::Spice;
         assert!(matches!(
             build(&config),
-            Err(FactoryError::NotImplemented("spice"))
+            Err(FactoryError::NotCompiledIn("spice"))
         ));
+    }
+
+    #[cfg(feature = "spice")]
+    #[test]
+    fn a_tls_spice_backend_builds() {
+        let mut config = Config::default();
+        config.backend.kind = BackendKind::Spice;
+        assert_eq!(build(&config).unwrap().name(), "spice");
+    }
+
+    #[cfg(feature = "spice")]
+    #[test]
+    fn plaintext_spice_to_a_remote_host_is_refused_at_startup() {
+        let mut config = Config::default();
+        config.backend.kind = BackendKind::Spice;
+        config.backend.spice.security = crate::config::SpiceSecurityKind::Plain;
+        config.backend.spice.host = "192.168.1.10".into();
+        assert!(matches!(build(&config), Err(FactoryError::Config(_))));
+
+        config.backend.spice.host = "127.0.0.1".into();
+        assert!(build(&config).is_ok(), "loopback is the exception");
     }
 
     #[cfg(feature = "vnc")]

@@ -307,6 +307,35 @@ early enough to find that out cheaply.
 client-mode absolute mouse are all testable without building a guest image.
 Test with it on *and* off — all three degrade when the agent is absent.
 
+**Status: running and passing.** `crates/solstice-spice/tests/real_server.rs`
+does all of the above — `off`, `quic`, `lz`, `glz`, `auto_glz`, plus
+`--streaming-video all`, input against an `xev` oracle, and the no-agent
+resize refusal. `docs/roadmap.md` §2.6 is the account, including the two bugs
+it found that the mock could not.
+
+**The shape of each test is the part worth copying.** Connect to a *black*
+screen, repaint it *while connected*, then assert every pixel. A client that
+only ever sees the screen as it was at connect time can be completely broken
+for incremental updates and still pass a test that connects after the content
+exists — which is the mistake the first draft of that file made, and it took
+an independent 80-line Python client to prove where the fault was not.
+
+Two traps in Debian's `Xspice`, both of which look like client bugs:
+
+- `--auto` crashes: the `xorg.conf` it generates omits the driver's
+  buffer-size options, so the QXL driver sizes surface 0 at zero and aborts
+  in `malloc`. Write the configuration by hand — which is also the only way
+  to set the geometry, since there is no `--geometry` flag.
+- `--vdagent` cannot be used without `--auto`, where it dies on an undefined
+  `temp_dir`; and setting `SpiceVdagentEnabled` by hand does not help,
+  because the packaged driver never binds the agent sockets. The agent is
+  therefore untested against a real agent — see `docs/roadmap.md` §2.7.
+
+```sh
+sudo apt install xserver-xspice x11-xserver-utils x11-utils xterm
+cargo test -p solstice-spice --test real_server -- --test-threads=2
+```
+
 ### 4.1 Mock SPICE server
 
 Same rationale as §3.2, for the same negative tests: truncated
@@ -314,13 +343,38 @@ Same rationale as §3.2, for the same negative tests: truncated
 ack-window violations, and a `SpiceDataHeader` whose `size` overruns the
 payload.
 
-### 4.2 Known gap
+Built: `crates/solstice-spice/src/mock.rs`, driven by
+`tests/mock_server.rs`. It is a *real* link peer rather than a stub — it
+mints a 1024-bit RSA key per session, hands over the DER public key, and
+decrypts the ticket the client sends back, so the OAEP path is exercised
+rather than faked. Which is also why the workspace optimises `rsa` even in
+debug builds: unoptimised key generation takes seconds per connection, and a
+session opens four of them.
 
-Xspice is the only SPICE server tested. Since it shares `spice-server` with
-QEMU this covers the protocol well, but it does **not** cover QXL guest-driver
-behaviour — a real VM's driver emits different draw-command mixes than the
-Xspice video driver does. Worth one manual QEMU run before a release, not a CI
-job.
+It offers nothing optional, for the same reason the RFB mock does: raw
+bitmaps only, no image compression, no streams unless a test pushes one. And
+it records every client message, which is what makes input testable precisely
+— inject a Moonlight key event at one end, assert on the exact scancode that
+came out the other.
+
+One trap it surfaced immediately, worth repeating because it will catch the
+next person too: **message numbers are per-channel namespaces.** 101 is
+`KEY_DOWN` on the inputs channel, `DISPLAY_INIT` on the display one and
+`CLIENT_INFO` on the main one. A recorder that filters by type alone finds
+the wrong message.
+
+### 4.2 Known gaps
+
+**`Xspice` does not cover QXL guest-driver behaviour.** Since it shares
+`spice-server` with QEMU it covers the protocol well, but a real VM's driver
+emits a different *mix* of draw commands than the Xspice video driver does —
+which renders through the frame buffer and sends mostly `DRAW_COPY` and
+`DRAW_FILL`. `DRAW_ROP3`, `DRAW_STROKE` and `DRAW_TEXT` have therefore never
+been seen from a real server. Worth one manual QEMU run before a release, not
+a CI job.
+
+**The guest agent has no real peer here**, for the packaging reason in §4
+above. A QEMU guest would close this and the QXL gap in the same run.
 
 ### 4.3 The image codecs, without a server
 
@@ -395,7 +449,7 @@ on push:      T0 unit/property                      ~20 s
 nightly:      T4 Xvnc  × encodings × security       ~10 min
               T4 Xspice × image-compression × streaming-video × vdagent  ~10 min
               T4 loss injection sweep               ~10 min
-              T5 cargo-fuzz on the seven parsers    ~2 h
+              T5 cargo-fuzz on the nine parsers     ~2 h
 ```
 
 The nightly tier is now a sweep over *one* server's flags rather than a matrix
@@ -403,13 +457,19 @@ of servers, which is both faster and more deterministic — the same binary with
 a different flag isolates the variable properly, where swapping servers
 confounds it.
 
-The two SPICE codec targets are worth running first when the budget is short.
-Both have already paid for themselves in minutes rather than hours:
-`spice_quic` found a 23-byte header asking the decoder for a 151 MiB image,
-and `spice_lz` found a width whose stride overflowed a `u32` before anything
-had a chance to reject it. Both now have named regression tests; neither was
-reachable from the differential vectors, because the C encoders do not emit
-malformed headers.
+The four SPICE targets are worth running first when the budget is short. All
+of them have paid for themselves in minutes rather than hours:
+
+| Target | What it found |
+|---|---|
+| `spice_quic` | a 23-byte header asking the decoder for a 151 MiB image |
+| `spice_lz` | a width whose stride overflowed a `u32` before anything could reject it |
+| `spice_draw` | a `COPY_BITS` whose destination rectangle asked for a 174 GB allocation on a 64 × 48 surface |
+| `spice_draw` | a stencil mask with a zero stride and a non-zero width, which indexed an empty row |
+
+Each now has a named regression test. None was reachable from the
+differential vectors, because the C encoders do not emit malformed headers —
+which is the general point about why both kinds of test are needed.
 
 Two practical constraints:
 

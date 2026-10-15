@@ -271,11 +271,49 @@ for a real deployment, not for a greenfield.
 
 ### The fuzz targets have no corpus and no CI job
 
-Five targets exist and each runs clean for a minute
+Nine targets exist and each runs clean for a minute to a few
 (`rtsp_message`, `sdp_announce`, `input_batch`, `control_envelope`,
-`rfb_rect`). That is a smoke test, not the nightly tier `docs/testing.md` §6
-describes. There is no seed corpus, no persistent corpus, and nothing runs them
-unattended.
+`rfb_rect`, `spice_quic`, `spice_lz`, `spice_draw`, `spice_message`). That is
+a smoke test, not the nightly tier `docs/testing.md` §6 describes. There is no
+seed corpus, no persistent corpus, and nothing runs them unattended.
+
+The short runs have not been wasted: four of those targets have each found a
+real unbounded allocation or out-of-bounds index in under two minutes, all
+four on the SPICE side, all four now with named regression tests. That is a
+reasonable argument that the nightly tier would find more.
+
+### What a real SPICE server found, and what it still cannot reach
+
+`crates/solstice-spice` was written against `spice.proto`, the C's own
+raster-operation mapping, and the reference client's behaviour — then tested
+against a mock written from the same reading. Pointing it at a live `Xspice`
+found two bugs within an afternoon, and both were in the *join* between
+pieces rather than in any one of them, which is what a real peer is for:
+
+1. **The mouse mode in `MAIN_INIT` was thrown away.** A real server reports
+   client mouse mode in `MAIN_INIT` itself; the mock granted it in a later
+   `MAIN_MOUSE_MODE`, and `MAIN_INIT` is consumed by the setup loop inside
+   `connect`. The session stayed in server mode and sent relative deltas,
+   which `Xspice` drops because its only pointer is a tablet. The pointer did
+   not move at all.
+2. **`connect` returned before the primary surface arrived**, handing the
+   first caller of `dimensions()` a `0x0` geometry.
+
+A third of the afternoon went to a bug that was **not** in the client: a
+throwaway probe treated two seconds of silence as end-of-session, which
+looked exactly like "the server never sends incremental updates". Writing an
+independent 80-line Python SPICE client was what settled it — and that is the
+general lesson, because the same symptom had three plausible causes on the
+client side and one on the server's.
+
+What `Xspice` still cannot reach: a real `spice-vdagent` (Debian's launcher
+cannot start one) and a QXL guest driver's mix of draw commands. `DRAW_ROP3`,
+`DRAW_STROKE` and `DRAW_TEXT` have therefore never been seen from a real
+server, and the raster-operation mapping behind them — `ropd_descriptor_to_rop`,
+transcribed from C that exists nowhere else — has only its transcription and
+a unit test for an oracle. The ROP3 truth table at least has `rop3.c`'s own
+self-test constants, reproduced as a test over all 256 opcodes.
+`docs/roadmap.md` §2.7.
 
 ### The whole path is tested, but only against one real server
 

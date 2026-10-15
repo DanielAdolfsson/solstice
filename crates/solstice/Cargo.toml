@@ -11,16 +11,16 @@ default-run = "solstice"
 default = ["vnc", "openh264"]
 vnc = ["dep:solstice-vnc"]
 openh264 = ["solstice-video/openh264"]
-# SPICE is deliberately excludable along with its dependency tree. The image
-# codecs are in (`solstice-spice-codec`); the channels and the display
-# rasteriser are not, so `backend.kind = "spice"` still reports itself
-# unimplemented (see README).
-spice = ["dep:solstice-spice-codec"]
+# SPICE is deliberately excludable along with its dependency tree: it pulls
+# in a JPEG decoder, LZ4, zlib and the image codecs, none of which an
+# RFB-only build needs.
+spice = ["dep:solstice-spice", "dep:solstice-spice-codec"]
 
 [dependencies]
 solstice-backend.workspace = true
 solstice-gamestream.workspace = true
 solstice-video.workspace = true
+solstice-spice = { workspace = true, optional = true }
 solstice-spice-codec = { workspace = true, optional = true }
 solstice-vnc = { workspace = true, optional = true }
 

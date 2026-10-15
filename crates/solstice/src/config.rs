@@ -203,6 +203,8 @@ pub struct Backend {
     pub kind: BackendKind,
     /// RFB settings.
     pub vnc: Vnc,
+    /// SPICE settings.
+    pub spice: Spice,
 }
 
 impl Default for Backend {
@@ -210,6 +212,7 @@ impl Default for Backend {
         Self {
             kind: BackendKind::TestPattern,
             vnc: Vnc::default(),
+            spice: Spice::default(),
         }
     }
 }
@@ -220,7 +223,7 @@ impl Default for Backend {
 pub enum BackendKind {
     /// RFB.
     Vnc,
-    /// SPICE. Not implemented.
+    /// SPICE: QEMU/KVM's console protocol. Needs the `spice` feature.
     Spice,
     /// The built-in colour bars, for bringing the host half up on its own.
     TestPattern,
@@ -254,6 +257,53 @@ impl Default for Vnc {
             ca_file: None,
         }
     }
+}
+
+/// SPICE backend settings.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Spice {
+    /// Host.
+    pub host: String,
+    /// Port. The TLS port when `security = "tls"`, the plain one otherwise;
+    /// SPICE configures the two independently and there is no convention for
+    /// the TLS one, so it has to be set explicitly.
+    pub port: u16,
+    /// `tls` or `plain`. `plain` is refused off-loopback
+    /// (`docs/security.md` §4.2).
+    pub security: SpiceSecurityKind,
+    /// The ticket password, where the server has ticketing enabled.
+    pub password: Option<String>,
+    /// PEM file of certificates to trust for TLS.
+    pub ca_file: Option<PathBuf>,
+    /// Whether to open the playback channel. SPICE's audio is Opus, which is
+    /// also what GameStream carries.
+    pub audio: bool,
+}
+
+impl Default for Spice {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".into(),
+            port: 5900,
+            // The sound default, for the same reason VeNCrypt is the RFB
+            // one: the ticket authenticates and protects nothing.
+            security: SpiceSecurityKind::Tls,
+            password: None,
+            ca_file: None,
+            audio: true,
+        }
+    }
+}
+
+/// How a SPICE connection is protected.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SpiceSecurityKind {
+    /// TLS with x509 server certificates, verified.
+    Tls,
+    /// Plaintext. Loopback only.
+    Plain,
 }
 
 /// RFB security type.
@@ -320,6 +370,19 @@ impl Config {
                 self.backend.vnc.security, self.backend.vnc.host
             )));
         }
+        // Same rule, same reason, for SPICE: its ticket is a password check
+        // and not a key exchange, so a plaintext channel carries the display
+        // and every keystroke in the clear (`docs/security.md` §4.2).
+        if self.backend.kind == BackendKind::Spice
+            && self.backend.spice.security == SpiceSecurityKind::Plain
+            && !is_loopback_host(&self.backend.spice.host)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "backend.spice.security = \"plain\" is refused against {}; \
+                 use tls or a tunnel to loopback",
+                self.backend.spice.host
+            )));
+        }
         Ok(())
     }
 }
@@ -381,6 +444,29 @@ mod tests {
         let text = include_str!("../../../contrib/solstice.example.toml");
         let config = Config::parse(text).expect("the shipped example must parse");
         assert_eq!(config.server.port, 47989);
+    }
+
+    #[test]
+    fn plaintext_spice_is_refused_against_a_remote_host() {
+        let text = r#"
+[backend]
+kind = "spice"
+
+[backend.spice]
+host = "192.168.1.10"
+security = "plain"
+"#;
+        assert!(matches!(Config::parse(text), Err(ConfigError::Invalid(_))));
+
+        let text = r#"
+[backend]
+kind = "spice"
+
+[backend.spice]
+host = "127.0.0.1"
+security = "plain"
+"#;
+        assert!(Config::parse(text).is_ok(), "loopback is the exception");
     }
 
     #[test]

@@ -6,7 +6,7 @@ in `docs/bridging-design.md` §6 — and the structure survived contact with the
 implementation almost unchanged. Where it did not, the deviation is marked
 **▲** and explained; `docs/implementation-notes.md` has the reasoning.
 
-About 19 000 lines of Rust across six crates, roughly half of it tests.
+About 37 000 lines of Rust across eight crates, roughly half of it tests.
 
 Design constraints this layout satisfies:
 
@@ -239,27 +239,44 @@ differential vectors that justify it live in `tests/vectors/spice/`.
 
 JPEG, LZ4 and ZLIB are deliberately absent: they have Rust crates.
 
-### `solstice-spice` — SPICE backend (optional, not written)
+### `solstice-spice` — SPICE backend (optional)
 
 ```
 src/
 ├── lib.rs
+├── wire.rs           # bounds-checked little-endian; the 32-bit member offsets
+├── error.rs
+├── protocol.rs       # constants, transcribed from the canonical headers
 ├── link.rs           # SpiceLinkHeader/Mess/Reply, caps, RSA-OAEP ticket
-├── channels/
-│   ├── main.rs       # session setup, mouse mode, the vdagent tunnel
-│   ├── display.rs    # draw commands + surfaces + video streams → framebuffer
-│   ├── inputs.rs
-│   ├── cursor.rs
-│   └── playback.rs   # Opus; possible repacketise path
-├── images/           # SpiceImage descriptors → solstice-spice-codec
-└── agent.rs          # MONITORS_CONFIG, clipboard
+├── channel.rs        # mini/full headers, sub-messages, the SET_ACK window
+├── main_channel.rs   # session setup, mouse mode, the vdagent tunnel
+├── agent.rs          # MONITORS_CONFIG, capabilities, clipboard, tokens
+├── display/
+│   ├── mod.rs        # the owning task: surfaces → framebuffer, damage, cursor
+│   ├── types.rs      # the structures spice.proto describes
+│   ├── image.rs      # SpiceImage descriptors, palettes, the pixmap cache
+│   ├── surface.rs    # the surface set
+│   ├── raster.rs     # ROPs, clipping, masks, brushes, sampling, glyphs
+│   ├── commands.rs   # one draw command, parsed and executed
+│   └── stream.rs     # video streams
+├── cursor.rs         # cursor shapes, composited by the display task
+├── inputs.rs         # scancodes, pointer, motion flow control
+├── playback.rs       # Opus, passed through rather than transcoded
+├── backend.rs        # dialling every channel; Backend and Session
+└── mock.rs           # a deliberately minimal server, for the negative cases
 ```
 
-Gated behind `--features spice`, off by default. `images/` is no longer the
-reason — that is `solstice-spice-codec` above, and it is done. What is left is
-`display.rs`: a 2D rasteriser with surfaces, clipping, ROPs, brushes, masks
-and glyphs, with video streams composited over it
-(`docs/spice-protocol.md` §5).
+Gated behind `--features spice`, off by default — not because it is
+unfinished, but because it pulls a dependency tree an RFB-only build has no
+use for: the image codecs, a JPEG decoder, LZ4 and zlib.
+
+▲ **The display and cursor channels share one owner.** They arrive on
+separate sockets, but a single task holds the surfaces, the cursor and the
+framebuffer, with the cursor channel's task forwarding updates into the same
+queue. The alternative — a mutex around the framebuffer — needs a third
+full-screen buffer to hold the pixels under the pointer, because moving it
+has to repaint what was beneath. With one owner that is just publishing the
+union of the old and new cursor rectangles out of the primary surface.
 
 ### `solstice-video` — encode path
 
@@ -401,15 +418,19 @@ which is what lets it be fuzzed and tested without a SPICE backend existing.
 ▲ That is the whole list, and deliberately: a decoder sitting directly on
 attacker-controlled bytes is the last place to want a supply chain.
 
-### `solstice-spice` (optional, not written)
+### `solstice-spice` (optional)
 
 | Crate | Version | Use |
 |---|---|---|
 | `solstice-spice-codec` | — | QUIC, LZ and GLZ |
-| `spice-client` | 0.2 | evaluate — small and young; see `docs/spice-protocol.md` §8 |
-| `rsa` | 0.9 | RSA-OAEP ticket |
-| `zune-jpeg` or `image` | — | the JPEG and JPEG-alpha descriptors |
-| `lz4_flex` | 0.11 | the LZ4 descriptor |
+| `rsa`, `sha1` | 0.9, 0.10 | the RSA-OAEP/MGF1-SHA-1 ticket |
+| `rustls`, `tokio-rustls`, `webpki-roots`, `rustls-pemfile` | — | TLS on every channel, with the certificate verified |
+| `zune-jpeg` | 0.4 | the JPEG and JPEG-alpha descriptors, and MJPEG streams |
+| `lz4_flex` | 0.11 | the LZ4 descriptor, in its external-dictionary mode |
+| `flate2` | 1 | the zlib-over-GLZ descriptor |
+
+▲ `spice-client` 0.2 was evaluated and not used; `docs/spice-protocol.md`
+§8 has the reasoning.
 
 ### FEC — a decision, not a dependency
 
@@ -441,9 +462,8 @@ against `moonlight-common-c` built with `FEC_VALIDATION_MODE` — see
 default  = ["vnc", "openh264"]
 vnc      = ["dep:solstice-vnc"]
 openh264 = ["solstice-video/openh264"]
-# SPICE is excludable along with its dependency tree. The image codecs are in
-# (`solstice-spice-codec`); the channels and the display rasteriser are not.
-spice    = ["dep:solstice-spice-codec"]
+# SPICE is excludable along with its whole dependency tree.
+spice    = ["dep:solstice-spice", "dep:solstice-spice-codec"]
 ```
 
 ▲ `ffmpeg`, `vaapi`, `hevc` and `av1` are not declared. A feature flag that
@@ -499,9 +519,11 @@ security = "vencrypt"           # refuse "none"/"vncauth" off-loopback
 ca_file  = "/etc/solstice/vnc-ca.pem"
 
 # [backend.spice]
-# host = "127.0.0.1"
-# port = 5900
-# tls  = true
+# host     = "127.0.0.1"
+# port     = 5901              # the server's *TLS* port, configured separately
+# security = "tls"             # refuse "plain" off-loopback
+# ca_file  = "/etc/solstice/spice-ca.pem"
+# audio    = true
 ```
 
 ---
@@ -517,9 +539,9 @@ ca_file  = "/etc/solstice/vnc-ca.pem"
 | Pairing | four-phase handshake against a mock client, with negative tests for every out-of-order and replayed transition | ✓ — each of the three CVEs has a named test |
 | RTSP | recorded Moonlight transcripts replayed | the full documented sequence is replayed against the state machine; the transcripts are ours, not captured |
 | Packetiser | feed Annex-B, reassemble with a port of the client's depacketiser, assert byte equality | ✓ — including shard loss recovered from parity, which is the `FEC_VALIDATION_MODE` invariant run locally |
-| Backends | `Xvnc` and `Xspice` in CI, plus minimal mocks as the opposite pole | both poles ✓ for RFB — `Xvnc` is spawned by the test and skipped with a note when absent. No SPICE, because there is no SPICE backend — the codecs are tested against the C encoders instead, which is a different and weaker thing: no QXL driver has produced any of it |
+| Backends | `Xvnc` and `Xspice` in CI, plus minimal mocks as the opposite pole | both poles ✓ for both backends. `real_server.rs` drives a live `Xspice` across every image codec, MJPEG streams and input; it found two bugs the mock could not (`docs/roadmap.md` §2.6). What `Xspice` cannot reach is a real `spice-vdagent` and a QXL guest driver — §2.7 |
 | Input | exhaustive VK → scancode table tests | ✓ — and VK → keysym, and both paths through the RFB encoder |
-| Parsers | `cargo-fuzz` over seven targets | targets written ✓; no corpus, no nightly run yet. The two SPICE ones have had a short local run each and found a bug apiece: a 23-byte header asking for a 151 MiB image (which is why `Limits` exists) and a width whose stride overflowed a `u32`. Both have regression tests |
+| Parsers | `cargo-fuzz` over nine targets | targets written ✓; no corpus, no nightly run yet. Four of them have found real bugs in short local runs: a 23-byte QUIC header asking for a 151 MiB image (which is why `Limits` exists), an LZ width whose stride overflowed a `u32`, a `COPY_BITS` asking for a 174 GB allocation on a 64 × 48 surface, and a zero-stride stencil mask that indexed an empty row. All four have regression tests |
 | SPICE image codecs | differential against the real C encoders | ✓ — 278 vectors from `spice-common` (QUIC, LZ) and `spice-server` (GLZ), frozen by `tests/vectors/spice/` |
 | End-to-end | headless Moonlight client, assert on the elementary stream | ✓ — but with a client of our own rather than `moonlight-embedded`: pair, launch, encrypted RTSP, decrypt, reassemble, decode H.264. Run twice: against the colour-bar generator, reading the frame counter off the decoded picture, and against a real `Xvnc` desktop, checking the pixels are the colour it was painted |
 
@@ -545,9 +567,9 @@ Capture it before writing the packetiser, not after.
 | 1 | `vnc-rs` vs. a direct RFB implementation | **Direct.** The three things a bridge needs are the three things client crates hide. |
 | 2 | Encoder default | **OpenH264.** The lightest encoder to build — cc and nothing else. (It was chosen for its BSD-2 licence; that stopped mattering when the project became GPL-3.0-or-later, and the choice stands on build weight.) It emits profile_idc 100 (High), which settles the question flagged in §4. |
 | 3 | HEVC and AV1 | **H.264 only.** `ServerCodecModeSupport` advertises `SCM_H264`, and DESCRIBE omits the two markers a client reads as HEVC and AV1. |
-| 4 | Audio beyond Opus silence | **Still silence.** RFB has no audio; the SPICE repacketise path is unbuilt. |
+| 4 | Audio beyond Opus silence | **Still silence on RFB**, which has no audio. SPICE's playback channel is implemented and hands the pipeline real Opus packets; whether they can be repacketised rather than transcoded depends on the frame duration matching `x-nv-aqos.packetDuration`, which is a pipeline question and is not yet answered. |
 | 5 | `rusty_enet` vs. reimplementing ENet | **Still open.** `rusty_enet` is in use, contained by a one-peer limit, a connect-data check and a GCM-authenticated message layer. No audit has happened. |
-| 6 | SPICE image decoders: port, FFI, or drop | **Port.** `solstice-spice-codec` has QUIC, LZ and GLZ in pure Rust, verified against the real C encoders. The backend above them is still unwritten, so `backend.kind = "spice"` still reports unimplemented. `docs/roadmap.md` §2.2. |
+| 6 | SPICE image decoders: port, FFI, or drop | **Port, and the backend above them is now written too.** `solstice-spice-codec` has QUIC, LZ and GLZ in pure Rust, verified against the real C encoders; `solstice-spice` has the channels, the rasteriser, the agent and the audio. `backend.kind = "spice"` builds a working backend. What has not happened is a real server answering it — `docs/roadmap.md` §2.6. |
 
 Two more that the implementation raised:
 

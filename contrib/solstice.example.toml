@@ -35,11 +35,12 @@ encoder        = "openh264"
 fec_percentage = 20
 
 [audio]
-# The RFB backend has no audio, so this sends Opus silence.
+# The RFB backend has no audio, so this sends Opus silence. The SPICE backend
+# does have audio, and it is Opus too.
 enabled = true
 
 [backend]
-# "vnc", "spice" (not implemented) or "testpattern".
+# "vnc", "spice" (needs the `spice` Cargo feature) or "testpattern".
 kind = "testpattern"
 
 [backend.vnc]
@@ -49,3 +50,21 @@ port     = 5900
 security = "vencrypt"
 # password = "..."
 # ca_file  = "/etc/solstice/vnc-ca.pem"
+
+[backend.spice]
+host     = "127.0.0.1"
+# The port to link on. With security = "tls" this is the server's *TLS* port,
+# which SPICE configures independently of the plain one and for which there is
+# no convention -- so set it explicitly. QEMU: -spice tls-port=5901,...
+port     = 5900
+# "tls" or "plain". "plain" is refused against anything but loopback: SPICE's
+# ticket is a password check, not a key exchange, so without TLS the display
+# and every keystroke are in the clear (docs/security.md 4.2).
+security = "tls"
+# The ticket password, where the server has ticketing enabled. A server run
+# with --disable-ticketing needs none.
+# password = "..."
+# ca_file  = "/etc/solstice/spice-ca.pem"
+# Open the playback channel. SPICE's audio is Opus, which is also what
+# GameStream carries.
+audio    = true
