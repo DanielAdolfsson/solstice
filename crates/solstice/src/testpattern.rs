@@ -26,6 +26,11 @@ pub struct TestPatternBackend {
     width: u32,
     height: u32,
     fps: u32,
+    /// Shared with every session this backend opens, so a caller holding the
+    /// backend can read back what the client sent. The daemon only ever sees
+    /// an `Arc<dyn Backend>` and the session is created inside the stream
+    /// task, so this is the only handle a test can keep.
+    received: Arc<Mutex<Vec<InputEvent>>>,
 }
 
 impl TestPatternBackend {
@@ -35,7 +40,13 @@ impl TestPatternBackend {
             width,
             height,
             fps: fps.clamp(1, 240),
+            received: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Every input event any session of this backend has been handed.
+    pub fn received_input(&self) -> Vec<InputEvent> {
+        self.received.lock().expect("input lock").clone()
     }
 }
 
@@ -46,10 +57,11 @@ impl Backend for TestPatternBackend {
     }
 
     async fn connect(&self) -> Result<Box<dyn Session>> {
-        Ok(Box::new(TestPatternSession::start(
+        Ok(Box::new(TestPatternSession::start_recording_into(
             self.width,
             self.height,
             self.fps,
+            self.received.clone(),
         )))
     }
 }
@@ -79,6 +91,16 @@ impl std::fmt::Debug for TestPatternSession {
 impl TestPatternSession {
     /// Start generating.
     pub fn start(width: u32, height: u32, fps: u32) -> Self {
+        Self::start_recording_into(width, height, fps, Arc::new(Mutex::new(Vec::new())))
+    }
+
+    /// Start generating, recording input into a log the caller owns.
+    pub fn start_recording_into(
+        width: u32,
+        height: u32,
+        fps: u32,
+        received: Arc<Mutex<Vec<InputEvent>>>,
+    ) -> Self {
         let fb = FramebufferHandle::with_size(width, height);
         let (events, _) = broadcast::channel(64);
         let running = Arc::new(AtomicBool::new(true));
@@ -109,7 +131,7 @@ impl TestPatternSession {
             width,
             height,
             running,
-            received: Arc::new(Mutex::new(Vec::new())),
+            received,
         }
     }
 

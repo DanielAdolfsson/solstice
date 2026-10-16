@@ -59,9 +59,12 @@ solstice/
 │       ├── control_envelope.rs
 │       └── rfb_rect.rs
 ├── tests/
+│   ├── guest/                    # the QEMU test guest: both backends, one image
 │   ├── vectors/fec/              # nanors oracle (dump.c), its checker, frozen JSON
 │   └── tools/
-│       └── gen_fec_vectors.py    # runs the oracle, freezes the vectors
+│       ├── gen_fec_vectors.py    # runs the oracle, freezes the vectors
+│       ├── gen_spice_vectors.py  # the same, for the SPICE image codecs
+│       └── mlc-probe/            # the real Moonlight client, headless and asserting
 └── contrib/
     ├── solstice.service          # hardened systemd unit
     └── solstice.example.toml
@@ -75,8 +78,10 @@ directory with the crate in scope:
 |---|---|
 | FEC differential vectors | `crates/solstice-gamestream/tests/fec_vectors.rs` |
 | RFB client vs. the minimal mock server | `crates/solstice-vnc/tests/mock_server.rs` |
-| RFB client vs. TigerVNC's `Xvnc` | `crates/solstice-vnc/tests/real_server.rs` |
+| RFB client vs. QEMU's RFB server | `crates/solstice-vnc/tests/real_server.rs` |
+| SPICE client vs. a live `spice-server` | `crates/solstice-spice/tests/real_server.rs` |
 | The whole stack, end to end, twice | `crates/solstice/tests/end_to_end.rs` |
+| The host vs. the **real** Moonlight client | `crates/solstice/tests/real_moonlight.rs` |
 
 ▲ The mock RFB server is `solstice-vnc`'s `mock` module rather than a separate
 `tests/mocks/` crate. It needs the same message definitions the client does,
@@ -568,15 +573,19 @@ Capture it before writing the packetiser, not after.
 | 2 | Encoder default | **OpenH264.** The lightest encoder to build — cc and nothing else. (It was chosen for its BSD-2 licence; that stopped mattering when the project became GPL-3.0-or-later, and the choice stands on build weight.) It emits profile_idc 100 (High), which settles the question flagged in §4. |
 | 3 | HEVC and AV1 | **H.264 only.** `ServerCodecModeSupport` advertises `SCM_H264`, and DESCRIBE omits the two markers a client reads as HEVC and AV1. |
 | 4 | Audio beyond Opus silence | **Still silence on RFB**, which has no audio. SPICE's playback channel is implemented and hands the pipeline real Opus packets; whether they can be repacketised rather than transcoded depends on the frame duration matching `x-nv-aqos.packetDuration`, which is a pipeline question and is not yet answered. |
-| 5 | `rusty_enet` vs. reimplementing ENet | **Still open.** `rusty_enet` is in use, contained by a one-peer limit, a connect-data check and a GCM-authenticated message layer. No audit has happened. |
-| 6 | SPICE image decoders: port, FFI, or drop | **Port, and the backend above them is now written too.** `solstice-spice-codec` has QUIC, LZ and GLZ in pure Rust, verified against the real C encoders; `solstice-spice` has the channels, the rasteriser, the agent and the audio. `backend.kind = "spice"` builds a working backend. What has not happened is a real server answering it — `docs/roadmap.md` §2.6. |
+| 5 | `rusty_enet` vs. reimplementing ENet | **Still open, but no longer unproven.** `rusty_enet` is in use, contained by a one-peer limit, a connect-data check and a GCM-authenticated message layer. A real `moonlight-common-c` peer now connects to it, carries input and disconnects cleanly (`real_moonlight.rs`). No audit has happened. |
+| 6 | SPICE image decoders: port, FFI, or drop | **Port, and the backend above them is now written too.** `solstice-spice-codec` has QUIC, LZ and GLZ in pure Rust, verified against the real C encoders; `solstice-spice` has the channels, the rasteriser, the agent and the audio. `backend.kind = "spice"` builds a working backend, and a real QEMU guest has answered it — `docs/roadmap.md` §2.6. |
 
 Two more that the implementation raised:
 
 7. **A captured Sunshine ↔ Moonlight session.** `docs/testing.md` §2.4 calls it
    the highest-value artefact and says to capture it *before* writing the
-   packetiser. That did not happen, and it is the gap that would catch a field
-   or endianness error both of our ends make consistently.
+   packetiser. That did not happen. The gap it was meant to close — a field or
+   endianness error both of our ends make consistently — is now covered
+   instead by `tests/tools/mlc-probe/`, which drives the host with the real
+   `moonlight-common-c` and found eight such errors on its first run
+   (`docs/roadmap.md` §3). Frozen vectors would still be worth having, because
+   the probe needs a C toolchain and a network and CI has neither.
 8. **The management socket.** `solstice pair` runs in a different process from
    the daemon, so opening a pairing window needs IPC that does not exist. The
    window, lockout and source-address policy are implemented and tested; only

@@ -46,7 +46,8 @@ pub enum Origin {
 }
 
 impl Origin {
-    const fn tag_byte(self) -> u8 {
+    /// The byte this origin writes into `iv[10]`.
+    pub const fn tag_byte(self) -> u8 {
         match self {
             Origin::Client => b'C',
             Origin::Host => b'H',

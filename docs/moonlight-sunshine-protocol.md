@@ -216,7 +216,40 @@ Stream-id strings are version-gated: `control/13/0` for appversion ≥ 7.1.431,
 out of the `Transport` response header (`RtspConnection.c:717-745`) — so the
 host *can* relocate its UDP ports per-session if it wants.
 
-The SETUP for audio also returns a `Session:` attribute the client requires.
+`PLAY` is a single request with the target `/` for appversion ≥ 7.1.431, and
+*two* requests — `streamid=video` then `streamid=audio` — below it
+(`RtspConnection.c:1353-1412`). A host that starts its stream on PLAY needs to
+know which it will get.
+
+### 4.0 One connection per message
+
+**Each RTSP message gets its own TCP connection, and the response is
+terminated by the host closing it.** `transactRtspMessageTcp`
+(`RtspConnection.c:386-517`) calls `connectTcpSocket` at the top and
+`closeSocket` at the bottom, and its read loop treats `recv() == 0` as "done
+reading" — there is no length prefix and no message-boundary scan.
+
+Two consequences for a host:
+
+- **Reply, then close.** A host that holds the connection open leaves the
+  client blocking until `RTSP_RECEIVE_TIMEOUT_SEC` (15 s) and the handshake
+  fails at `STAGE_RTSP_HANDSHAKE`.
+- **The negotiation state belongs to the launch session, not the socket.**
+  The stage ordering that makes `SETUP` legal only after `DESCRIBE`, the count
+  of streams set up, and the encryption sequence number all have to survive
+  across connections. A per-connection state machine sees seven first
+  messages.
+
+### Three headers Sunshine adds to `SETUP`
+
+None are in any RFC and the client silently falls back when they are absent,
+which makes each of them an invisible failure:
+
+| Header | On | Read at | Absent ⇒ |
+|---|---|---|---|
+| `Session: <id>;timeout = 90` | audio | `RtspConnection.c:1214-1231` | the client fails the handshake outright |
+| `X-SS-Ping-Payload: <16 ASCII>` | audio, video | `RtspConnection.c:1202-1207`, `:1267-1272` | the client sends the 4-byte legacy `"PING"` instead of the payload from `/launch`, so a host that refuses the legacy form (as `security.md` §2.3 says to) never learns the client's address and sends nothing at all |
+| `X-SS-Connect-Data: <u32>` | control | `RtspConnection.c:1309-1316`, `strtoul(…, 0)` | the client connects with ENet connect data `0`, and a host that binds peers to a session by that value refuses it |
 
 ### 4.1 Encrypted RTSP (`rtspenc://`)
 
@@ -232,9 +265,28 @@ struct encrypted_rtsp_header {   // packed, 24 bytes
 };                               // ciphertext follows
 ```
 
+The 12-byte IV is **not** just the sequence number
+(`RtspConnection.c:122-132`, `:197-206`):
+
+```
+iv[0..4]  = sequenceNumber, little-endian   (note: the header field is big-endian)
+iv[4..10] = 0
+iv[10]    = 'C' client-originated | 'H' host-originated
+iv[11]    = 'R' RTSP stream
+```
+
+Both tag bytes matter. Each end numbers its own messages from zero, so without
+`iv[10]` the two directions would reuse a nonce under one key; without
+`iv[11]` the RTSP and control streams would. Get either wrong and nothing
+decrypts — the host refuses the client's first `OPTIONS` and the client
+refuses the host's first reply. The same `'C'`/`'H'` + stream-letter scheme is
+used by the control stream (§7.1) and the video stream (§5.5).
+
 The MSB of `typeAndLength` is how a parser tells encrypted from plaintext.
 Sunshine rejects a plaintext message once the session is encrypted
-(`rtsp.cpp:166`).
+(`rtsp.cpp:166`). The client is equally strict in the other direction: it
+rejects a response that is partial *or* has excess data
+(`RtspConnection.c:185-194`), so exactly one envelope per connection.
 
 ### 4.2 The ANNOUNCE SDP — the real configuration channel
 
@@ -371,8 +423,42 @@ Reed–Solomon over GF(2^8), up to **4 blocks** per frame (2 bits in
 `data_shards = 255*100 / (100 + fec_pct)`. If a frame needs more than 4 blocks,
 Sunshine disables FEC for it entirely (`stream.cpp:1637-1643`).
 
-Parity is computed over the **whole shard including the NV header**, with the
-per-shard header fields patched afterwards.
+#### What the parity covers, exactly
+
+Parity is computed over the **whole shard including the NV header**, with some
+per-shard header fields patched afterwards. Which fields land on which side of
+the encode is not a detail — the client asserts on it.
+
+`stream.cpp:1694-1711` writes these **before** `fec::encode`, so they are in
+the parity and a recovered shard gets them back:
+
+> `streamPacketIndex`, `flags` (`CONTAINS_PIC_DATA`/`SOF`/`EOF`),
+> `extraFlags`, `multiFecFlags`
+
+`stream.cpp:1745-1759` patches these **after**, over every shard including the
+parity ones, so they are *not* recoverable and the client re-derives them from
+the rest of the block:
+
+> `rtp.header`, `rtp.sequenceNumber`, `rtp.timestamp`, `fecInfo`,
+> `multiFecBlocks`, `frameIndex`
+
+`RtpVideoQueue.c:355-389` is the mirror image: the client overwrites exactly
+the second list on a recovered shard and then asserts the first list matches
+the original byte for byte. Putting a field on the wrong side fails that
+assertion in a debug Moonlight and silently corrupts recovered frames in a
+release one.
+
+Two consequences that look like bugs and are not:
+
+- **A parity shard's `flags`, `extraFlags`, `multiFecFlags` and
+  `streamPacketIndex` are Reed–Solomon output** — effectively random bytes.
+  Nothing patches them afterwards. So `flags & CONTAINS_PIC_DATA` is **not**
+  how you tell a parity shard from a data one; the client uses the sequence
+  number (`RtpVideoQueue.c:738`), and `fecInfo` carries the same information
+  in a field that *is* patched.
+- `rtp.packetType`, `rtp.ssrc` and the four reserved bytes are never patched
+  at all, so in a parity shard they hold parity too. A host that helpfully
+  zeroes them takes those bytes out of the recovery.
 
 The parity count is **never transmitted**. Both sides derive it from `D` and
 the percentage with the same expression (`stream.cpp:866`, `RtpVideoQueue.c:712`):
@@ -382,9 +468,16 @@ P = (D * fec_percentage + 99) / 100        # integer division = ceil
 ```
 
 An encoder must therefore guarantee that the percentage it writes re-derives to
-the parity count it actually used. Sunshine's `minRequiredFecPackets` path
-(Moonlight sends `2`) bumps `P` and *recomputes* `pct = 100*P/D`; that round-trip
-holds because the bump only fires for `D <= 5`.
+the parity count it actually used. The client applies **no minimum of its own**
+— that expression is the whole of its knowledge. So Sunshine's
+`minRequiredFecPackets` path (Moonlight sends `2`) bumps `P` *and recomputes*
+`pct = 100*P/D` before writing it into `fecInfo` (`stream.cpp:867-873`); the
+round-trip holds because the bump only fires for `D <= 5`, where
+`200/D ∈ {200, 100, 66, 50, 40}` all re-derive to 2.
+
+Declaring the configured percentage next to a bumped count is the subtle
+version of getting this wrong: the client builds a Reed–Solomon matrix one row
+short of the host's, and every recovery from that block is quietly garbage.
 
 #### The matrix is a closed form
 
@@ -488,13 +581,39 @@ struct AUDIO_FEC_HEADER {
 The parity matrix Sunshine patches in is
 `{0x77, 0x40, 0x38, 0x0e, 0xc7, 0xa7, 0x0d, 0x6c}`.
 
+**The sequence number advances once per data packet and never for parity**
+(`stream.cpp:1913`). The two parity packets of a block *borrow* the next two
+sequence numbers — the block starting at `n` sends data at `n..n+3` and parity
+at `n+4` and `n+5` — and the following block then starts at `n+4`, colliding
+with them. That is intentional: a parity packet is told apart by
+`packetType = 127`, not by its sequence number.
+
+The reason it has to work that way is `RtpAudioQueue.c:269-280`: a block whose
+`baseSequenceNumber` is not a multiple of four is rejected, logged as *"Audio
+FEC has been disabled due to an incompatibility with your host's old
+software!"*, and audio FEC is switched off **for the rest of the session**. A
+host that reserves sequence numbers for its parity produces bases of 0, 6, 12,
+… and only the first one is ever accepted.
+
 ---
 
 ## 7. Control stream — UDP 47999 (ENet)
 
 Reliable-UDP via **ENet 1.3.x**. The client supplies `control_connect_data` as
-ENet connect data so the host can bind the peer to a session. Input events,
-IDR requests, loss statistics, rumble, HDR state and termination all ride here.
+ENet connect data so the host can bind the peer to a session — it learns the
+value from `X-SS-Connect-Data` on the control `SETUP` (§4), and uses `0` when
+that header is missing. Input events, IDR requests, loss statistics, rumble,
+HDR state and termination all ride here.
+
+**The client connects here before it sends a single video ping.**
+`STAGE_CONTROL_STREAM_START` runs at `Connection.c:483`, and the ping thread
+that tells the host where to send video does not start until
+`startVideoStream` at `:497` (`VideoStream.c:382-384`). A host that waits for
+the ping before binding its ENet socket deadlocks against every real client:
+each side is waiting for the other to go first. Bind the control port first.
+
+(The *audio* ping thread is the exception — it starts before the RTSP
+handshake, for GFE 3.22 compatibility: `AudioStream.c:87-95`.)
 
 ### 7.1 Framing
 
@@ -588,8 +707,11 @@ Ordered by dependency, this is the build list:
 3. The four-step PIN handshake; persist client certs.
 4. `/applist`, `/launch`, `/resume`, `/cancel`.
 5. RTSP on 48010, both plaintext and GCM-wrapped, with an SDP DESCRIBE and a
-   parser for the ANNOUNCE attribute soup.
-6. UDP ping responder on 47998/48000 to learn the peer address.
+   parser for the ANNOUNCE attribute soup — one message per connection,
+   closing after each reply, with the negotiation state kept per session
+   (§4.0), and the three `SETUP` headers of §4.
+6. UDP ping responder on 47998/48000 to learn the peer address. Bind the ENet
+   control port (8) *before* waiting on the video ping, or deadlock (§7).
 7. H.264 Annex-B → `NV_VIDEO_PACKET` packetizer on 47998 (FEC off initially).
 8. ENet host on 47999, AES-GCM envelope, input-packet decoder.
 9. Opus sender on 48000 (can be silence, or omitted if the client tolerates it
@@ -597,3 +719,8 @@ Ordered by dependency, this is the build list:
 
 Steps 1–6 and 8 are protocol plumbing with no hard problems. Step 7 is where
 the real work is, and it is a *video-encoding* problem, not a protocol one.
+
+None of that is the same as being interoperable. Everything in this document
+that a host can get wrong *symmetrically* — an IV construction, a FEC field
+ordering, a sequence-numbering rule — will pass a test suite built from this
+document alone. The only cure is a real client: `tests/tools/mlc-probe/`.

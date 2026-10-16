@@ -197,21 +197,23 @@ async fn run_stream(
         "backend geometry"
     );
 
-    // 3. Bind the media sockets and wait for the client to prove where it is.
+    // 3. Bind the media sockets. Binding only: the pings that say where the
+    //    client is cannot be waited for yet, see below.
     let video_socket =
         Arc::new(UdpSocket::bind(SocketAddr::new(bind, config.server.video_port())).await?);
     let audio_socket =
         Arc::new(UdpSocket::bind(SocketAddr::new(bind, config.server.audio_port())).await?);
-    let video_peer = media::await_peer(&video_socket, &ping_payload).await?;
-    let audio_peer = match media::await_peer(&audio_socket, &ping_payload).await {
-        Ok(peer) => Some(peer),
-        Err(e) => {
-            tracing::warn!(error = %e, "no audio ping; continuing without audio");
-            None
-        }
-    };
 
     // 4. The control channel, on its own thread because ENet is a poll loop.
+    //
+    //    This must come *before* waiting for the video ping. Moonlight
+    //    establishes the ENet control stream at `STAGE_CONTROL_STREAM_START`
+    //    and only then starts the video stream, which is what begins the ping
+    //    thread (`Connection.c:483-497`, `VideoStream.c:382-384`). A host that
+    //    waits for the ping first and binds ENet afterwards deadlocks against
+    //    a real client: each side is waiting for the other to go first. Our
+    //    own test client pings immediately and so never showed it
+    //    (`docs/roadmap.md` §3).
     let (control_tx, mut control_rx) = mpsc::channel(256);
     let running = Arc::new(AtomicBool::new(true));
     {
@@ -226,6 +228,16 @@ async fn run_stream(
                 }
             })?;
     }
+
+    // 4b. Now the pings can be waited for.
+    let video_peer = media::await_peer(&video_socket, &ping_payload).await?;
+    let audio_peer = match media::await_peer(&audio_socket, &ping_payload).await {
+        Ok(peer) => Some(peer),
+        Err(e) => {
+            tracing::warn!(error = %e, "no audio ping; continuing without audio");
+            None
+        }
+    };
 
     // 5. The pipeline.
     let frame_interval = Duration::from_nanos(1_000_000_000 / stream_config.fps.max(1) as u64);

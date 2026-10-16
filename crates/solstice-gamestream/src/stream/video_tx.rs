@@ -8,13 +8,21 @@
 //!
 //! **The buffer layout is shaped around FEC.** Each shard is
 //! `packet_size + MAX_RTP_HEADER_SIZE` bytes, of which the first
-//! [`VIDEO_HEADER_LEN`] are the RTP and NV headers. Parity is computed over the
-//! *whole* shard with those header bytes still zero, and every header -- data
-//! and parity alike -- is written afterwards. Sunshine reserves exactly this
-//! space at each block boundary so shards can be built in place
-//! (`concat_and_insert`), and the client zeroes the same region before
-//! recovering. Build the no-FEC path first and this layout is the thing you
-//! have to tear out (`docs/bridging-design.md` §2.5).
+//! [`MAX_RTP_HEADER_SIZE`] are the RTP header and the next sixteen are the NV
+//! header. Parity is computed over the *whole* shard with the **RTP** region
+//! still zero but the **NV header already written**, and the RTP headers --
+//! plus the parity shards' NV headers -- are patched in afterwards
+//! (`docs/moonlight-sunshine-protocol.md` §5.4). Sunshine reserves exactly
+//! this space at each block boundary so shards can be built in place
+//! (`concat_and_insert`). Build the no-FEC path first and this layout is the
+//! thing you have to tear out (`docs/bridging-design.md` §2.5).
+//!
+//! That split is not cosmetic. `moonlight-common-c` runs Reed-Solomon over
+//! the datagram exactly as it arrived, headers included, and then asserts
+//! that a recovered shard's `flags`, `extraFlags` and `streamPacketIndex`
+//! match the original (`RtpVideoQueue.c:373-414`). Those fields differ per
+//! shard, so they can only come back out of the parity -- which means they
+//! have to have gone into it.
 //!
 //! **The parity count is never transmitted.** Both ends derive it from the data
 //! shard count and the percentage, so the percentage written into `fecInfo`
@@ -25,10 +33,10 @@
 //! shifted left by 8. Conflating them freezes the picture after 65536 packets.
 
 use crate::crypto::gcm::SessionCrypto;
-use crate::wire::rtp::RtpHeader;
+use crate::wire::rtp::{RtpHeader, RTP_HEADER_LEN};
 use crate::wire::video::{
-    flags, EncPrefix, FrameHeader, FrameType, NvVideoPacket, VideoPacketHeader, ENC_PREFIX_LEN,
-    FRAME_HEADER_LEN, MULTI_FEC_FLAGS, VIDEO_HEADER_LEN,
+    flags, EncPrefix, FrameHeader, FrameType, NvVideoPacket, ENC_PREFIX_LEN, FRAME_HEADER_LEN,
+    MULTI_FEC_FLAGS, VIDEO_HEADER_LEN,
 };
 
 use super::fec::{self, parity_count, Rs};
@@ -186,8 +194,8 @@ impl VideoPacketizer {
         for block_index in 0..blocks {
             let first = block_index * per_block;
             let count = per_block.min(data_shards - first);
-            let block_parity = if fec_percentage == 0 {
-                0
+            let (block_parity, block_percentage) = if fec_percentage == 0 {
+                (0, 0)
             } else {
                 self.block_parity_count(count, fec_percentage)
             };
@@ -197,7 +205,7 @@ impl VideoPacketizer {
                 block_payload,
                 count,
                 block_parity,
-                fec_percentage,
+                block_percentage,
                 block_index as u8,
                 blocks as u8,
                 frame_index,
@@ -214,15 +222,24 @@ impl VideoPacketizer {
         })
     }
 
-    /// Parity shards for one block, honouring `minRequiredFecPackets`.
+    /// Parity shards for one block, and the percentage to declare for it.
     ///
-    /// Moonlight sends `2`. Sunshine's path bumps the count and *recomputes*
-    /// the percentage so that both ends still derive the same number; that
-    /// round-trip only holds because the bump fires for small blocks.
-    fn block_parity_count(&self, data_shards: usize, fec_percentage: u32) -> usize {
+    /// The count is never transmitted: the client re-derives it with
+    /// `(D * pct + 99) / 100` and nothing else (`RtpVideoQueue.c:708`). So
+    /// when `minRequiredFecPackets` -- Moonlight sends `2` -- bumps the count
+    /// above what the configured percentage gives, the *percentage* has to be
+    /// recomputed to match, exactly as Sunshine does
+    /// (`stream.cpp:867-873`). Declaring the configured percentage alongside a
+    /// bumped count makes the client build a smaller Reed-Solomon matrix than
+    /// the host used, and every recovery from that block is silently wrong.
+    fn block_parity_count(&self, data_shards: usize, fec_percentage: u32) -> (usize, u32) {
         let base = parity_count(data_shards, fec_percentage as usize);
-        base.max(self.config.min_required_fec_packets as usize)
-            .max(1)
+        let minimum = self.config.min_required_fec_packets as usize;
+        if base >= minimum.max(1) {
+            return (base, fec_percentage);
+        }
+        let parity = minimum.max(1);
+        (parity, (100 * parity / data_shards) as u32)
     }
 
     fn fec_geometry(&self, data_shards: usize) -> (u32, usize) {
@@ -264,13 +281,44 @@ impl VideoPacketizer {
     ) -> Result<Vec<Vec<u8>>, fec::FecError> {
         let blocksize = self.blocksize();
         let payload_blocksize = self.payload_blocksize();
+        let total = data_shards + parity_shards;
 
-        // Shards are built in place: 32 zero bytes, then the payload chunk.
-        // The zeroes are what the parity is computed over, and the client
-        // zeroes the same region before recovering.
+        // Sequence numbers for the whole block up front: a data shard's NV
+        // header has to exist before parity is computed over it, and the
+        // header carries the sequence number.
+        let first_sequence = self.sequence;
+        self.sequence = self.sequence.wrapping_add(total as u32);
+
+        // The NV header fields that have to survive Reed-Solomon
+        // (`stream.cpp:1694-1711`). `fecInfo` is absent: Sunshine does not
+        // know the final percentage until after the encode, and patches it in
+        // afterwards along with the RTP header.
+        let pre_fec_header = |i: usize| {
+            let sequence = first_sequence.wrapping_add(i as u32);
+            let mut nv_flags = flags::CONTAINS_PIC_DATA;
+            if i == 0 && block_index == 0 {
+                nv_flags |= flags::SOF;
+            }
+            if i == data_shards - 1 && block_index + 1 == block_count {
+                nv_flags |= flags::EOF;
+            }
+            NvVideoPacket {
+                stream_packet_index: sequence << 8,
+                frame_index,
+                flags: nv_flags,
+                extra_flags: 0,
+                multi_fec_flags: MULTI_FEC_FLAGS,
+                multi_fec_blocks: NvVideoPacket::pack_multi_fec_blocks(block_index, block_count),
+                fec_info: 0,
+            }
+        };
+
+        // Shards are built in place: the RTP region zero, the NV header
+        // written, then the payload chunk. Parity covers all of it.
         let mut shards: Vec<Vec<u8>> = (0..data_shards)
             .map(|i| {
                 let mut shard = vec![0u8; blocksize];
+                pre_fec_header(i).write(&mut shard[RTP_HEADER_LEN + 4..VIDEO_HEADER_LEN]);
                 shard[VIDEO_HEADER_LEN..].copy_from_slice(
                     &block_payload[i * payload_blocksize..(i + 1) * payload_blocksize],
                 );
@@ -285,44 +333,22 @@ impl VideoPacketizer {
             shards.extend(parity);
         }
 
-        // Headers last, over every shard, exactly as Sunshine does.
-        let total = shards.len();
-        let mut out = Vec::with_capacity(total);
+        // Now patch the fields that are the same work for a data shard and a
+        // parity shard, and that the client re-derives rather than recovers.
+        let mut out = Vec::with_capacity(shards.len());
         for (i, mut shard) in shards.into_iter().enumerate() {
-            let sequence = self.sequence;
-            self.sequence = self.sequence.wrapping_add(1);
-
-            let mut nv_flags = 0u8;
-            if i < data_shards {
-                nv_flags |= flags::CONTAINS_PIC_DATA;
-                if i == 0 && block_index == 0 {
-                    nv_flags |= flags::SOF;
-                }
-                if i == data_shards - 1 && block_index + 1 == block_count {
-                    nv_flags |= flags::EOF;
-                }
-            }
-
-            let header = VideoPacketHeader {
-                rtp: RtpHeader::video(sequence as u16, timestamp),
-                nv: NvVideoPacket {
-                    stream_packet_index: sequence << 8,
-                    frame_index,
-                    flags: nv_flags,
-                    extra_flags: 0,
-                    multi_fec_flags: MULTI_FEC_FLAGS,
-                    multi_fec_blocks: NvVideoPacket::pack_multi_fec_blocks(
-                        block_index,
-                        block_count,
-                    ),
-                    fec_info: NvVideoPacket::pack_fec_info(
-                        i as u32,
-                        data_shards as u32,
-                        fec_percentage,
-                    ),
-                },
-            };
-            header.write(&mut shard);
+            let sequence = first_sequence.wrapping_add(i as u32);
+            RtpHeader::patch_video_after_fec(
+                &mut shard[..RTP_HEADER_LEN],
+                sequence as u16,
+                timestamp,
+            );
+            NvVideoPacket::patch_after_fec(
+                &mut shard[RTP_HEADER_LEN + 4..VIDEO_HEADER_LEN],
+                frame_index,
+                NvVideoPacket::pack_multi_fec_blocks(block_index, block_count),
+                NvVideoPacket::pack_fec_info(i as u32, data_shards as u32, fec_percentage),
+            );
             out.push(self.maybe_encrypt(shard, frame_index));
         }
         Ok(out)
@@ -373,6 +399,20 @@ mod tests {
         }
     }
 
+    /// Whether a shard carries picture data, decided the way the client
+    /// decides it: by position within the block.
+    ///
+    /// Not by `flags`. A parity shard's `flags` byte is Reed-Solomon output,
+    /// because Sunshine writes the flags *before* the encode and never
+    /// touches them again (`stream.cpp:1704-1711`), so on the wire it is
+    /// effectively random. `moonlight-common-c` sorts data from parity by
+    /// sequence number instead (`RtpVideoQueue.c:738`); `fecInfo` carries the
+    /// same information and is patched onto every shard afterwards.
+    fn is_data_shard(h: &VideoPacketHeader) -> bool {
+        let (shard_index, data_shards, _) = NvVideoPacket::unpack_fec_info(h.nv.fec_info);
+        shard_index < data_shards
+    }
+
     /// A port of `moonlight-common-c`'s depacketiser, enough to prove the
     /// stream is reassemblable. Returns the access unit.
     fn reassemble(packets: &[Vec<u8>], payload_blocksize: usize) -> Vec<u8> {
@@ -380,8 +420,8 @@ mod tests {
         let mut last_payload_len = payload_blocksize;
         for p in packets {
             let (h, payload) = VideoPacketHeader::parse(p).unwrap();
-            if h.nv.flags & flags::CONTAINS_PIC_DATA == 0 {
-                continue; // parity
+            if !is_data_shard(&h) {
+                continue;
             }
             let (shard_index, _, _) = NvVideoPacket::unpack_fec_info(h.nv.fec_info);
             let (block_index, _) = NvVideoPacket::unpack_multi_fec_blocks(h.nv.multi_fec_blocks);
@@ -425,9 +465,7 @@ mod tests {
         let data_shards = frame
             .packets
             .iter()
-            .filter(|pkt| {
-                VideoPacketHeader::parse(pkt).unwrap().0.nv.flags & flags::CONTAINS_PIC_DATA != 0
-            })
+            .filter(|pkt| is_data_shard(&VideoPacketHeader::parse(pkt).unwrap().0))
             .count();
         assert_eq!(
             data_shards,
@@ -458,10 +496,7 @@ mod tests {
             .iter()
             .map(|x| VideoPacketHeader::parse(x).unwrap().0)
             .collect();
-        let data: Vec<_> = headers
-            .iter()
-            .filter(|h| h.nv.flags & flags::CONTAINS_PIC_DATA != 0)
-            .collect();
+        let data: Vec<_> = headers.iter().filter(|h| is_data_shard(h)).collect();
         assert!(data.first().unwrap().nv.flags & flags::SOF != 0);
         assert!(data.last().unwrap().nv.flags & flags::EOF != 0);
         assert_eq!(
@@ -526,17 +561,15 @@ mod tests {
                         NvVideoPacket::unpack_multi_fec_blocks(h.nv.multi_fec_blocks).0 == block
                     })
                     .collect();
-                let data = in_block
-                    .iter()
-                    .filter(|h| h.nv.flags & flags::CONTAINS_PIC_DATA != 0)
-                    .count();
+                let data = in_block.iter().filter(|h| is_data_shard(h)).count();
                 let parity = in_block.len() - data;
                 let (_, declared_data, declared_pct) =
                     NvVideoPacket::unpack_fec_info(in_block[0].nv.fec_info);
                 assert_eq!(declared_data as usize, data, "len {payload_len}");
-                let derived = fec::parity_count(data, declared_pct as usize)
-                    .max(p.config.min_required_fec_packets as usize)
-                    .max(1);
+                // Exactly the client's expression, with no minimum applied:
+                // it has no idea `minRequiredFecPackets` exists
+                // (`RtpVideoQueue.c:708`).
+                let derived = fec::parity_count(data, declared_pct as usize);
                 assert_eq!(derived, parity, "len {payload_len}, block {block}");
             }
         }
@@ -574,32 +607,45 @@ mod tests {
             );
             let data_count = shards
                 .iter()
-                .filter(|(_, pkt)| {
-                    VideoPacketHeader::parse(pkt).unwrap().0.nv.flags & flags::CONTAINS_PIC_DATA
-                        != 0
-                })
+                .filter(|(_, pkt)| is_data_shard(&VideoPacketHeader::parse(pkt).unwrap().0))
                 .count();
             let parity_count_ = shards.len() - data_count;
             assert!(parity_count_ > 0, "pct {pct}");
 
-            // The client zeroes the header region before running recovery.
-            let mut slots: Vec<Option<Vec<u8>>> = shards
-                .iter()
-                .map(|(_, pkt)| {
-                    let mut s = pkt.clone();
-                    s[..VIDEO_HEADER_LEN].fill(0);
-                    Some(s)
-                })
-                .collect();
+            // Exactly what the client does: Reed-Solomon over the datagrams
+            // as they arrived, headers and all, with nothing zeroed
+            // (`RtpVideoQueue.c:306-332`).
+            let mut slots: Vec<Option<Vec<u8>>> =
+                shards.iter().map(|(_, pkt)| Some(pkt.clone())).collect();
             let original = slots[0].clone().unwrap();
             slots[0] = None;
 
             let rs = Rs::video(data_count, parity_count_).unwrap();
             rs.reconstruct(&mut slots).unwrap();
+            let recovered = slots[0].as_ref().unwrap();
+
+            // What came back must be what went in, for everything that was
+            // written *before* parity. The RTP header, `frameIndex`,
+            // `multiFecBlocks` and `fecInfo` are patched afterwards, so they
+            // are not in the parity and the client re-derives them itself
+            // (`RtpVideoQueue.c:355-370`).
             assert_eq!(
-                slots[0].as_ref().unwrap(),
-                &original,
-                "recovered bytes differ"
+                &recovered[VIDEO_HEADER_LEN..],
+                &original[VIDEO_HEADER_LEN..],
+                "recovered payload differs"
+            );
+            let nv = RTP_HEADER_LEN + 4;
+            assert_eq!(
+                &recovered[nv..nv + 4],
+                &original[nv..nv + 4],
+                "`streamPacketIndex` did not survive recovery"
+            );
+            assert_eq!(
+                &recovered[nv + 8..nv + 11],
+                &original[nv + 8..nv + 11],
+                "`flags`, `extraFlags` or `multiFecFlags` did not survive \
+                 recovery -- the real client asserts on exactly these \
+                 (`RtpVideoQueue.c:385-387`)"
             );
 
             // Put the headers back and check the frame still reassembles.

@@ -30,6 +30,22 @@ impl Default for StreamPorts {
     }
 }
 
+/// The per-launch values the negotiation has to hand back to the client.
+///
+/// All three are minted at `/launch` and all three reach the client only
+/// through RTSP, which is why they travel together.
+#[derive(Clone, Debug)]
+pub struct SessionParams {
+    /// Echoed as the RTSP `Session:` attribute on the audio `SETUP`.
+    pub session_id: String,
+    /// `X-SS-Connect-Data` on the control `SETUP`: the client sends it back
+    /// as ENet connect data, binding its peer to this session.
+    pub control_connect_data: u32,
+    /// `X-SS-Ping-Payload` on the audio and video `SETUP`s: the client puts
+    /// it in its UDP pings, which is how the host learns where to send.
+    pub ping_payload: [u8; 16],
+}
+
 /// What the caller should do after handling a request.
 #[derive(Debug)]
 pub enum RtspOutcome {
@@ -57,7 +73,7 @@ pub struct RtspServer {
     limits: Limits,
     supported_encryption: u32,
     required_encryption: u32,
-    session_id: String,
+    session: SessionParams,
     stage: Stage,
     streams_set_up: u8,
     config: Option<StreamConfig>,
@@ -70,14 +86,14 @@ impl RtspServer {
         limits: Limits,
         supported_encryption: u32,
         required_encryption: u32,
-        session_id: impl Into<String>,
+        session: SessionParams,
     ) -> Self {
         Self {
             ports,
             limits,
             supported_encryption,
             required_encryption,
-            session_id: session_id.into(),
+            session,
             stage: Stage::Start,
             streams_set_up: 0,
             config: None,
@@ -154,7 +170,34 @@ impl RtspServer {
         let mut response = Response::ok(cseq).header("Transport", format!("server_port={port}"));
         // The client requires a Session attribute on the audio SETUP.
         if stream == "audio" {
-            response = response.header("Session", format!("{};timeout = 90", self.session_id));
+            response = response.header(
+                "Session",
+                format!("{};timeout = 90", self.session.session_id),
+            );
+        }
+        // Sunshine's `X-SS-Ping-Payload` extension
+        // (`RtspConnection.c:1202-1207`, `:1267-1272`). Without it the client
+        // falls back to the four-byte legacy `"PING"`, which this host refuses
+        // on purpose as unauthenticated (`docs/security.md` §2.3) -- so the
+        // host would never learn the client's address and would send nothing
+        // at all. That is exactly what a real Moonlight saw here.
+        if stream == "audio" || stream == "video" {
+            response = response.header(
+                "X-SS-Ping-Payload",
+                String::from_utf8_lossy(&self.session.ping_payload).into_owned(),
+            );
+        }
+        // Sunshine's `X-SS-Connect-Data` extension, read at
+        // `RtspConnection.c:1309-1316` with `strtoul(.., 0)` and defaulted to
+        // zero when the header is absent. Without it the client connects with
+        // connect data 0, the host refuses the peer as belonging to no
+        // session, and the stream dies at "control stream establishment" --
+        // which is what a real Moonlight did here before this line existed.
+        if stream == "control" {
+            response = response.header(
+                "X-SS-Connect-Data",
+                self.session.control_connect_data.to_string(),
+            );
         }
         RtspOutcome::Reply(response)
     }
@@ -200,7 +243,11 @@ mod tests {
             Limits::default(),
             encryption::ALL,
             encryption::ALL,
-            "DEADBEEFCAFE",
+            SessionParams {
+                session_id: "DEADBEEFCAFE".into(),
+                control_connect_data: 0xC0FF_EE42,
+                ping_payload: *b"0123456789abcdef",
+            },
         )
     }
 

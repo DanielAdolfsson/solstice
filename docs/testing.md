@@ -87,13 +87,24 @@ oracle. These are compile-time and undocumented outside the source:
 | `LC_DEBUG_RECORD_MODE` | Installs pass-through recorder callbacks (`Connection.c:249`) that write the reassembled video and audio elementary streams to files given via `drContext`/`arContext` | Lets you assert on *content*, not just "it connected" |
 | `LC_FUZZING` | Disables early-reject paths that would short-circuit a fuzzer (`RtpVideoQueue.c:577`, `VideoStream.c:169`) | Fuzz the depacketiser against your packetiser's output |
 
-A ~150-line C driver linking `moonlight-common-c` with all three gives you a
-headless, asserting, recording client. Build it once, keep it in
-`tests/tools/mlc-probe/`, and treat it as the primary conformance tool.
+**The three are not usable together.** `RtpVideoQueue.c:5` defines
+`FEC_VALIDATION_MODE` as `LC_DEBUG && !LC_FUZZING`, and `Platform.h:128-132`
+compiles `LC_ASSERT_VT` -- the assertions on host-supplied values -- out under
+`LC_FUZZING` for the obvious reason. `LC_FUZZING` is for fuzzing the
+depacketiser; conformance wants the other two.
+
+This exists and is built: `tests/tools/mlc-probe/`, with `build.sh` to fetch
+`moonlight-common-c` at a pinned commit and compile it under `LC_DEBUG` and
+`LC_DEBUG_RECORD_MODE`. The harness that drives it is
+`crates/solstice/tests/real_moonlight.rs`, which does the pairing and `/launch`
+the probe cannot (they are not in `moonlight-common-c`) and then hands over.
+Both skip with a printed note when the probe has not been built. That README
+is the detail; `docs/roadmap.md` §3 has what the exercise found.
 
 `FEC_VALIDATION_MODE` deserves emphasis given the earlier FEC discussion: it
 converts "did we get the Cauchy matrix right?" from a question into a
-continuously-enforced invariant.
+continuously-enforced invariant. It is also the single highest-yield assertion
+in this project's history -- it is what caught both FEC defects below.
 
 ### 2.3 Asserting on the video that actually arrived
 
@@ -445,11 +456,30 @@ on push:      T0 unit/property                      ~20 s
               T1 golden vectors                     ~10 s
               T2 mock client + mock RFB/SPICE       ~40 s
               T3 both backends against the guest    ~45 s
+              T3 the host against real Moonlight    ~5 s
 nightly:      T4 image-compression × streaming-video × agent sweeps  ~10 min
               T4 loss injection sweep               ~10 min
               T4 encoding cost measurement          ~1 min
               T5 cargo-fuzz on the nine parsers     ~2 h
 ```
+
+`mlc-probe` is the cheapest of these by a wide margin and the highest-yield
+(§2.2), so it belongs on every push rather than nightly. It needs `gcc`,
+`git` and `libssl-dev` in the image, and a cache of its own:
+
+```yaml
+- uses: actions/cache@v4
+  with:
+    path: ~/.cache/solstice/mlc
+    key: mlc-${{ hashFiles('tests/tools/mlc-probe/manifest.lock',
+                           'tests/tools/mlc-probe/probe.c',
+                           'tests/tools/mlc-probe/build.sh') }}
+- run: ./tests/tools/mlc-probe/build.sh   # a no-op on a cache hit
+```
+
+Keying on `manifest.lock` rather than on the pinned commit in `build.sh` is
+deliberate: the lock also names the resolved `enet` and `nanors` submodules,
+so a rebuild happens when any of the three move.
 
 The guest is one artifact, not a per-test build, so cache it rather than
 rebuild it:
@@ -503,17 +533,23 @@ tests/
 ├── vectors/
 │   ├── fec/                 # nanors differential vectors (see the FEC work)
 │   ├── spice/               # QUIC/LZ/GLZ differential vectors
-│   └── capture/             # golden Sunshine↔Moonlight transcripts
+│   └── capture/             # golden Sunshine↔Moonlight transcripts (§2.4, not yet)
 └── tools/
     ├── gen_fec_vectors.py
-    └── gen_spice_vectors.py
+    ├── gen_spice_vectors.py
+    └── mlc-probe/           # the real Moonlight client, headless (§2.2)
+        ├── build.sh         # fetches moonlight-common-c at a pinned commit
+        ├── probe.c          # the driver: connect, record, assert, report
+        ├── manifest.lock    # resolved commits, superproject and submodules
+        └── README.md
 
 crates/solstice-test-guest/  # boots the guest and drives it; dev-only
 ```
 
-The guest image itself is built into `~/.cache/solstice/guest` and is not in
-the repository — `manifest.lock` is what is committed, so a stale image is
-loud rather than silent.
+Neither built artifact is in the repository. The guest image lands in
+`~/.cache/solstice/guest` and the probe in `~/.cache/solstice/mlc`; what is
+committed in each case is a `manifest.lock`, so a stale build is loud rather
+than silent.
 
 ---
 

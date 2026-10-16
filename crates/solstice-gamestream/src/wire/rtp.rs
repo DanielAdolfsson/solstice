@@ -65,6 +65,19 @@ impl RtpHeader {
         out[8..12].copy_from_slice(&self.ssrc.to_be_bytes());
     }
 
+    /// Overwrite only the three fields Sunshine patches into a video shard
+    /// after Reed-Solomon (`stream.cpp:1752-1754`).
+    ///
+    /// `packetType`, `ssrc` and the four reserved bytes that follow are left
+    /// alone on purpose: in a parity shard they hold parity, and rewriting
+    /// them would take that parity out of the recovery.
+    pub fn patch_video_after_fec(out: &mut [u8], sequence_number: u16, timestamp: u32) {
+        assert!(out.len() >= RTP_HEADER_LEN);
+        out[0] = VIDEO_HEADER;
+        out[2..4].copy_from_slice(&sequence_number.to_be_bytes());
+        out[4..8].copy_from_slice(&timestamp.to_be_bytes());
+    }
+
     /// Serialise to a fresh array.
     pub fn to_bytes(&self) -> [u8; RTP_HEADER_LEN] {
         let mut out = [0u8; RTP_HEADER_LEN];
