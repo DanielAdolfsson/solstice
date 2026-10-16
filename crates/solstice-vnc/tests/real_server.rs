@@ -1,89 +1,42 @@
-//! T3: the client against TigerVNC's `Xvnc`, the feature-rich pole.
+//! T3: the client against a real RFB server.
 //!
-//! `docs/testing.md` §3 argues for two poles rather than a matrix of servers:
-//! a real one with everything present, and a deliberately minimal mock with
-//! nothing optional present. `mock_server.rs` is the second pole; this is the
-//! first.
+//! This tier used to be TigerVNC's `Xvnc`, chosen as the "feature-rich pole"
+//! of `docs/testing.md` §3. It is now QEMU's own RFB server, running on the
+//! same guest image the SPICE tests use -- one server implementation, one
+//! image, one harness, instead of two X servers with separate launchers.
 //!
-//! `Xvnc` is a self-contained X server with a VNC frontend -- no Xvfb, no
-//! compositor, no VM -- and it covers every axis this client depends on:
-//! ZRLE and Hextile, ContinuousUpdates and Fence, ExtendedDesktopSize, and
-//! **QEMU Extended Key Event server-side**, which is the only way to exercise
-//! the scancode path against a real server.
+//! **What that trade costs, measured rather than assumed.** QEMU's RFB server
+//! was probed directly before the move. It serves Raw, Hextile, zlib, Tight
+//! and ZRLE natively, and -- the one that matters most here -- it supports
+//! **QEMU Extended Key Event (−258)**, which it invented, so scancodes still
+//! meet a real server. It offers ExtendedDesktopSize (−308) and LEDState
+//! (−261). It does *not* implement RRE, CoRRE or ZlibHex, and it does not
+//! implement **Fence (−312) or ContinuousUpdates (−313)**: a ClientFence
+//! makes it close the connection outright.
 //!
-//! Skipped with a printed note when `Xvnc` is not installed, so the suite still
-//! runs on a machine without it:
+//! So `backend.rs`'s continuous-updates path no longer runs against a
+//! third-party server. It is still covered by `mock_server.rs`, whose mock
+//! offers both and tests the negative -- but only against an implementation
+//! of our own reading of the spec, which is exactly the class of mistake
+//! `docs/roadmap.md` §3 warns about. That is a deliberate, recorded trade,
+//! not an oversight.
 //!
 //! ```sh
-//! sudo apt install tigervnc-standalone-server
+//! ./tests/guest/build-image.sh
+//! cargo test -p solstice-vnc --test real_server -- --test-threads=4
 //! ```
 
 use std::net::{IpAddr, Ipv4Addr};
-use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use solstice_backend::{BackendEvent, InputEvent, KeyEvent, MouseButton, Session};
+use solstice_test_guest::{Guest, GuestConfig};
 use solstice_vnc::{VncConfig, VncSecurity};
 
-const TIMEOUT: Duration = Duration::from_secs(20);
+const TIMEOUT: Duration = Duration::from_secs(30);
 
-struct Xvnc {
-    child: Child,
-    port: u16,
-    display: u32,
-}
-
-impl Drop for Xvnc {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_file(format!("/tmp/.X11-unix/X{}", self.display));
-        let _ = std::fs::remove_file(format!("/tmp/.X{}-lock", self.display));
-    }
-}
-
-fn start_xvnc(display: u32, geometry: &str) -> Option<Xvnc> {
-    if Command::new("Xvnc")
-        .arg("-version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_err()
-    {
-        eprintln!("skipping: Xvnc is not installed (apt install tigervnc-standalone-server)");
-        return None;
-    }
-    let port = 5900 + display as u16;
-    let child = Command::new("Xvnc")
-        .arg(format!(":{display}"))
-        .args(["-geometry", geometry])
-        .args(["-depth", "24"])
-        .args(["-SecurityTypes", "None"])
-        .args(["-rfbport", &port.to_string()])
-        .arg("-AlwaysShared")
-        .arg("-localhost")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    Some(Xvnc {
-        child,
-        port,
-        display,
-    })
-}
-
-async fn wait_for_port(port: u16) -> bool {
-    for _ in 0..100 {
-        if tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))
-            .await
-            .is_ok()
-        {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    false
+fn start(width: u32, height: u32) -> Option<Guest> {
+    Guest::start(GuestConfig::new().geometry(width, height).vnc())
 }
 
 fn config(port: u16) -> VncConfig {
@@ -97,17 +50,19 @@ fn config(port: u16) -> VncConfig {
     }
 }
 
-#[tokio::test]
-async fn the_client_connects_to_xvnc_and_receives_a_framebuffer() {
-    let Some(server) = start_xvnc(97, "800x600") else {
-        return;
-    };
-    assert!(wait_for_port(server.port).await, "Xvnc never listened");
-
-    let session = tokio::time::timeout(TIMEOUT, solstice_vnc::connect(&config(server.port)))
+async fn session(guest: &Guest) -> solstice_vnc::backend::VncSession {
+    tokio::time::timeout(TIMEOUT, solstice_vnc::connect(&config(guest.vnc_port())))
         .await
         .expect("connect timed out")
-        .expect("connect failed");
+        .expect("connect failed")
+}
+
+#[tokio::test]
+async fn the_client_connects_to_a_real_server_and_receives_a_framebuffer() {
+    let Some(guest) = start(800, 600) else {
+        return;
+    };
+    let session = session(&guest).await;
 
     assert_eq!(session.dimensions(), (800, 600));
 
@@ -127,7 +82,7 @@ async fn the_client_connects_to_xvnc_and_receives_a_framebuffer() {
             _ => break,
         }
     }
-    let covered = covered.expect("no damage arrived from Xvnc");
+    let covered = covered.expect("no damage arrived from the server");
     assert!(
         covered.width >= 800 && covered.height >= 600,
         "only {covered:?} was updated"
@@ -149,27 +104,21 @@ async fn the_client_connects_to_xvnc_and_receives_a_framebuffer() {
     session.close().await;
 }
 
-/// TigerVNC advertises pseudo-encoding -258, so this is the only place the
-/// scancode path meets a real server.
+/// QEMU advertises pseudo-encoding −258 -- it is QEMU's own extension -- so
+/// this remains the one place the scancode path meets a real server.
 #[tokio::test]
-async fn xvnc_accepts_both_keyboard_paths_and_pointer_input() {
-    let Some(server) = start_xvnc(98, "640x480") else {
+async fn a_real_server_accepts_both_keyboard_paths_and_pointer_input() {
+    let Some(guest) = start(640, 480) else {
         return;
     };
-    assert!(wait_for_port(server.port).await, "Xvnc never listened");
-
-    let session = tokio::time::timeout(TIMEOUT, solstice_vnc::connect(&config(server.port)))
-        .await
-        .expect("connect timed out")
-        .expect("connect failed");
+    let session = session(&guest).await;
 
     // Let the first update land so the server's capabilities are known.
     let mut events = session.subscribe();
     let _ = tokio::time::timeout(TIMEOUT, events.recv()).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // A key with both representations: against TigerVNC this takes the
-    // scancode path.
+    // A key with both representations: this takes the scancode path.
     for down in [true, false] {
         session
             .send_input(InputEvent::Key(KeyEvent {
@@ -232,14 +181,18 @@ async fn xvnc_accepts_both_keyboard_paths_and_pointer_input() {
     session.close().await;
 }
 
-/// Pixels actually change when the desktop does. `xsetroot` is the smallest
-/// thing that repaints the root window.
+/// Pixels actually change when the desktop does.
+///
+/// Connect first and repaint second: QEMU renders guest damage into its
+/// console surface only while a display client is attached, so painting
+/// before connecting would be dropped and this test would fail for a reason
+/// unrelated to the client.
 #[tokio::test]
 async fn a_change_on_the_desktop_reaches_the_framebuffer() {
-    let Some(server) = start_xvnc(99, "640x480") else {
+    let Some(guest) = start(640, 480) else {
         return;
     };
-    assert!(wait_for_port(server.port).await, "Xvnc never listened");
+    guest.fill("000000").expect("painting the guest black");
 
     // `RUST_LOG=solstice_vnc=debug` turns the update loop's tracing on, which
     // is how the ExtendedDesktopSize loop this test now guards against was
@@ -247,34 +200,12 @@ async fn a_change_on_the_desktop_reaches_the_framebuffer() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
-    let session = tokio::time::timeout(TIMEOUT, solstice_vnc::connect(&config(server.port)))
-        .await
-        .expect("connect timed out")
-        .expect("connect failed");
+
+    let session = session(&guest).await;
     let mut events = session.subscribe();
     let _ = tokio::time::timeout(TIMEOUT, events.recv()).await;
 
-    let paint = |colour: &str| {
-        Command::new("xsetroot")
-            .env("DISPLAY", format!(":{}", server.display))
-            .args(["-solid", colour])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-    };
-    match paint("#102030") {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            eprintln!("skipping the repaint check: xsetroot exited {status}");
-            session.close().await;
-            return;
-        }
-        Err(e) => {
-            eprintln!("skipping the repaint check: xsetroot is unavailable ({e})");
-            session.close().await;
-            return;
-        }
-    }
+    guest.fill("102030").expect("repainting the guest");
 
     let fb = session.framebuffer();
     let deadline = tokio::time::Instant::now() + TIMEOUT;

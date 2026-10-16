@@ -1,0 +1,34 @@
+# Packages installed into the test guest. One per line; `#` comments ignored.
+# Verified present in Alpine v3.24 main/community for x86_64.
+
+# base system and the kernel (linux-virt carries drivers/gpu/drm/qxl/qxl.ko)
+alpine-base
+linux-virt
+eudev
+
+# the X server and the QXL driver whose draw-command mix is the point of
+# having a real guest at all
+xorg-server
+xf86-video-qxl
+xf86-input-libinput
+xkeyboard-config
+xinit
+font-misc-misc
+
+# the two agents the harness talks to
+qemu-guest-agent
+spice-vdagent
+
+# how tests paint, inspect and drive the guest
+xsetroot
+xdpyinfo
+xev
+xdotool
+xrandr
+xclip
+xwininfo
+xprop
+setxkbmap
+xauth
+xterm
+alsa-utils

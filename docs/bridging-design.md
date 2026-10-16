@@ -242,7 +242,7 @@ gap is on the server side of a widely deployed family:
 |---|---|---|
 | TigerVNC / `Xvnc` / TurboVNC | ✓ | `SConnection.cxx:393`, `SMsgReader::readQEMUMessage` |
 | neatvnc / `wayvnc` | ✓ | `rfb-proto.h:73`, `server.c:857` |
-| QEMU `-vnc` | ✓ | originator |
+| QEMU `-vnc` | ✓ | originator; confirmed by probe — it answers with a −258 pseudo-rectangle, and it is the server the T3 tests use |
 | **libvncserver** (and `x11vnc`, built on it) | **✗** | `rfbQemuExtendedKeyEvent` is defined in `include/rfb/rfbproto.h:531` and implemented in `libvncclient` only — nothing in `src/libvncserver/` |
 
 So the keysym table is **not a nice-to-have fallback**; it is the path taken

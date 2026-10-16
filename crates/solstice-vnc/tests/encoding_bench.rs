@@ -3,8 +3,14 @@
 //! Ignored by default -- it is a measurement, not an assertion. Run it with:
 //!
 //! ```sh
+//! ./tests/guest/build-image.sh
 //! cargo test -p solstice-vnc --release --test encoding_bench -- --ignored --nocapture
 //! ```
+//!
+//! The server is the QEMU guest the other real-server tests use, so the
+//! encodings measured are the ones a server we actually test against will
+//! send. QEMU serves Raw, Hextile, zlib, Tight and ZRLE, which covers every
+//! case below.
 //!
 //! The question it answers is narrow and specific: in a bridge that re-encodes
 //! everything to H.264 anyway, the backend encoding is not a bandwidth decision
@@ -13,22 +19,21 @@
 //! client CPU burned decoding them, per encoding, against the same content.
 
 use std::pin::Pin;
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use solstice_backend::{BackendEvent, FramebufferHandle, Rect};
+use solstice_test_guest::{Guest, GuestConfig};
 use solstice_vnc::pixel::PixelFormat;
 use solstice_vnc::protocol::encoding;
 use solstice_vnc::session::{self, UpdateLoop};
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tokio::sync::{broadcast, mpsc};
 
-const DISPLAY: u32 = 94;
-const PORT: u16 = 5900 + DISPLAY as u16;
-const GEOMETRY: &str = "1280x720";
+const WIDTH: u32 = 1280;
+const HEIGHT: u32 = 720;
 const MEASURE: Duration = Duration::from_secs(6);
 
 /// Counts every byte that comes off the socket.
@@ -72,83 +77,33 @@ fn cpu_seconds() -> f64 {
     ticks / 100.0 // _SC_CLK_TCK is 100 on every Linux this runs on
 }
 
-struct Xvnc(Child);
+/// Boot the guest and put a desktop-shaped, continuously changing picture on
+/// it: scrolling text, which is where encodings differ most, plus repeated
+/// vector drawing.
+///
+/// The content generators are the guest's own. `xterm` uses a core bitmap
+/// font because the image ships no scalable ones, and the vector half is
+/// `solstice-draw`, which exists anyway to force the QXL draw commands and
+/// happens to be exactly the right shape for this.
+fn start_server() -> Option<Guest> {
+    let guest = Guest::start(
+        GuestConfig::new()
+            .geometry(WIDTH, HEIGHT)
+            .vnc()
+            .memory_mb(1536),
+    )?;
 
-impl Drop for Xvnc {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-        let _ = std::fs::remove_file(format!("/tmp/.X11-unix/X{DISPLAY}"));
-        let _ = std::fs::remove_file(format!("/tmp/.X{DISPLAY}-lock"));
-    }
-}
-
-fn start_server() -> Option<(Xvnc, Vec<Child>)> {
-    if Command::new("Xvnc")
-        .arg("-version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_err()
-    {
-        eprintln!("skipping: Xvnc is not installed");
-        return None;
-    }
-    let server = Xvnc(
-        Command::new("Xvnc")
-            .arg(format!(":{DISPLAY}"))
-            .args(["-geometry", GEOMETRY])
-            .args(["-depth", "24"])
-            .args(["-SecurityTypes", "None"])
-            .args(["-rfbport", &PORT.to_string()])
-            .arg("-localhost")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?,
+    guest.fill("2e3436").ok()?;
+    let _ = guest.sh(
+        "nohup xterm -fn 10x20 -geometry 100x40+10+10 \
+         -e sh -c 'while :; do ls -lR /usr 2>/dev/null; done' >/dev/null 2>&1 &",
+    );
+    let _ = guest.sh(
+        "nohup sh -c 'while :; do solstice-draw stroke 48; solstice-draw text; \
+         sleep 0.2; done' >/dev/null 2>&1 &",
     );
     std::thread::sleep(Duration::from_millis(1500));
-
-    let display = format!(":{DISPLAY}");
-    let _ = Command::new("xsetroot")
-        .env("DISPLAY", &display)
-        .args(["-solid", "#2e3436"])
-        .status();
-
-    // A desktop-shaped screen: scrolling text, which is where encodings differ
-    // most, plus two vector-ish windows.
-    let mut apps = Vec::new();
-    if let Ok(child) = Command::new("xterm")
-        .env("DISPLAY", &display)
-        .args(["-geometry", "100x40+10+10"])
-        .args(["-fa", "Monospace"])
-        .args(["-fs", "10"])
-        .args([
-            "-e",
-            "sh",
-            "-c",
-            "while :; do ls -lR /usr/share/doc 2>/dev/null; done",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        apps.push(child);
-    } else {
-        eprintln!("note: xterm is unavailable, so the text-heavy case is missing");
-    }
-    for app in ["xeyes", "xclock"] {
-        if let Ok(child) = Command::new(app)
-            .env("DISPLAY", &display)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            apps.push(child);
-        }
-    }
-    std::thread::sleep(Duration::from_millis(1500));
-    Some((server, apps))
+    Some(guest)
 }
 
 struct Measurement {
@@ -160,8 +115,8 @@ struct Measurement {
     wall: Duration,
 }
 
-async fn measure(name: &'static str, encodings: &[i32]) -> Measurement {
-    let stream = tokio::net::TcpStream::connect(("127.0.0.1", PORT))
+async fn measure(port: u16, name: &'static str, encodings: &[i32]) -> Measurement {
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .unwrap();
     stream.set_nodelay(true).unwrap();
@@ -261,11 +216,12 @@ async fn measure(name: &'static str, encodings: &[i32]) -> Measurement {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "measurement, not an assertion; needs Xvnc and takes about a minute"]
+#[ignore = "measurement, not an assertion; needs the test guest and takes about a minute"]
 async fn what_each_encoding_costs() {
-    let Some((_server, mut apps)) = start_server() else {
+    let Some(guest) = start_server() else {
         return;
     };
+    let port = guest.vnc_port();
 
     let pseudo = [encoding::PSEUDO_LAST_RECT, encoding::PSEUDO_DESKTOP_SIZE];
     let cases: Vec<(&'static str, Vec<i32>)> = vec![
@@ -282,10 +238,10 @@ async fn what_each_encoding_costs() {
     let mut results = Vec::new();
     for (name, mut encodings) in cases {
         encodings.extend_from_slice(&pseudo);
-        results.push(measure(name, &encodings).await);
+        results.push(measure(port, name, &encodings).await);
     }
 
-    println!("\n{GEOMETRY} Xvnc, scrolling text plus two windows, {MEASURE:?} per case\n");
+    println!("\n{WIDTH}x{HEIGHT} QEMU guest, scrolling text plus vector drawing, {MEASURE:?} per case\n");
     println!(
         "{:<22} {:>10} {:>9} {:>9} {:>10} {:>12}",
         "encoding", "MB/s", "updates", "CPU %", "MPixel/s", "bytes/pixel"
@@ -307,8 +263,6 @@ async fn what_each_encoding_costs() {
     }
     println!();
 
-    for app in &mut apps {
-        let _ = app.kill();
-        let _ = app.wait();
-    }
+    // The content generators live in the guest, which Drop tears down whole.
+    drop(guest);
 }

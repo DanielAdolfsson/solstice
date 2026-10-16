@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 solstice-backend.workspace = true
 solstice-input.workspace = true
+solstice-test-guest.workspace = true
 solstice-spice-codec.workspace = true
 
 async-trait = "0.1"
@@ -41,6 +42,7 @@ zune-jpeg = "0.4"
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 solstice-input.workspace = true
+solstice-test-guest.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [lints.rust]

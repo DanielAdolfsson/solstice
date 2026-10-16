@@ -173,8 +173,11 @@ the real server available, was one `tracing::debug!` on the rectangle header.
 ## 3. Measured
 
 Two benchmarks exist, both `#[ignore]`d because they are measurements rather
-than assertions. On this machine, a 1280x720 `Xvnc` showing scrolling text plus
-two windows:
+than assertions. The figures below were taken against a 1280x720 `Xvnc`, which
+is no longer the server the tests use; `encoding_bench.rs` now measures the
+same cases against the QEMU guest, whose cheaper content generators move the
+absolute numbers while leaving their ordering intact. Kept because the shape
+is the point, not the digits:
 
 ```
 encoding                     MB/s   updates     CPU %   MPixel/s  bytes/pixel
@@ -306,10 +309,13 @@ independent 80-line Python SPICE client was what settled it — and that is the
 general lesson, because the same symptom had three plausible causes on the
 client side and one on the server's.
 
-What `Xspice` still cannot reach: a real `spice-vdagent` (Debian's launcher
-cannot start one) and a QXL guest driver's mix of draw commands. `DRAW_ROP3`,
-`DRAW_STROKE` and `DRAW_TEXT` have therefore never been seen from a real
-server, and the raster-operation mapping behind them — `ropd_descriptor_to_rop`,
+Neither of the things `Xspice` could not reach is out of reach now. A real
+`spice-vdagent` answers in the QEMU guest, and `solstice-draw` drives the
+core X11 primitives through a real QXL driver, so `DRAW_ROP3`, `DRAW_STROKE`
+and `DRAW_TEXT` can be provoked at will. What is still missing is the other
+half of that test: the display channel keeps no record of which command
+kinds it has executed, so they can be sent but not yet asserted. Until then
+the raster-operation mapping behind them — `ropd_descriptor_to_rop`,
 transcribed from C that exists nowhere else — has only its transcription and
 a unit test for an oracle. The ROP3 truth table at least has `rop3.c`'s own
 self-test constants, reproduced as a test over all 256 opcodes.
@@ -319,10 +325,11 @@ self-test constants, reproduced as a test over all 256 opcodes.
 
 `crates/solstice/tests/end_to_end.rs` runs the complete chain twice: once
 against the colour-bar generator, reading the frame counter off the decoded
-picture, and once against a real `Xvnc` desktop painted a known colour. That
+picture, and once against a real guest desktop painted a known colour. That
 settles the question the research could not — the pieces fit together — but the
-VNC half still meets exactly one implementation. `docs/testing.md` §3.3 lists
-what that costs and when to revisit it.
+VNC half still meets exactly one implementation, and it is now QEMU's rather
+than TigerVNC's. `docs/testing.md` §3.3 lists what that costs and when to
+revisit it.
 
 ### No capture-derived golden vectors
 

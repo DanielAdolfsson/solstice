@@ -1363,6 +1363,7 @@ dependencies = [
  "solstice-gamestream",
  "solstice-spice",
  "solstice-spice-codec",
+ "solstice-test-guest",
  "solstice-video",
  "solstice-vnc",
  "thiserror",
@@ -1435,6 +1436,7 @@ dependencies = [
  "solstice-backend",
  "solstice-input",
  "solstice-spice-codec",
+ "solstice-test-guest",
  "thiserror",
  "tokio",
  "tokio-rustls",
@@ -1450,6 +1452,15 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "solstice-test-guest"
+version = "0.1.0"
+dependencies = [
+ "base64",
  "serde_json",
  "thiserror",
 ]
@@ -1478,6 +1489,7 @@ dependencies = [
  "rustls-pki-types",
  "solstice-backend",
  "solstice-input",
+ "solstice-test-guest",
  "thiserror",
  "tokio",
  "tokio-rustls",

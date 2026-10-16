@@ -10,6 +10,7 @@ members = [
     "crates/solstice-spice",
     "crates/solstice-video",
     "crates/solstice-input",
+    "crates/solstice-test-guest",
 ]
 
 [workspace.package]
@@ -27,6 +28,7 @@ solstice-video = { path = "crates/solstice-video" }
 solstice-spice-codec = { path = "crates/solstice-spice-codec" }
 solstice-spice = { path = "crates/solstice-spice" }
 solstice-vnc = { path = "crates/solstice-vnc" }
+solstice-test-guest = { path = "crates/solstice-test-guest" }
 
 bytes = "1"
 thiserror = "2"
