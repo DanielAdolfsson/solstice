@@ -1,0 +1,252 @@
+//! `solstice pair`, `status`, `list-clients` and `revoke`, run as the real
+//! binary against a running daemon over its management socket.
+//!
+//! The binary rather than `management::call`, because what was missing was a
+//! *second process* reaching the daemon: the old `solstice pair` refused to
+//! run, and the old `revoke` edited `clients.tsv` while the daemon went on
+//! trusting the client it held in memory. A test in one process could not have
+//! seen either.
+
+mod common;
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use common::{pair, start_daemon_closed, Ports, PIN};
+use solstice::config::Config;
+use solstice::testpattern::TestPatternBackend;
+use solstice_gamestream::crypto::certs::{ClientStore, HostIdentity, PairedClient};
+use solstice_gamestream::nvhttp::Host;
+use tokio::process::Command;
+
+fn daemon(base: u16, tag: &str) -> (Arc<Host>, PathBuf, PathBuf) {
+    let mut config = Config::default();
+    config.server.port = base;
+    let (host, state_dir) =
+        start_daemon_closed(config, tag, Arc::new(TestPatternBackend::new(320, 240, 30)));
+    (host, state_dir.clone(), config_file(&state_dir))
+}
+
+/// The CLI finds the socket through the configuration, as it does in a real
+/// deployment, so each test writes one naming its state directory.
+fn config_file(state_dir: &Path) -> PathBuf {
+    std::fs::create_dir_all(state_dir).unwrap();
+    let path = state_dir.join("solstice.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[server]\nstate_dir = {:?}\n",
+            state_dir.display().to_string()
+        ),
+    )
+    .unwrap();
+    path
+}
+
+fn solstice(config: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_solstice"));
+    command
+        .arg("--config")
+        .arg(config)
+        .args(args)
+        .env("SOLSTICE_LOG", "warn")
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    command
+}
+
+struct Run {
+    ok: bool,
+    stdout: String,
+    stderr: String,
+}
+
+async fn finish(child: tokio::process::Child) -> Run {
+    let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+        .await
+        .expect("the command did not finish")
+        .unwrap();
+    Run {
+        ok: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+async fn run(config: &Path, args: &[&str]) -> Run {
+    finish(solstice(config, args).spawn().unwrap()).await
+}
+
+async fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !condition() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn window_open(host: &Host) -> bool {
+    host.pairing.lock().unwrap().is_open(Instant::now())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pair_status_list_and_revoke_reach_the_running_daemon() {
+    const PORTS: Ports = Ports::from_base(49389);
+    let (host, state_dir, config) = daemon(PORTS.http, "mgmt");
+    let socket = state_dir.join("control.sock");
+    eventually("the management socket", || socket.exists()).await;
+
+    let status = run(&config, &["status"]).await;
+    assert!(status.ok, "{}", status.stderr);
+    assert!(
+        status.stdout.contains("pairing: closed"),
+        "{}",
+        status.stdout
+    );
+    assert!(
+        status.stdout.contains("backend: testpattern"),
+        "{}",
+        status.stdout
+    );
+
+    // `solstice pair` holds on until the client has paired, as a script
+    // alongside `moonlight pair -pin` needs it to.
+    let pairing = solstice(&config, &["pair", "--pin", PIN, "--window", "30s"])
+        .spawn()
+        .unwrap();
+    eventually("the window to open", || window_open(&host)).await;
+
+    let status = run(&config, &["status"]).await;
+    assert!(status.stdout.contains("pairing: open"), "{}", status.stdout);
+
+    let client_identity = HostIdentity::generate("client").unwrap();
+    pair(PORTS, &client_identity).await;
+
+    let paired = finish(pairing).await;
+    assert!(paired.ok, "pair failed: {}", paired.stderr);
+    assert!(
+        paired.stdout.contains("pairing is open for 30s"),
+        "{}",
+        paired.stdout
+    );
+    assert!(paired.stdout.contains("paired test ("), "{}", paired.stdout);
+    assert!(!window_open(&host), "one pairing per window");
+
+    let listed = run(&config, &["list-clients"]).await;
+    assert!(listed.ok, "{}", listed.stderr);
+    let line = listed.stdout.lines().next().expect("one client");
+    assert!(line.contains("test"), "{line}");
+    let fingerprint = line.split_whitespace().next().unwrap();
+
+    // The point of revoking through the daemon: the client it holds in memory
+    // goes, not just the line in the file.
+    assert!(host.is_paired(client_identity.cert_der()));
+    let revoked = run(&config, &["revoke", &fingerprint[..8]]).await;
+    assert!(revoked.ok, "{}", revoked.stderr);
+    assert!(
+        revoked.stdout.contains("revoked test"),
+        "{}",
+        revoked.stdout
+    );
+    assert!(!host.is_paired(client_identity.cert_der()));
+    assert!(ClientStore::load(state_dir.join("clients.tsv"))
+        .unwrap()
+        .is_empty());
+
+    let listed = run(&config, &["list-clients"]).await;
+    assert_eq!(listed.stdout.trim(), "no paired clients");
+
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interrupting_pair_closes_the_window() {
+    let (host, state_dir, config) = daemon(49489, "mgmt-int");
+    eventually("the management socket", || {
+        state_dir.join("control.sock").exists()
+    })
+    .await;
+
+    let mut pairing = solstice(&config, &["pair", "--pin", PIN]).spawn().unwrap();
+    eventually("the window to open", || window_open(&host)).await;
+    pairing.kill().await.unwrap();
+    eventually("the window to close", || !window_open(&host)).await;
+
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_window_nobody_uses_fails_the_command() {
+    let (host, state_dir, config) = daemon(49589, "mgmt-exp");
+    eventually("the management socket", || {
+        state_dir.join("control.sock").exists()
+    })
+    .await;
+
+    let expired = run(&config, &["pair", "--pin", PIN, "--window", "1s"]).await;
+    assert!(!expired.ok);
+    assert!(
+        expired.stderr.contains("closed before a client paired"),
+        "{}",
+        expired.stderr
+    );
+    assert!(!window_open(&host));
+
+    for refused in [
+        &["pair", "--pin", PIN, "--window", "11m"][..],
+        &["pair", "--pin", "12"][..],
+        &["revoke", "abc"][..],
+    ] {
+        let run = run(&config, refused).await;
+        assert!(!run.ok, "{refused:?} succeeded");
+    }
+    assert!(!window_open(&host));
+
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+/// With no daemon, `list-clients` and `revoke` work on the state directory;
+/// `pair` and `status` say plainly that there is nothing to talk to.
+#[tokio::test]
+async fn without_a_daemon_the_client_list_is_edited_directly() {
+    let state_dir =
+        std::env::temp_dir().join(format!("solstice-e2e-mgmt-off-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&state_dir);
+    let config = config_file(&state_dir);
+    let mut store = ClientStore::load(state_dir.join("clients.tsv")).unwrap();
+    let identity = HostIdentity::generate("offline").unwrap();
+    store
+        .add(PairedClient {
+            cert_der: identity.cert_der().to_vec(),
+            device_name: "offline-tv".into(),
+            unique_id: "0123456789ABCDEF".into(),
+        })
+        .unwrap();
+
+    let listed = run(&config, &["list-clients"]).await;
+    assert!(listed.ok, "{}", listed.stderr);
+    let fingerprint = solstice::management::fingerprint(identity.cert_der());
+    assert!(
+        listed
+            .stdout
+            .starts_with(&format!("{}  offline-tv", &fingerprint[..16])),
+        "{}",
+        listed.stdout
+    );
+
+    let revoked = run(&config, &["revoke", &fingerprint[..6]]).await;
+    assert!(revoked.ok, "{}", revoked.stderr);
+    assert!(ClientStore::load(state_dir.join("clients.tsv"))
+        .unwrap()
+        .is_empty());
+
+    for args in [&["pair", "--pin", PIN][..], &["status"][..]] {
+        let run = run(&config, args).await;
+        assert!(!run.ok);
+        assert!(run.stderr.contains("not running"), "{}", run.stderr);
+    }
+
+    let _ = std::fs::remove_dir_all(&state_dir);
+}

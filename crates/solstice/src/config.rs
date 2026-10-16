@@ -60,6 +60,10 @@ impl Default for Server {
 }
 
 impl Server {
+    /// The management socket `solstice pair` and friends talk to.
+    pub fn control_socket(&self) -> PathBuf {
+        self.state_dir.join("control.sock")
+    }
     /// The mutual-TLS NVHTTP port, `port - 5`.
     pub fn https_port(&self) -> u16 {
         self.port.wrapping_sub(5)

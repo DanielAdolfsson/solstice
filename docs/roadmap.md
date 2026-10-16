@@ -38,12 +38,13 @@ What is left is ordinary work.
 | 2 | [SPICE backend](#2-spice-backend) | **implemented and validated against a real QEMU guest**, agent and clipboard included (§2.6); what is left is in §2.7 | nothing |
 | 3 | [Validate against real Moonlight](#3-validate-against-real-moonlight) | **done** — a real `moonlight-common-c` client streams from this host; the eight defects it found are in §3 | nothing |
 | 4 | [Captured golden vectors](#4-captured-sunshine--moonlight-vectors) | **done** — a real session, frozen and replayed in CI; the two defects it found are in §4 | nothing |
-| 5 | [`solstice pair` management socket](#5-solstice-pair-and-a-management-socket) | ~2 days | nothing |
+| 5 | [`solstice pair` management socket](#5-solstice-pair-and-a-management-socket) | **done** — `pair`, `status`, `list-clients` and `revoke` reach the running daemon; what is left is in §5 | nothing |
 | 6 | [The still-frame encode cost](#6-the-still-frame-encode-cost) | ~2 days | nothing |
 | 7 | [ENet: audit or reimplement](#7-enet-audit-or-reimplement) | 1–3 weeks | nothing |
 | 8 | [Smaller items](#8-smaller-items) | varies | |
 
-§5 is the next one with a clear finish line, and the one a user notices.
+§5, the management socket, is done. §6 is the next one with a clear finish
+line: it is the steady-state cost of every idle session.
 
 ---
 
@@ -755,22 +756,79 @@ That is differential testing (§2.4's second use), not conformance.
 
 ## 5. `solstice pair` and a management socket
 
-The pairing window, attempt lockout and source-address restriction are
-implemented and tested inside the daemon. What is missing is only the IPC:
-`solstice pair` runs in a *different process*, so today it reports that rather
-than opening a window against its own throwaway state
-(`crates/solstice/src/main.rs`).
-
-A Unix socket at `$state_dir/control.sock`, mode 0600, carrying a handful of
-commands: `pair --pin --window`, `list-clients`, `revoke`, `status`.
+**Done.** `crates/solstice/src/management.rs` serves a Unix socket at
+`$state_dir/control.sock`, and `pair`, `status`, `list-clients` and `revoke`
+are clients of it. The daemon binds it first, before any network port, so a
+second daemon on the same state directory fails at once.
 
 **Not** an HTTP API and **not** a web UI: `docs/security.md` §3.5 is blunt that
 Sunshine's worst CVEs — CSRF to command injection as Administrator,
-clickjacking — are in its config UI rather than its protocol. A Unix socket
-with filesystem permissions needs no auth layer of its own, which is the point.
+clickjacking — are in its config UI rather than its protocol. The socket needs
+no auth layer of its own:
 
-`contrib/solstice.service` already restricts `RestrictAddressFamilies` to
-`AF_INET AF_INET6 AF_UNIX`, so the socket is allowed there.
+- it is mode 0600, in a state directory the unit already makes 0700;
+- every connection's peer credentials are checked against the socket's owner
+  (or root), so the mode is not the only control and the instant between
+  `bind` and `chmod` does not matter;
+- a request is one line of at most 256 bytes, read with a five-second timeout.
+
+`contrib/solstice.service` already allows `AF_UNIX`, and the socket lives in its
+one writable path.
+
+`solstice pair` **waits for the outcome** of the window it opened and exits
+accordingly: 0 when a client has paired, non-zero when the window runs out, the
+attempt limit locks pairing out, a malformed request abandons it, or a second
+`solstice pair` replaces it. Interrupting it closes the window. That is what a
+script driving `moonlight pair -pin` needs (`docs/testing.md` §2.1), and it
+means the operator learns a wrong PIN was tried while still at the terminal.
+`--window` defaults to `security.pairing_window` and is capped at ten minutes.
+
+`list-clients` and `revoke` fall back to editing `clients.tsv` directly when no
+daemon answers — the one moment that is safe.
+
+### How it is tested
+
+`crates/solstice/tests/management.rs` runs the **real binary** as a second
+process: it opens a window on a running daemon, a client pairs through it, the
+command reports the client and exits 0, and `revoke` then takes effect in the
+daemon's memory. Also: an interrupted `pair` closes the window, an unused one
+fails the command, and with no daemon the client list is edited directly. The
+socket's own lifecycle — mode, refusal of a second daemon, replacement of a
+stale socket but not of a regular file, removal on shutdown — is unit-tested in
+the module.
+
+### What it found
+
+- **`solstice revoke` did not revoke.** It edited `clients.tsv` from its own
+  process; the running daemon kept the client in memory and went on accepting
+  it until restarted. `docs/security.md` §3.4 asks for revocation that takes
+  effect immediately.
+- **`list-clients` printed the same prefix for every client.** It showed the
+  first sixteen hex digits of the certificate's *DER*, which is ASN.1 framing
+  and lengths — identical across certificates of the same shape — and `revoke`
+  took the first match. It now prints a SHA-256 fingerprint, and `revoke`
+  refuses a prefix that matches more than one client. The fingerprint is only
+  something for the operator to type: a client is still identified by its
+  exact DER (`docs/security.md` §3.3).
+- **A device name reached the terminal raw.** It comes from the pairing
+  request and is attacker-controlled; control characters are now replaced
+  before printing.
+
+Telling a successful window from an expired one needed the pairing manager to
+remember its result (`PairingManager::paired`): Moonlight reuses its
+certificate, so a client re-pairing leaves the store looking unchanged.
+
+### What is left
+
+- **Revocation does not end a stream already running.** `Host::revoke` removes
+  the client and its launch record, so nothing new starts, but the supervisor's
+  stream task does not watch for it — short of `docs/security.md` §3.4,
+  "with existing sessions torn down". Closing that means giving `run_stream` a
+  cancellation the revoke path can fire.
+- **`security.pairing_enabled` does nothing.** The window is the switch; the
+  key is a leftover from before there was one and could be removed.
+- **The peer-credential refusal is untested**: exercising it needs a second
+  uid, which an unprivileged test cannot get.
 
 ---
 

@@ -5,8 +5,10 @@ use std::sync::Arc;
 use clap::Parser;
 use solstice::cli::{Cli, Command};
 use solstice::config::Config;
+use solstice::management::{self, ClientError, Request};
 use solstice::supervisor::{build_host, Supervisor};
 use solstice_gamestream::crypto::certs::{ClientStore, HostIdentity};
+use solstice_gamestream::crypto::pairing::is_plausible_pin;
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
@@ -15,6 +17,7 @@ fn main() -> std::process::ExitCode {
             tracing_subscriber::EnvFilter::try_new(&cli.log)
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_writer(std::io::stderr)
         .init();
 
     match run(cli) {
@@ -33,16 +36,18 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!(path = %cli.config.display(), "no config file; using defaults");
         Config::default()
     };
+    let socket = config.server.control_socket();
+    let remote = |request: Request| management::call(&socket, &request, &mut std::io::stdout());
 
-    let identity = HostIdentity::load_or_generate(&config.server.state_dir, &config.server.name)?;
-    let clients = ClientStore::load(config.server.state_dir.join("clients.tsv"))?;
-    let host = Arc::new(build_host(&config, identity, clients));
-
-    let runtime = tokio::runtime::Runtime::new()?;
     match cli.command {
         Command::Run => {
+            let identity =
+                HostIdentity::load_or_generate(&config.server.state_dir, &config.server.name)?;
+            let clients = ClientStore::load(config.server.state_dir.join("clients.tsv"))?;
+            let host = Arc::new(build_host(&config, identity, clients));
             let backend = solstice::backend_factory::build(&config)?;
             let supervisor = Supervisor::new(config, host, backend);
+            let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async move {
                 tokio::select! {
                     result = supervisor.run() => result.map_err(Into::into),
@@ -54,56 +59,55 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             })
         }
         Command::Pair { pin, window } => {
-            // Pairing happens inside a running daemon; this process opening a
-            // window of its own would pair against its own state and then exit.
-            // Until there is a management socket, say so plainly rather than
-            // appearing to work.
-            let _ = (pin, window, host);
-            Err(
-                "`solstice pair` needs the management socket, which is not implemented yet; \
-                 see the README's status section"
-                    .into(),
-            )
-        }
-        Command::ListClients => {
-            let listed: Vec<String> = {
-                let clients = host.clients.read().expect("client store lock");
-                clients
-                    .clients()
-                    .map(|c| {
-                        format!(
-                            "{}  {}  {}",
-                            &hex::encode(&c.cert_der)[..16],
-                            c.device_name,
-                            c.unique_id
-                        )
-                    })
-                    .collect()
-            };
-            if listed.is_empty() {
-                println!("no paired clients");
+            // Checked here as well as in the daemon, so that a PIN with a space
+            // in it is reported as a bad PIN rather than a bad request.
+            if !is_plausible_pin(&pin) {
+                return Err("the PIN is the four digits the client is showing".into());
             }
-            for line in listed {
-                println!("{line}");
-            }
-            Ok(())
+            Ok(remote(Request::Pair {
+                pin,
+                window: window.map(Into::into),
+            })?)
         }
-        Command::Revoke { prefix } => {
-            let target: Option<Vec<u8>> = {
-                let clients = host.clients.read().expect("client store lock");
-                let found = clients
-                    .clients()
-                    .find(|c| hex::encode(&c.cert_der).starts_with(&prefix))
-                    .map(|c| c.cert_der.clone());
-                found
-            };
-            match target {
-                Some(der) if host.revoke(&der) => {
-                    println!("revoked");
-                    Ok(())
+        Command::Status => Ok(remote(Request::Status)?),
+        // These two have an answer without a daemon -- the client list is a
+        // file -- and revoking a client while the daemon is down is exactly
+        // when it is safe to edit that file.
+        Command::ListClients => match remote(Request::ListClients) {
+            Err(ClientError::NotRunning(_)) => {
+                let store = offline_store(&config)?;
+                let lines = management::client_lines(&store);
+                if lines.is_empty() {
+                    println!("no paired clients");
                 }
-                _ => Err(format!("no paired client matches {prefix}").into()),
+                for line in lines {
+                    println!("{line}");
+                }
+                Ok(())
             }
-        }
+            other => Ok(other?),
+        },
+        Command::Revoke { prefix } => match remote(Request::Revoke {
+            prefix: prefix.clone(),
+        }) {
+            Err(ClientError::NotRunning(_)) => {
+                let mut store = offline_store(&config)?;
+                let client = management::find_client(&store, &prefix)?.clone();
+                store.remove(&client.cert_der)?;
+                println!(
+                    "revoked {} ({})",
+                    management::printable(&client.device_name),
+                    &management::fingerprint(&client.cert_der)[..16]
+                );
+                Ok(())
+            }
+            other => Ok(other?),
+        },
     }
+}
+
+fn offline_store(config: &Config) -> Result<ClientStore, Box<dyn std::error::Error>> {
+    let path = config.server.state_dir.join("clients.tsv");
+    tracing::info!(path = %path.display(), "solstice is not running; using the client list directly");
+    Ok(ClientStore::load(path)?)
 }
