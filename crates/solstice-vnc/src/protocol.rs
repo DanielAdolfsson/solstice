@@ -65,6 +65,7 @@ pub mod encoding {
     pub const RRE: i32 = 2;
     pub const HEXTILE: i32 = 5;
     pub const ZLIB: i32 = 6;
+    pub const TIGHT: i32 = 7;
     pub const ZRLE: i32 = 16;
 
     pub const PSEUDO_DESKTOP_SIZE: i32 = -223;

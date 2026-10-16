@@ -114,9 +114,10 @@ async fn the_client_sets_its_format_and_encodings_before_anything_else() {
         unreachable!()
     };
     assert!(encodings.contains(&0), "Raw must always be offered");
+    assert!(encodings.contains(&7), "Tight is decoded, so it is offered");
     assert!(
-        !encodings.contains(&7),
-        "Tight must not be offered: it is not implemented"
+        !encodings.iter().any(|e| (-32..=-23).contains(e)),
+        "no JPEG quality level: that is what keeps Tight lossless"
     );
     let messages = h.recorded.lock().unwrap().clone();
     assert!(matches!(messages[0], ClientMessage::SetPixelFormat(_)));
@@ -500,4 +501,116 @@ async fn a_server_that_keeps_its_own_pixel_format_is_handled() {
     // This currently decodes through the requested BGRA format, so the test
     // records what actually happens rather than what would be ideal.
     assert!(fb.pixel(0, 0).is_some());
+}
+
+/// A deterministic picture of `colours` distinct colours (`colours` above 256
+/// gives every pixel its own), so each Tight sub-encoding can be asked for by
+/// colour count.
+fn picture(width: u32, height: u32, colours: u32, seed: u32) -> Vec<[u8; 4]> {
+    (0..width * height)
+        .map(|i| {
+            let k = if colours > 256 {
+                i.wrapping_mul(2_654_435_761).wrapping_add(seed)
+            } else {
+                (i.wrapping_mul(7).wrapping_add(i / width).wrapping_add(seed)) % colours
+            };
+            let v = k.wrapping_mul(0x9E37_79B9).wrapping_add(seed);
+            [v as u8, (v >> 8) as u8, (v >> 16) as u8, 255]
+        })
+        .collect()
+}
+
+/// Send `pixels` and wait until they are in the framebuffer exactly.
+async fn send_and_check(h: &Harness, rect: Rect, pixels: Vec<[u8; 4]>, what: &str) {
+    let mut events = h.session.subscribe();
+    h.updates
+        .send(MockUpdate::Pixels {
+            rect,
+            pixels: pixels.clone(),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            if let BackendEvent::Damage(d) = events.recv().await.unwrap() {
+                if d == rect {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}: no damage arrived"));
+    let fb = h.session.framebuffer();
+    let fb = fb.read();
+    for y in 0..rect.height {
+        for x in 0..rect.width {
+            assert_eq!(
+                fb.pixel(rect.x + x, rect.y + y),
+                Some(pixels[(y * rect.width + x) as usize]),
+                "{what}: pixel ({x}, {y})"
+            );
+        }
+    }
+}
+
+/// Every lossless Tight sub-encoding, end to end through the real session:
+/// fill, the 1-bit and 8-bit palettes, the copy or gradient filter, and data
+/// short enough to skip zlib -- interleaved across all four streams, then
+/// again after the server resets them mid-session, so a decoder that mixed up
+/// windows or ignored a reset bit would fail on the second pass.
+async fn tight_round_trip(gradient: bool) {
+    let h = harness(MockConfig {
+        offer_tight: true,
+        tight_gradient: gradient,
+        ..Default::default()
+    })
+    .await;
+    let full_colour = if gradient { "gradient" } else { "copy" };
+    let at = |x, y, width, height| Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    for pass in 0..2u32 {
+        let cases = [
+            ("fill", at(0, 0, 64, 64), 1),
+            ("two colours", at(3, 5, 37, 11), 2),
+            ("indexed", at(8, 8, 40, 30), 100),
+            (full_colour, at(0, 20, 64, 44), 1000),
+            ("indexed again", at(1, 1, 33, 33), 200),
+            ("two colours again", at(0, 0, 64, 64), 2),
+            (full_colour, at(10, 0, 50, 64), 1000),
+            ("under twelve bytes", at(60, 60, 3, 1), 1000),
+        ];
+        for (seed, (what, rect, colours)) in cases.into_iter().enumerate() {
+            let pixels = picture(rect.width, rect.height, colours, seed as u32 + pass * 100);
+            send_and_check(&h, rect, pixels, &format!("pass {pass}, {what}")).await;
+        }
+        h.updates.send(MockUpdate::ResetTightStreams).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn tight_sub_encodings_decode_exactly_with_the_copy_filter() {
+    tight_round_trip(false).await;
+}
+
+#[tokio::test]
+async fn tight_sub_encodings_decode_exactly_with_the_gradient_filter() {
+    tight_round_trip(true).await;
+}
+
+/// The mock only sends Tight to a client that asked for it, like a real server.
+#[tokio::test]
+async fn the_default_mock_still_sends_raw() {
+    let h = harness(MockConfig::default()).await;
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: 16,
+        height: 16,
+    };
+    send_and_check(&h, rect, picture(16, 16, 1000, 1), "raw").await;
 }

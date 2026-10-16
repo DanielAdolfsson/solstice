@@ -7,16 +7,16 @@
 //! Tests drive them over an in-memory cursor, which is an `AsyncRead` like any
 //! other.
 //!
-//! **Not implemented:** Tight (7) and its JPEG sub-encoding. Solstice does not
-//! advertise it, so a conforming server will not send it; a server that sends
-//! an unrequested encoding gets [`RfbError::UnsupportedEncoding`] rather than a
-//! guess. ZRLE covers the same ground against every server in
-//! `docs/testing.md` §3.
+//! **Not implemented:** Tight's JPEG sub-encoding, deliberately -- see
+//! [`tight`]. Solstice advertises no quality level, so a conforming server
+//! will not send it. More generally, a server that sends an unrequested
+//! encoding gets [`RfbError::UnsupportedEncoding`] rather than a guess.
 
 pub mod copy_rect;
 pub mod hextile;
 pub mod raw;
 pub mod rre;
+pub mod tight;
 pub mod zrle;
 
 use solstice_backend::{Framebuffer, Rect};

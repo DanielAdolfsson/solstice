@@ -173,12 +173,10 @@ summaries below are just the shape of it.
   Each is a deliberate omission rather than a gap, and the capability is not
   advertised in any of the three cases, so a conforming server will not send
   them. [The list](docs/roadmap.md#25-what-is-deliberately-not-implemented).
-- **Tight encoding** on the RFB side. Solstice does not advertise it, so a
-  conforming server will not send it; a server that sends it anyway gets an
-  error rather than a guess. ZRLE covers the same ground.
-  [Plan](docs/roadmap.md#1-tight-encoding-rfb) — and note it should be
-  implemented lossless-only, since a JPEG hop in front of an H.264 encoder is a
-  quality regression.
+- **Tight's JPEG sub-encoding** on the RFB side. Tight itself is decoded and
+  preferred, lossless-only: a JPEG hop in front of an H.264 encoder is a
+  quality regression, so no quality level is advertised and a conforming
+  server sends none. [Why](docs/roadmap.md#1-tight-encoding-rfb).
 - **`solstice pair`** needs a management socket to reach the running daemon.
   The pairing state machine and its window/lockout policy are complete and
   tested; only the IPC is missing. Until then the command says so instead of

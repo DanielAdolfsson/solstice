@@ -10,7 +10,8 @@
 //! The server is the QEMU guest the other real-server tests use, so the
 //! encodings measured are the ones a server we actually test against will
 //! send. QEMU serves Raw, Hextile, zlib, Tight and ZRLE, which covers every
-//! case below.
+//! case below. The guest uses virtio-gpu, for the reason `real_server.rs`
+//! gives.
 //!
 //! The question it answers is narrow and specific: in a bridge that re-encodes
 //! everything to H.264 anyway, the backend encoding is not a bandwidth decision
@@ -25,7 +26,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use solstice_backend::{BackendEvent, FramebufferHandle, Rect};
-use solstice_test_guest::{Guest, GuestConfig};
+use solstice_test_guest::{Display, Guest, GuestConfig};
 use solstice_vnc::pixel::PixelFormat;
 use solstice_vnc::protocol::encoding;
 use solstice_vnc::session::{self, UpdateLoop};
@@ -89,6 +90,7 @@ fn start_server() -> Option<Guest> {
     let guest = Guest::start(
         GuestConfig::new()
             .geometry(WIDTH, HEIGHT)
+            .display(Display::VirtioGpu)
             .vnc()
             .memory_mb(1536),
     )?;
@@ -232,6 +234,8 @@ async fn what_each_encoding_costs() {
             "ZRLE + CopyRect",
             vec![encoding::ZRLE, encoding::COPY_RECT, encoding::RAW],
         ),
+        // Lossless: no quality level is listed, so the server sends no JPEG.
+        ("Tight", vec![encoding::TIGHT, encoding::RAW]),
         ("what Solstice ships", session::ENCODINGS.to_vec()),
     ];
 

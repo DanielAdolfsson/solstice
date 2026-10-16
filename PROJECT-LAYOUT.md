@@ -209,12 +209,14 @@ pseudo-encodings — are the three things client crates hide. The decoders came
 to about 700 lines including their tests, which is less than a fork would have
 cost to maintain.
 
-▲ `encodings/` has Raw, CopyRect, RRE, Hextile and ZRLE. **Tight is absent**
-and is not advertised, so a conforming server will not send it; one that does
-gets an error rather than a guess. ZRLE covers the same servers.
+▲ `encodings/` has Raw, CopyRect, RRE, Hextile, ZRLE and Tight. Tight is
+**lossless-only** — fill, copy, palette and gradient — and no JPEG quality
+level is advertised, so a conforming server sends no JPEG; one that does gets
+an error rather than a guess (`docs/roadmap.md` §1).
 
 ▲ `mock.rs` is the deliberately minimal recording server from
-`docs/testing.md` §3.2: Raw only, no flow control, no -258, and it records
+`docs/testing.md` §3.2: Raw only unless Tight is asked for, no flow control,
+no -258, and it records
 every client message so input is asserted on exactly rather than observed on a
 live desktop.
 
@@ -411,7 +413,7 @@ which is what lets it be fuzzed and tested without a SPICE backend existing.
 |---|---|---|
 | `vnc-rs` | 0.6 | candidate RFB client; evaluate vs. implementing directly |
 | `flate2` | 1.1 | zlib for Tight / ZRLE / zlibhex |
-| `turbojpeg` | 1.5 | Tight's JPEG sub-encoding |
+| `turbojpeg` | 1.5 | Tight's JPEG sub-encoding — **not taken**: Tight is lossless-only |
 | `des` | — | only if VNC Authentication is supported at all |
 
 ### `solstice-spice-codec`

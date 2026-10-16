@@ -24,7 +24,8 @@ const TILE: u32 = 64;
 /// exhaust memory (`docs/security.md` §5.4).
 const MAX_INFLATED: usize = 64 * 1024 * 1024;
 
-/// A connection-lifetime zlib stream.
+/// A connection-lifetime zlib stream. ZRLE has one; Tight has four, each of
+/// which the server may also [reset](Self::reset).
 pub struct ZlibStream {
     decompress: Decompress,
 }
@@ -51,9 +52,23 @@ impl ZlibStream {
         }
     }
 
+    /// Discard the deflate window and start over, as a Tight server asks for
+    /// with a reset bit.
+    pub fn reset(&mut self) {
+        self.decompress.reset(true);
+    }
+
     /// Inflate one chunk, continuing the stream.
     pub fn inflate(&mut self, input: &[u8]) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(input.len() * 4);
+        self.inflate_at_most(input, MAX_INFLATED)
+    }
+
+    /// [`Self::inflate`], refusing to produce more than `limit` bytes. A caller
+    /// that knows exactly how much a chunk must inflate to passes that, which
+    /// stops a bomb at the size of the rectangle rather than at the global cap.
+    pub fn inflate_at_most(&mut self, input: &[u8], limit: usize) -> Result<Vec<u8>> {
+        let limit = limit.min(MAX_INFLATED);
+        let mut out = Vec::with_capacity(input.len().saturating_mul(4).min(limit));
         let mut consumed = 0usize;
         let mut scratch = vec![0u8; 64 * 1024];
         loop {
@@ -67,10 +82,10 @@ impl ZlibStream {
             let written = (self.decompress.total_out() - before_out) as usize;
             consumed += read;
             out.extend_from_slice(&scratch[..written]);
-            if out.len() > MAX_INFLATED {
-                return Err(RfbError::Limit(
-                    "ZRLE rectangle inflated past the cap".into(),
-                ));
+            if out.len() > limit {
+                return Err(RfbError::Limit(format!(
+                    "a rectangle inflated past {limit} bytes"
+                )));
             }
             match status {
                 Status::StreamEnd => break,

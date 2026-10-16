@@ -164,21 +164,45 @@ impl PixelFormat {
 
     /// Convert one pixel to BGRA.
     pub fn to_bgra(&self, bytes: &[u8]) -> [u8; 4] {
+        self.bgra_from_components(self.components(bytes))
+    }
+
+    /// The red, green and blue intensities of one pixel, unscaled: each is in
+    /// `0..=max` for its channel.
+    pub fn components(&self, bytes: &[u8]) -> [u32; 3] {
         let value = self.read_pixel(bytes);
-        let component = |max: u16, shift: u8| -> u8 {
-            let raw = (value >> shift) & max as u32;
+        [
+            (value >> self.red_shift) & self.red_max as u32,
+            (value >> self.green_shift) & self.green_max as u32,
+            (value >> self.blue_shift) & self.blue_max as u32,
+        ]
+    }
+
+    /// The per-channel maxima, red first, in the order [`Self::components`]
+    /// returns.
+    pub fn maxima(&self) -> [u32; 3] {
+        [
+            self.red_max as u32,
+            self.green_max as u32,
+            self.blue_max as u32,
+        ]
+    }
+
+    /// Scale unscaled red, green and blue intensities to BGRA.
+    pub fn bgra_from_components(&self, [r, g, b]: [u32; 3]) -> [u8; 4] {
+        let scale = |raw: u32, max: u16| -> u8 {
             if max == 0 {
                 0
             } else {
                 // Scale to 0..=255 without a division by a non-power-of-two
                 // mattering: max is 2^n - 1 in every real format.
-                ((raw * 255 + max as u32 / 2) / max as u32) as u8
+                ((raw.min(max as u32) * 255 + max as u32 / 2) / max as u32) as u8
             }
         };
         [
-            component(self.blue_max, self.blue_shift),
-            component(self.green_max, self.green_shift),
-            component(self.red_max, self.red_shift),
+            scale(b, self.blue_max),
+            scale(g, self.green_max),
+            scale(r, self.red_max),
             0xFF,
         ]
     }

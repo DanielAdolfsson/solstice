@@ -210,8 +210,10 @@ Three things follow.
 
 **The backend decoder is not the bottleneck.** ZRLE costs about 14% of a core
 at 720p under the worst desktop content there is; the encoder costs 36% at the
-same resolution and 83% at 1080p60. Any work on the RFB decoding side -- Tight,
-for instance -- is optimising the cheap third of the pipeline.
+same resolution and 83% at 1080p60. Any work on the RFB decoding side is
+optimising the cheap third of the pipeline. Tight, since implemented, bears
+that out: about 13% less client CPU per pixel than ZRLE at the same bytes
+(`docs/roadmap.md` §1), which is real and does not matter.
 
 **The per-rectangle conversion was worth building.** Converting a 320x200
 damage rectangle is 0.1 ms against 3.2 ms for a whole 1080p frame, a 30x
@@ -285,15 +287,6 @@ When the backend declines to resize, the frame is letterboxed with
 nearest-neighbour sampling. For a text-heavy desktop that is a defensible
 default — a smoothing filter costs CPU to make text less legible — but it has
 not been compared against anything.
-
-### Tight is not implemented
-
-ZRLE covers the same servers, and Tight is *"a small zoo of sub-encodings
-(basic/fill/jpeg/png, palette, gradient filters) over a stateful zlib stream"*
-as `docs/rfb-vnc-protocol.md` §8.3 puts it. The honest position is that it is
-not advertised, so a conforming server will not send it, and one that does gets
-an error rather than a guess. Whether it is worth implementing is a question
-for a real deployment, not for a greenfield.
 
 ### The fuzz targets have no corpus and no CI job
 
