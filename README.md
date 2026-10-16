@@ -91,6 +91,20 @@ cp contrib/solstice.example.toml /etc/solstice/solstice.toml
 solstice --config /etc/solstice/solstice.toml run
 ```
 
+Pairing is opened from a second shell, as the user the daemon runs as, with
+the PIN Moonlight is showing. The command waits until the client has paired,
+and fails if the window runs out:
+
+```sh
+solstice pair --pin 1234            # window: security.pairing_window, 60s
+solstice status
+solstice list-clients
+solstice revoke 3fa9c2d1            # a fingerprint prefix from list-clients
+```
+
+They reach the daemon over `$state_dir/control.sock`, a mode-0600 Unix socket.
+There is no HTTP management API and no web UI.
+
 The shipped defaults are the deployment `docs/security.md` recommends: bound to
 loopback, pairing closed, encryption mandatory, one session, and a ceiling on
 every resolution, rate and bitrate the client can ask for. The default backend
@@ -129,6 +143,9 @@ pointed at a client before any desktop is involved.
   transition per request, nothing persisted until step ④ verifies, session
   destroyed on any deviation. The three CVEs in Sunshine's version of this
   state machine each have a named negative test.
+- **`solstice pair`, `status`, `list-clients` and `revoke`** against the
+  running daemon, over a Unix socket rather than a web UI. A revocation takes
+  effect in the daemon at once, not at its next restart.
 - **RTSP**, plaintext and AES-GCM wrapped, with the ANNOUNCE attribute parser
   and server-side clamping of everything the client asks for.
 - **The video path**: synthetic frame clock, BGRA→I420 conversion (whole-frame,
@@ -177,10 +194,6 @@ summaries below are just the shape of it.
   preferred, lossless-only: a JPEG hop in front of an H.264 encoder is a
   quality regression, so no quality level is advertised and a conforming
   server sends none. [Why](docs/roadmap.md#1-tight-encoding-rfb).
-- **`solstice pair`** needs a management socket to reach the running daemon.
-  The pairing state machine and its window/lockout policy are complete and
-  tested; only the IPC is missing. Until then the command says so instead of
-  appearing to work.
 - **Controllers, touch and pen.** Neither backend protocol has any notion of
   them. They are dropped — and *counted*, because quietly swallowing input is
   the kind of thing that generates bug reports.
@@ -234,6 +247,7 @@ The strategy is in [docs/testing.md](docs/testing.md); what exists today:
 | T2 | The RFB client against a deliberately minimal recording mock server | `crates/solstice-vnc/tests/mock_server.rs` |
 | T3 | The RFB client against **QEMU's RFB server**, on the same guest the SPICE tests use — skipped with a note when QEMU or the guest image is absent | `crates/solstice-vnc/tests/real_server.rs` |
 | T3 | **The whole stack end to end**: pair, launch, RTSP, decrypt, reassemble, decode H.264 — twice, once against the colour-bar generator reading the frame counter off the picture, and once against a real guest desktop checking the pixels are the colour it was painted | `crates/solstice/tests/end_to_end.rs` |
+| T3 | **`solstice pair` and `revoke` as a second process**: the real binary opens a window on a running daemon, a client pairs through it, and a revocation takes effect in the daemon's memory | `crates/solstice/tests/management.rs` |
 | T5 | Five `cargo-fuzz` targets over the parsers the CVEs lived in | `fuzz/fuzz_targets/` |
 
 Two `#[ignore]`d benchmarks measure where the CPU goes --

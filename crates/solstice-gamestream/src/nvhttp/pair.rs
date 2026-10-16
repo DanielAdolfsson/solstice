@@ -166,11 +166,12 @@ fn server_challenge_response(
 }
 
 fn client_pairing_secret(host: &Host, now: Instant, body: &[u8]) -> (u16, String) {
-    let result = {
-        let mut mgr = host.pairing.lock().expect("pairing lock");
-        mgr.finish(now, body)
-    };
-    match result {
+    // The pairing lock is held across the store write. A success closes the
+    // window, and `solstice pair` -- waiting on the management socket for the
+    // outcome -- must never see it closed while the new client is not in the
+    // store yet, or it would report a pairing as an expiry.
+    let mut mgr = host.pairing.lock().expect("pairing lock");
+    match mgr.finish(now, body) {
         Ok(client) => {
             let name = client.device_name.clone();
             match host.clients.write().expect("client store lock").add(client) {

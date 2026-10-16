@@ -244,6 +244,8 @@ pub struct PairingManager {
     failures: u32,
     max_attempts: u32,
     locked_out: bool,
+    generation: u64,
+    paired: Option<PairedClient>,
 }
 
 impl Default for PairingManager {
@@ -262,6 +264,8 @@ impl PairingManager {
             failures: 0,
             max_attempts,
             locked_out: false,
+            generation: 0,
+            paired: None,
         }
     }
 
@@ -275,7 +279,18 @@ impl PairingManager {
         self.session = None;
         self.failures = 0;
         self.locked_out = false;
+        self.generation = self.generation.wrapping_add(1);
+        self.paired = None;
         Ok(())
+    }
+
+    /// Which window this is: bumped by every successful [`open`](Self::open).
+    ///
+    /// `solstice pair` waits for the outcome of the window *it* opened, and a
+    /// second `solstice pair` replaces the PIN under it; this is how the first
+    /// one notices instead of reporting the second one's result as its own.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Close the window and drop any in-flight handshake.
@@ -288,6 +303,26 @@ impl PairingManager {
     /// Whether a window is currently open.
     pub fn is_open(&self, now: Instant) -> bool {
         !self.locked_out && self.closes_at.is_some_and(|t| now < t)
+    }
+
+    /// How long the window has left, if it is open.
+    pub fn time_left(&self, now: Instant) -> Option<Duration> {
+        self.closes_at
+            .filter(|_| self.is_open(now))
+            .map(|t| t.saturating_duration_since(now))
+    }
+
+    /// The client this window paired, once it has. Cleared by the next
+    /// [`open`](Self::open), and the only way to tell a window that closed
+    /// because it succeeded from one that ran out: a client re-pairing with a
+    /// certificate the store already holds leaves the store looking unchanged.
+    pub fn paired(&self) -> Option<&PairedClient> {
+        self.paired.as_ref()
+    }
+
+    /// The attempt limit.
+    pub fn max_attempts(&self) -> u32 {
+        self.max_attempts
     }
 
     /// Whether the attempt limit has been hit.
@@ -383,6 +418,7 @@ impl PairingManager {
                 // One successful pairing per window: the window is closed
                 // immediately so a second client cannot reuse the same PIN.
                 self.close();
+                self.paired = Some(client.clone());
                 Ok(client)
             }
             Err(e) => {
@@ -626,6 +662,25 @@ mod tests {
     }
 
     #[test]
+    fn each_open_is_a_new_window_and_a_refused_one_is_not() {
+        let mut mgr = PairingManager::new(3);
+        let now = Instant::now();
+        let before = mgr.generation();
+        mgr.open(PIN, Duration::from_secs(60), now).unwrap();
+        let first = mgr.generation();
+        assert_ne!(first, before);
+        assert!(mgr.open("12", Duration::from_secs(60), now).is_err());
+        assert_eq!(mgr.generation(), first, "a refused open changes nothing");
+        mgr.open(PIN, Duration::from_secs(60), now).unwrap();
+        assert_ne!(mgr.generation(), first);
+        assert_eq!(
+            mgr.time_left(now + Duration::from_secs(20)),
+            Some(Duration::from_secs(40))
+        );
+        assert_eq!(mgr.paired(), None);
+    }
+
+    #[test]
     fn pairing_is_closed_until_a_window_is_opened() {
         let (host, client_identity) = identities();
         let mut mgr = PairingManager::new(3);
@@ -762,8 +817,14 @@ mod tests {
             .unwrap();
         let paired = mgr.finish(now, &body).unwrap();
         assert_eq!(paired.cert_der, client_identity.cert_der());
+        assert_eq!(
+            mgr.paired(),
+            Some(&paired),
+            "the window remembers its result"
+        );
 
         assert!(!mgr.is_open(now));
+        assert_eq!(mgr.time_left(now), None);
         assert!(matches!(
             mgr.start(
                 host,

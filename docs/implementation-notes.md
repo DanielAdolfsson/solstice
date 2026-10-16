@@ -123,16 +123,19 @@ old OpenSSL licence is generally considered GPL-incompatible, so a stale
 clarification would have made a compatible dependency look like a licence
 conflict. The entry is gone; cargo-deny reads the crate's own metadata.
 
-### No web UI, and therefore no `solstice pair` yet
+### No web UI, and a socket instead
 
 `docs/security.md` §3.5 says not to build a web UI with a session cookie, and
 `docs/testing.md` §2.1 says pairing must be scriptable. Both are satisfied by a
 CLI — but a CLI subcommand runs in a *different process* from the daemon, so
-`solstice pair` needs a management socket that does not exist yet. The pairing
-window, the attempt lockout and the source-address restriction are all
-implemented and tested inside the daemon; only the IPC to open the window from
-outside is missing. The command reports that rather than opening a window
-against its own throwaway state.
+`solstice pair` reaches it over a Unix socket, `$state_dir/control.sock`
+(`crates/solstice/src/management.rs`, `docs/roadmap.md` §5).
+
+Building it turned up a second thing the missing IPC had been hiding: the old
+`solstice revoke` edited `clients.tsv` from its own process, and the running
+daemon went on trusting the client it held in memory until it restarted. A
+revocation that does not take effect is worse than none, because the operator
+believes it has. It now goes through the daemon when one is running.
 
 ### The fuzz targets found a bug on their first run
 

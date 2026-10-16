@@ -238,6 +238,24 @@ pub fn start_daemon_with(
     tag: &str,
     backend: Arc<dyn Backend>,
 ) -> (Arc<solstice_gamestream::nvhttp::Host>, std::path::PathBuf) {
+    let (host, state_dir) = start_daemon_closed(config, tag, backend);
+    // Opened directly rather than through `solstice pair`, so that a streaming
+    // test does not also depend on the management socket; `management.rs`
+    // drives that with the real binary.
+    host.pairing
+        .lock()
+        .unwrap()
+        .open(PIN, Duration::from_secs(120), std::time::Instant::now())
+        .unwrap();
+    (host, state_dir)
+}
+
+/// Start a daemon with pairing closed, as a real one starts.
+pub fn start_daemon_closed(
+    config: Config,
+    tag: &str,
+    backend: Arc<dyn Backend>,
+) -> (Arc<solstice_gamestream::nvhttp::Host>, std::path::PathBuf) {
     let state_dir = std::env::temp_dir().join(format!("solstice-e2e-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&state_dir);
     let mut config = config;
@@ -246,14 +264,6 @@ pub fn start_daemon_with(
     let identity = HostIdentity::load_or_generate(&state_dir, "solstice-e2e").unwrap();
     let clients = ClientStore::load(state_dir.join("clients.tsv")).unwrap();
     let host = Arc::new(build_host(&config, identity, clients));
-
-    // `solstice pair` would do this over the management socket; the window is
-    // opened directly here because that socket is not built yet.
-    host.pairing
-        .lock()
-        .unwrap()
-        .open(PIN, Duration::from_secs(120), std::time::Instant::now())
-        .unwrap();
 
     let supervisor = Supervisor::new(config, host.clone(), backend);
     tokio::spawn(async move {

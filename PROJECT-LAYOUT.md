@@ -85,6 +85,7 @@ directory with the crate in scope:
 | RFB client vs. QEMU's RFB server | `crates/solstice-vnc/tests/real_server.rs` |
 | SPICE client vs. a live `spice-server` | `crates/solstice-spice/tests/real_server.rs` |
 | The whole stack, end to end, twice | `crates/solstice/tests/end_to_end.rs` |
+| `solstice pair` / `revoke` as a second process against a running daemon | `crates/solstice/tests/management.rs` |
 | The host vs. the **real** Moonlight client | `crates/solstice/tests/real_moonlight.rs` |
 
 ▲ The mock RFB server is `solstice-vnc`'s `mock` module rather than a separate
@@ -105,7 +106,8 @@ without starting a daemon.
 src/
 ├── main.rs
 ├── lib.rs            # ▲ also a library, so the end-to-end test can start it
-├── cli.rs            # clap: run, pair, list-clients, revoke
+├── cli.rs            # clap: run, pair, status, list-clients, revoke
+├── management.rs     # ▲ the control socket those subcommands talk to the daemon over
 ├── config.rs         # serde + toml; see §5
 ├── supervisor.rs     # session lifecycle, resource ceilings, shutdown
 ├── pipeline.rs       # ▲ the frame loop: framebuffer → convert → encode → packetise
@@ -595,6 +597,8 @@ Two more that the implementation raised:
    phantom byte (`docs/roadmap.md` §4). Sunshine is still not at the host
    end; what that would add is a host-side oracle, not conformance.
 8. **The management socket.** `solstice pair` runs in a different process from
-   the daemon, so opening a pairing window needs IPC that does not exist. The
-   window, lockout and source-address policy are implemented and tested; only
-   the socket is missing.
+   the daemon, so opening a pairing window needed IPC. It is a Unix socket at
+   `$state_dir/control.sock`, mode 0600 and peer-credential checked, carrying
+   `pair`, `status`, `list-clients` and `revoke` as one line in, lines out --
+   not HTTP, for the reason `docs/security.md` §3.5 gives
+   (`docs/roadmap.md` §5).

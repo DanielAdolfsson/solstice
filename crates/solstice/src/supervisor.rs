@@ -82,6 +82,15 @@ impl Supervisor {
     /// Run until the process is told to stop.
     pub async fn run(self) -> std::io::Result<()> {
         let bind = self.config.server.bind;
+
+        // First, so that a second daemon on the same state directory fails
+        // here rather than after binding half its ports.
+        let management = crate::management::bind(&self.config.server.control_socket())?;
+        tokio::spawn(management.serve(Arc::new(crate::management::Context {
+            host: self.host.clone(),
+            pairing_window: self.config.security.pairing_window,
+            backend: self.backend.name(),
+        })));
         let (negotiated_tx, mut negotiated_rx) = mpsc::channel(4);
 
         let identity_cert = self.host.identity.cert_pem().to_owned();

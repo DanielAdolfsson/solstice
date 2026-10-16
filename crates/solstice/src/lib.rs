@@ -9,6 +9,7 @@
 pub mod backend_factory;
 pub mod cli;
 pub mod config;
+pub mod management;
 pub mod net;
 pub mod pipeline;
 pub mod supervisor;
