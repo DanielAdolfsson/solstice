@@ -43,8 +43,9 @@ pub struct AudioPacketizer {
     key: Option<[u8; 16]>,
     sequence: u16,
     timestamp: u32,
-    /// The four data shards of the block currently being filled, padded to a
-    /// common length -- RS needs equal-length shards and Opus packets are not.
+    /// The payloads of the block currently being filled: what follows each
+    /// data packet's RTP header, as sent. Padded to a common length when the
+    /// parity is computed, because RS needs equal shards.
     block: Vec<Vec<u8>>,
     block_base_sequence: u16,
     block_base_timestamp: u32,
@@ -89,9 +90,14 @@ impl AudioPacketizer {
             None => datagram.extend_from_slice(opus),
         }
 
-        // Parity protects the datagram as sent, header included, so a recovered
-        // shard is a complete packet.
-        self.block.push(datagram.clone());
+        // Parity protects the payload as sent, not the RTP header. The client
+        // takes a data shard to be everything after the header
+        // (`RtpAudioQueue.c`, `completeFecBlock`: `dataPackets[i] + 1`),
+        // rebuilds a recovered packet's header from the FEC header, and
+        // requires a parity shard to be exactly a data payload long. Parity
+        // over the whole datagram was 12 bytes too long, so the first time a
+        // client needed it, it switched audio FEC off for the session instead.
+        self.block.push(datagram[RTP_HEADER_LEN..].to_vec());
         self.sequence = self.sequence.wrapping_add(1);
         self.timestamp = self.timestamp.wrapping_add(self.config.packet_duration_ms);
 
@@ -259,7 +265,34 @@ mod tests {
         assert_eq!(data_sequences, (0..16u16).collect::<Vec<_>>());
     }
 
-    /// The whole point of the parity: lose a data packet and get it back.
+    /// The client's own check: every packet of a block must imply the same
+    /// block size, a data packet's being its length less the RTP header and
+    /// a parity packet's its length less the RTP and FEC headers
+    /// (`RtpAudioQueue.c`, "Audio block size mismatch"). A mismatch turns
+    /// audio FEC off for the session, or asserts in a debug client.
+    #[test]
+    fn parity_shards_are_exactly_a_data_payload_long() {
+        let key = [3u8; 16];
+        let mut p = AudioPacketizer::new(AudioConfig::default(), Some(&key));
+        let silence = opus_silence_packet(2);
+        let mut sizes = std::collections::BTreeSet::new();
+        for _ in 0..8 {
+            for packet in p.packetize(&silence) {
+                let rtp = parse_rtp(&packet);
+                let block_size = if rtp.packet_type == AUDIO_FEC_PAYLOAD_TYPE {
+                    packet.len() - RTP_HEADER_LEN - AUDIO_FEC_HEADER_LEN
+                } else {
+                    packet.len() - RTP_HEADER_LEN
+                };
+                sizes.insert(block_size);
+            }
+        }
+        assert_eq!(sizes.len(), 1, "block sizes {sizes:?}");
+    }
+
+    /// The whole point of the parity: lose a data packet and get it back,
+    /// laid out as the client lays it out -- payloads as the data shards,
+    /// and the header rebuilt from the FEC header.
     #[test]
     fn a_lost_audio_packet_recovers_from_parity() {
         let mut p = AudioPacketizer::new(
@@ -284,20 +317,16 @@ mod tests {
         }
         assert_eq!(parity.len(), crate::wire::audio::AUDIO_PARITY_SHARDS);
 
-        let shard_len = data.iter().map(|d| d.len()).max().unwrap();
         let mut slots: Vec<Option<Vec<u8>>> = data
             .iter()
-            .map(|d| {
-                let mut v = d.clone();
-                v.resize(shard_len, 0);
-                Some(v)
-            })
+            .map(|d| Some(d[RTP_HEADER_LEN..].to_vec()))
             .chain(parity.into_iter().map(Some))
             .collect();
         let original = slots[2].clone().unwrap();
         slots[2] = None;
         Rs::audio().reconstruct(&mut slots).unwrap();
         assert_eq!(slots[2].as_ref().unwrap(), &original);
+        assert_eq!(&data[2][RTP_HEADER_LEN..], &original[..]);
     }
 
     #[test]
