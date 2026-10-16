@@ -149,6 +149,10 @@ async fn the_primary_surface_reaches_the_framebuffer() {
     assert_eq!(fb.width(), 64);
     // 0x0000FF00 little-endian is B=0x00, G=0xFF, R=0x00.
     assert_eq!(fb.pixel(10, 10), Some([0x00, 0xFF, 0x00, 0xFF]));
+    assert_eq!(
+        session.draw_counts(),
+        std::collections::BTreeMap::from([(display_msg::DRAW_FILL, 1)])
+    );
 }
 
 #[tokio::test]

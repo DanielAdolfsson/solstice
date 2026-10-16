@@ -107,11 +107,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Spice {
     options: Vec<(String, String)>,
     agent: bool,
+    audio: bool,
 }
 
 impl Default for Spice {
     fn default() -> Self {
-        Self { options: Vec::new(), agent: true }
+        Self { options: Vec::new(), agent: true, audio: false }
     }
 }
 
@@ -130,6 +131,18 @@ impl Spice {
     /// ever be tested in this state.
     pub fn without_agent(mut self) -> Self {
         self.agent = false;
+        self
+    }
+
+    /// Give the guest a sound card whose output is the SPICE playback
+    /// channel.
+    ///
+    /// Off by default because it is a PCI device every other test would
+    /// boot for nothing. The guest's `linux-virt` kernel already carries
+    /// `snd-hda-intel`, and `eudev` loads it, so `aplay` and `speaker-test`
+    /// find a card with no change to the image.
+    pub fn audio(mut self) -> Self {
+        self.audio = true;
         self
     }
 
@@ -552,6 +565,11 @@ impl Guest {
                 // comes up agentless.
                 qemu.args(["-chardev", "spicevmc,id=vdagent,name=vdagent"]);
                 qemu.args(["-device", "virtserialport,chardev=vdagent,name=com.redhat.spice.0"]);
+            }
+            if spice.audio {
+                qemu.args(["-audiodev", "spice,id=snd0"]);
+                qemu.args(["-device", "intel-hda"]);
+                qemu.args(["-device", "hda-output,audiodev=snd0"]);
             }
         }
         let mut vnc_port = None;

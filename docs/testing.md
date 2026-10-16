@@ -305,12 +305,35 @@ Two more things the guest had to be taught, each of which fails silently:
 
 - `xsetroot -solid` does not work against this X server. It exits 0, leaves
   `_XSETROOT_ID` unset, and the root reverts to black the moment it exits,
-  because the background is only retained for a client that asked for
-  `RetainPermanent`. `tests/guest/draw-helper.c` does.
+  because the background is only retained for a client that asked to be.
+  `tests/guest/draw-helper.c` does, as `RetainTemporary` after killing the
+  previous holder: `RetainPermanent` on every call leaked one X client per
+  paint, and a soak ran into the server's limit of 256.
 - `spice-vdagentd` takes `-x`, not `-X`; it needs the `uinput` module; and it
   needs `/run/spice-vdagentd/` and a machine-id. Miss any one and the daemon
   is simply absent, which looks exactly like a client that failed to
   negotiate.
+
+**Count what arrived, not only what it looks like.** The session exposes
+`draw_counts()` and `image_counts()` — how many of each draw command it has
+executed and of each image encoding it has decoded. Correct pixels are
+consistent with more than one route to them, and twice that hid a test that
+was not testing what it was named for: the codec sweep decoded one `LZ_RGB`
+image whatever it forced, and `solstice-draw stroke|text|rop3`, written to
+force `DRAW_STROKE`, `DRAW_TEXT` and `DRAW_ROP3`, produces fills and copies
+because `xf86-video-qxl` accelerates nothing else. `roadmap.md` §2.6 has both.
+A new test that claims a code path should assert the count that proves it.
+
+**Never block the runtime the client runs on.** `Guest` calls block the
+thread. On a single-threaded runtime that freezes the client while the guest
+command runs, and a command that draws more than the server's ack window
+deadlocks against it — the X server ends up blocked in `qxl_ring_push` and
+the failure looks like a slow guest. `real_server.rs` is multi-threaded *and*
+wraps `Guest` so every blocking call goes through `block_in_place`, because a
+blocked worker could otherwise still hold the client's next task in its LIFO
+slot. Its module comment has the mechanism. The GLZ soak still stalls
+intermittently with both in place, for a reason not yet found
+(`roadmap.md` §2.7).
 
 ### 4.1 Which display device, and why it matters
 
@@ -380,18 +403,15 @@ the test answers them from a task rather than with a single call, because a
 consumer that answered only the first would hang the guest on the second. A
 real consumer carries the same obligation.
 
-**The draw-command mix is reachable but not yet asserted.** The guest emits
-`DRAW_STROKE`, `DRAW_TEXT` and `DRAW_ROP3` on demand via `solstice-draw`, so
-the long-standing problem of never having seen them from a real server is
-solved. What is missing is observability on the client side: the display
-channel keeps no record of which command kinds it has executed, so a test can
-drive them but cannot assert they arrived.
+**Audio.** The guest gets a sound card with `Spice::audio()` (an
+`intel-hda` codec whose output is the playback channel), and `speaker-test`
+plays into it. What arrives is Opus, 48 kHz stereo, in **10 ms** packets —
+measured, and asserted by `guest_audio_arrives_as_opus_packets_of_one_fixed_duration`.
 
-**Audio is unexercised.** The guest has `alsa-utils` and QEMU can carry the
-playback channel, but the open question is not whether Opus arrives — it is
-whether it can be **repacketised rather than transcoded**, which depends on
-the frame duration matching `x-nv-aqos.packetDuration` (`spice-protocol.md`
-§7).
+**The GLZ soak** is `glz_soak_keeps_the_screen_exact_across_thousands_of_images`,
+`#[ignore]`d because it is minutes long under TCG. It repaints with changing
+content round after round and holds the screen against QEMU's screendump
+every twenty; `SOLSTICE_GLZ_SOAK_ROUNDS` lengthens it.
 
 ### 4.4 The image codecs, without a server
 
@@ -582,5 +602,6 @@ Be honest about the gaps rather than pretending the matrix is complete:
 - **Hardware encoders**, per §6.
 - **Long-running stability.** Memory growth, sequence-number and IV-counter
   wrap, GLZ history-window drift over hours. Needs a soak job, not a CI job.
+  The GLZ part has a test to run (§4.3); nothing runs it on a schedule.
 - **Other RFB servers and real QXL guests**, deliberately — see §3.3 and §4.2
   for exactly what that costs and when to revisit.

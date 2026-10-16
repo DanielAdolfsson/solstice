@@ -81,9 +81,9 @@ tail -1 "$WORK/apk.log" >&2
 install -D -m 0755 "$HERE/init"       "$ROOT/init"
 install -D -m 0644 "$HERE/xorg.conf"  "$ROOT/etc/X11/xorg.conf"
 
-# The draw helper forces DRAW_STROKE / DRAW_TEXT / DRAW_ROP3 out of the QXL
-# driver (roadmap.md 2.7). Same architecture as the host, so it compiles in a
-# plain chroot -- no cross toolchain, no first-boot build step.
+# The draw helper paints the guest from the test harness (see its header for
+# what it does and does not reach). Same architecture as the host, so it
+# compiles in a plain chroot -- no cross toolchain, no first-boot build step.
 if [[ -f $HERE/draw-helper.c ]]; then
     say "compiling the draw helper in the guest toolchain"
     install -D -m 0644 "$HERE/draw-helper.c" "$ROOT/tmp/draw-helper.c"
@@ -119,6 +119,13 @@ gzip -9 -n -c "$WORK/initramfs.cpio" > "$WORK/initramfs.gz"
     echo "arch          $ARCH"
     echo "kernel        $KVER"
     echo "bootstrap     $APK_PKG $KEYS_PKG"
+    # The files this script installs from tests/guest, so that changing one
+    # makes a cached image stale rather than silently keeping the old copy.
+    for f in init xorg.conf draw-helper.c; do
+        if [[ -f $HERE/$f ]]; then
+            printf 'input         %s %s\n' "$f" "$(sha256sum < "$HERE/$f" | cut -c1-16)"
+        fi
+    done
     echo "---"
     unshare -Ur "$APK" --root "$ROOT" list --installed 2>/dev/null \
         | awk '{print $1}' | LC_ALL=C sort

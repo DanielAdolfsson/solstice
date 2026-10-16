@@ -26,6 +26,7 @@
 //! not a key exchange, so without TLS the display, the keystrokes and the
 //! clipboard are all in the clear.
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -41,7 +42,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::agent::{clipboard_type, ClipboardType};
 use crate::channel::{self, ChannelReader, OutMessage};
-use crate::display::{self, DisplayChannel, DisplayEvent, DisplayLimits};
+use crate::display::{self, DisplayChannel, DisplayCounts, DisplayEvent, DisplayLimits};
 use crate::error::{Result, SpiceError};
 use crate::inputs::{InputState, MouseMode};
 use crate::link::{self, LinkRequest, Transport};
@@ -97,6 +98,10 @@ pub struct SpiceConfig {
     pub limits: DisplayLimits,
     /// Whether to open the playback channel.
     pub audio: bool,
+    /// An `image_compression` to ask the server for. `None` leaves the
+    /// server's own `image-compression=` in force, which is what `spice-gtk`
+    /// does by default; a preference replaces it outright.
+    pub preferred_compression: Option<u8>,
 }
 
 impl Default for SpiceConfig {
@@ -113,6 +118,7 @@ impl Default for SpiceConfig {
             },
             limits: DisplayLimits::default(),
             audio: true,
+            preferred_compression: None,
         }
     }
 }
@@ -433,6 +439,7 @@ async fn connect_inner(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<S
     let (display_events, display_rx) = mpsc::channel::<DisplayEvent>(512);
     let (display_out, display_out_rx) = mpsc::channel::<OutMessage>(256);
     let dimensions;
+    let counts;
     if available(channel_type::DISPLAY) {
         let (stream, mini) = link_channel(
             dialer.as_ref(),
@@ -449,8 +456,10 @@ async fn connect_inner(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<S
             events.clone(),
             display_out.clone(),
             config.limits,
-        );
+        )
+        .with_preferred_compression(config.preferred_compression);
         dimensions = display.dimensions_handle();
+        counts = display.counts_handle();
         tokio::spawn(display::reader_task(
             ChannelReader::new(rx, mini, display_out.clone(), "display"),
             display_events.clone(),
@@ -561,6 +570,7 @@ async fn connect_inner(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<S
         inputs_out,
         input,
         dimensions,
+        counts,
         connected,
         audio: Mutex::new(audio),
     };
@@ -762,6 +772,7 @@ pub struct SpiceSession {
     inputs_out: mpsc::Sender<OutMessage>,
     input: Arc<Mutex<InputState>>,
     dimensions: Arc<AtomicU64>,
+    counts: Arc<DisplayCounts>,
     connected: Arc<AtomicBool>,
     audio: Mutex<Option<mpsc::Receiver<AudioFrame>>>,
 }
@@ -777,6 +788,21 @@ impl std::fmt::Debug for SpiceSession {
 }
 
 impl SpiceSession {
+    /// How many of each draw command the display channel has executed,
+    /// keyed by `display_msg` number; kinds never seen are absent.
+    ///
+    /// For tests and logs: this is what turns "the guest drew a line" into
+    /// "a `DRAW_STROKE` arrived and was executed" (`docs/roadmap.md` §2.7).
+    pub fn draw_counts(&self) -> BTreeMap<u16, u64> {
+        self.counts.draws()
+    }
+
+    /// How many images of each encoding the display channel has decoded,
+    /// keyed by `image_type` number. Cache hits count as `FROM_CACHE`.
+    pub fn image_counts(&self) -> BTreeMap<u8, u64> {
+        self.counts.images()
+    }
+
     /// The pointer representation in force, for tests and logs.
     pub fn mouse_mode(&self) -> MouseMode {
         self.input.lock().expect("input lock").mode()

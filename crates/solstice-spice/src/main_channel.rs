@@ -173,6 +173,17 @@ impl MainChannel {
                 let current = r.u16()? as u32;
                 self.supported_modes = supported;
                 self.set_mouse_mode(current, &mut outcomes);
+                // Client mode becomes *possible* when the guest agent
+                // attaches, and that is announced here rather than in
+                // `MAIN_INIT` whenever the agent comes up after this client
+                // did: a guest still booting, or one whose agent restarted.
+                // Asking only at `INIT` left those sessions in server mode
+                // for good, sending relative deltas a tablet-only guest
+                // drops. `spice-gtk` re-asks on every `MOUSE_MODE` for the
+                // same reason (`channel-main.c`, `set_mouse_mode`).
+                if supported & mouse_mode::CLIENT != 0 && current & mouse_mode::CLIENT == 0 {
+                    send.push(mouse_mode_request(mouse_mode::CLIENT));
+                }
             }
 
             main_msg::MULTI_MEDIA_TIME => {
@@ -426,6 +437,37 @@ mod tests {
         assert_eq!(request.body, (mouse_mode::CLIENT as u16).to_le_bytes());
         // ...but the mode in force is still the one the server reported.
         assert_eq!(main.mouse_mode(), MouseMode::Server);
+    }
+
+    #[test]
+    fn client_mouse_mode_is_asked_for_when_it_becomes_available_after_init() {
+        let mut main = MainChannel::new();
+        let (send, _) = main
+            .handle(
+                main_msg::INIT,
+                &init_body(0, mouse_mode::SERVER, mouse_mode::SERVER),
+            )
+            .unwrap();
+        assert!(!send.iter().any(|m| m.kind == main_msgc::MOUSE_MODE_REQUEST));
+
+        // The agent attaches: the server now offers client mode.
+        let mut w = Writer::new();
+        w.u16((mouse_mode::SERVER | mouse_mode::CLIENT) as u16)
+            .u16(mouse_mode::SERVER as u16);
+        let (send, _) = main.handle(main_msg::MOUSE_MODE, &w.finish()).unwrap();
+        let request = send
+            .iter()
+            .find(|m| m.kind == main_msgc::MOUSE_MODE_REQUEST)
+            .expect("client mode became available and should have been asked for");
+        assert_eq!(request.body, (mouse_mode::CLIENT as u16).to_le_bytes());
+
+        // Granted: nothing more to ask for.
+        let mut w = Writer::new();
+        w.u16((mouse_mode::SERVER | mouse_mode::CLIENT) as u16)
+            .u16(mouse_mode::CLIENT as u16);
+        let (send, _) = main.handle(main_msg::MOUSE_MODE, &w.finish()).unwrap();
+        assert!(!send.iter().any(|m| m.kind == main_msgc::MOUSE_MODE_REQUEST));
+        assert_eq!(main.mouse_mode(), MouseMode::Client);
     }
 
     #[test]

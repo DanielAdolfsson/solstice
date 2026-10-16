@@ -153,7 +153,7 @@ RFB has no audio. SPICE has Opus on the playback channel.
 | Backend | Plan |
 |---|---|
 | None / RFB | Send Opus silence at the negotiated `packetDuration`. Cheap, keeps the client happy, avoids the "no audio stream" edge cases. |
-| SPICE with Opus | Potentially repacketise without transcoding — see `spice-protocol.md` §7. Verify frame duration and channel layout line up before relying on it. |
+| SPICE with Opus | Repacketise when the client asked for 10 ms stereo, which is what `spice-server` sends; transcode otherwise, which with Moonlight's default of 5 ms is the common case. Measured — see `spice-protocol.md` §7. |
 | SPICE with CELT | Decode and re-encode, or fall back to silence. |
 
 Either way the audio path is: Opus packet → RTP(pt 97) → optional AES-CBC →
