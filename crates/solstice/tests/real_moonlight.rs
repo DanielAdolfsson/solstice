@@ -601,7 +601,7 @@ async fn revoking_the_client_ends_its_running_stream() {
     config.limits.max_fps = FPS;
 
     let backend = Arc::new(TestPatternBackend::new(WIDTH, HEIGHT, FPS));
-    let (host, state_dir) = start_daemon_with(config, "mlc-revoke", backend.clone());
+    let (host, state_dir) = start_daemon_with(config, "mlc-revoke", backend);
     tokio::time::sleep(Duration::from_millis(300)).await;
     let launched = pair_and_launch(PORTS).await;
 
@@ -610,36 +610,77 @@ async fn revoking_the_client_ends_its_running_stream() {
         .arg("frames=1")
         .arg(format!("hold={HOLD}"))
         .arg(format!("timeout={}", HOLD + 30));
-    let probe_run =
-        tokio::task::spawn_blocking(move || command.output().expect("failed to run mlc-probe"));
+    let mut child = tokio::process::Command::from(command)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to run mlc-probe");
 
-    // Input on the backend means the stream is up and frames have arrived.
-    let up = tokio::time::timeout(Duration::from_secs(30), async {
-        while backend.received_input().is_empty() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    // The probe's own report of a decoded frame is what "up" means. Input on
+    // the backend would be a weaker signal: the probe sends it once, and the
+    // loss script can drop it.
+    let (first_frame, up) = tokio::sync::oneshot::channel();
+    let stdout_reader = tokio::spawn({
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut first_frame = Some(first_frame);
+        async move {
+            let mut all = String::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.starts_with("PROBE frame ") {
+                    if let Some(tx) = first_frame.take() {
+                        let _ = tx.send(());
+                    }
+                }
+                all.push_str(&line);
+                all.push('\n');
+            }
+            all
         }
-    })
-    .await;
-    assert!(up.is_ok(), "the stream never came up");
+    });
+    let stderr_reader = tokio::spawn({
+        use tokio::io::AsyncReadExt;
+        let mut stderr = child.stderr.take().unwrap();
+        async move {
+            let mut all = String::new();
+            let _ = stderr.read_to_string(&mut all).await;
+            all
+        }
+    });
+    if !matches!(
+        tokio::time::timeout(Duration::from_secs(30), up).await,
+        Ok(Ok(()))
+    ) {
+        let _ = child.kill().await;
+        panic!(
+            "the stream never came up; the probe said:\n{}\n{}",
+            stdout_reader.await.unwrap(),
+            stderr_reader.await.unwrap()
+        );
+    }
+
+    // Revoke a stream that is running, not one still being set up: the
+    // host's half of the ENet handshake can finish after the first frame, and
+    // under the loss script that can take a retransmission or two.
+    // `net/control.rs` covers a revocation inside that window.
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // The same call the management socket's `revoke` makes; `management.rs`
     // drives that path with the real binary.
     let revoked_at = std::time::Instant::now();
     assert!(host.revoke(launched.client.cert_der()));
 
-    let output = tokio::time::timeout(PROMPT * 3, probe_run)
+    tokio::time::timeout(PROMPT * 3, child.wait())
         .await
         .expect("the client was still streaming long after the revoke")
         .unwrap();
     let ended_after = revoked_at.elapsed();
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stdout = stdout_reader.await.unwrap();
     let report = parse_probe_output(&stdout);
     if std::env::var("MLC_DEBUG").is_ok() || ended_after >= PROMPT {
         eprintln!("--- mlc-probe stdout ---\n{stdout}");
-        eprintln!(
-            "--- mlc-probe stderr ---\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        eprintln!("--- mlc-probe stderr ---\n{}", stderr_reader.await.unwrap());
     }
     eprintln!("revoked; the client stopped after {ended_after:?}");
 

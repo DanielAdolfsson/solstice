@@ -67,7 +67,8 @@ pub enum ControlEvent {
 /// Blocking, so it belongs on its own thread. Whatever `outgoing` carries is
 /// sent before `running` is next looked at, so a message queued just before
 /// stopping still goes out, and the thread lingers (up to [`LINGER`]) until
-/// the client has acknowledged it.
+/// the client has acknowledged it -- or, if the handshake has not finished,
+/// until it has and the message could be sent.
 pub fn run(
     socket: UdpSocket,
     key: Option<[u8; 16]>,
@@ -88,14 +89,26 @@ pub fn run(
     let mut buf = vec![0u8; MAXIMUM_MTU as usize + 1];
     let mut reported = host.stats();
     let mut stopping_since: Option<Instant> = None;
+    // Held until the peer is connected. The stream can be up before the host's
+    // side of the handshake is: video flows once the client has pinged, while
+    // the acknowledgement of `VERIFY_CONNECT` may still be in a retransmit.
+    let mut pending = std::collections::VecDeque::new();
     let result = loop {
-        while let Ok(message) = outgoing.try_recv() {
-            send(&mut host, &mut codec, message);
+        pending.extend(outgoing.try_iter());
+        if host.is_connected() {
+            while let Some(message) = pending.pop_front() {
+                send(&mut host, &mut codec, message);
+            }
         }
         transmit(&socket, &mut host);
         if !running.load(Ordering::Relaxed) {
             let since = *stopping_since.get_or_insert_with(Instant::now);
-            if !host.is_connected() || host.unacknowledged() == 0 || since.elapsed() >= LINGER {
+            let delivered =
+                pending.is_empty() && (!host.is_connected() || host.unacknowledged() == 0);
+            if delivered || since.elapsed() >= LINGER {
+                if !pending.is_empty() {
+                    tracing::warn!(?pending, "the control peer never connected to be told");
+                }
                 break Ok(());
             }
         }
@@ -321,6 +334,47 @@ mod tests {
         assert_eq!(received.0, msg::TERMINATION);
         assert_eq!(received.1, 0x8003_0023u32.to_be_bytes());
         join_within(host.thread, LINGER / 2);
+    }
+
+    /// The host's half of the handshake can finish after the stream is up. A
+    /// `TERMINATION` asked for before then waits for it rather than being
+    /// refused for want of a peer.
+    #[test]
+    fn a_termination_asked_for_before_the_handshake_waits_for_it() {
+        let host = start();
+        host.outgoing
+            .send(Outgoing::Terminate(TERMINATED_CLOSED))
+            .unwrap();
+        host.running.store(false, Ordering::Relaxed);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut client = rusty_enet::Host::new(
+            socket,
+            rusty_enet::HostSettings {
+                peer_limit: 1,
+                channel_limit: 0x30,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        client.connect(host.address, 0x30, CONNECT_DATA).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let received = loop {
+            assert!(Instant::now() < deadline, "no TERMINATION arrived");
+            match client.service().unwrap().map(|e| e.no_ref()) {
+                Some(rusty_enet::EventNoRef::Receive { packet, peer, .. }) => {
+                    let message = open(packet.data());
+                    client.peer_mut(peer).disconnect_now(0);
+                    break message;
+                }
+                Some(rusty_enet::EventNoRef::Disconnect { .. }) => {
+                    panic!("disconnected before the TERMINATION arrived")
+                }
+                _ => std::thread::sleep(Duration::from_millis(1)),
+            }
+        };
+        assert_eq!(received.0, msg::TERMINATION);
+        join_within(host.thread, LINGER);
     }
 
     /// A client that has already gone cannot acknowledge anything, and must

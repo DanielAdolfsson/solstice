@@ -125,6 +125,14 @@ impl Supervisor {
             "solstice is up"
         );
 
+        // Every stream binds the same fixed ports, so one must have let go of
+        // them before the next binds. A client that relaunches straight after
+        // a `TERMINATION` arrives while the old stream is still lingering for
+        // its acknowledgement; without this it got `EADDRINUSE`. With it, the
+        // new stream waits a moment, and the client retries its `CONNECT`
+        // meanwhile.
+        let ports_free = Arc::new(tokio::sync::Mutex::new(()));
+
         while let Some(negotiated) = negotiated_rx.recv().await {
             let session_key = {
                 let sessions = self.host.sessions.lock().expect("session lock");
@@ -148,8 +156,10 @@ impl Supervisor {
             let config = self.config.clone();
             let backend = self.backend.clone();
             let host = self.host.clone();
+            let ports_free = ports_free.clone();
             tokio::spawn(async move {
                 let session_id = negotiated.session_id;
+                let _ports = ports_free.lock().await;
                 let result = run_stream(
                     config,
                     backend,

@@ -846,8 +846,19 @@ The details came from the reference client, not from Sunshine:
   what it was asked to send before it looks at its stop flag, then lingers
   until the client has acknowledged it. The linger is capped at a second, for
   a client that has already gone.
+- **The stream can be up before the host's half of the handshake is.** Video
+  starts once the client has seen `VERIFY_CONNECT`. The host counts the peer
+  connected only when the client's acknowledgement of it arrives, and under
+  loss that can be a retransmission later. A `TERMINATION` asked for in that
+  gap is held until the peer connects, inside the same one-second cap, rather
+  than refused.
 - **`/cancel` ends the stream too.** It is the client quitting the app, and
   Sunshine tears the stream down for it.
+- **One stream at a time holds the ports.** Every stream binds the same
+  fixed ports, so a client that relaunches straight after a `TERMINATION`
+  used to arrive while the old stream was still lingering, and got
+  `EADDRINUSE`. A new stream now waits for the previous one to let go, and
+  the client retries its `CONNECT` meanwhile.
 
 `security.pairing_enabled` went with it. The window was always the switch,
 and the key never did anything. It is still accepted, and warned about, so
@@ -855,18 +866,23 @@ that a configuration copied from an older example keeps loading under
 `deny_unknown_fields`.
 
 Tested at three levels. `nvhttp` unit tests check that the signal changes on
-revoke and on `/cancel`, and only for the client that had a session. Three
-tests in `net/control.rs` drive the control thread over a real socket with
-`rusty_enet` as the client. One hangs up on `TERMINATION` the way Moonlight
-does and checks it arrived before any disconnect. One shows that a vanished
-client holds the thread for no more than the linger. The third shows that
-stopping with nothing outstanding does not linger at all. Then
-`revoking_the_client_ends_its_running_stream` in `real_moonlight.rs` revokes
-the reference client mid-stream. `moonlight-common-c` reports a graceful
-termination about 200 ms later. A newly paired client then streams from the
-same daemon.
+revoke and on `/cancel`, and only for the client that had a session. Four
+tests in `net/control.rs` drive the control thread over a real socket, with
+`rusty_enet` as the client:
 
-**Two things it found**, both older than this change:
+- a client that hangs up on `TERMINATION`, as Moonlight does, receives it
+  before any disconnect;
+- a `TERMINATION` asked for before the handshake waits for it;
+- a vanished client holds the thread for no longer than the linger;
+- stopping with nothing outstanding does not linger at all.
+
+Then `revoking_the_client_ends_its_running_stream` in `real_moonlight.rs`
+revokes the reference client mid-stream. `moonlight-common-c` reports a
+graceful termination about 200 ms later, and a newly paired client then
+streams from the same daemon. `tests/tools/control-loss.sh 40 revoke` runs
+the same test with 40% loss on the control port.
+
+**Three things it found**, all older than this change:
 
 - **A daemon could serve one stream in its lifetime.** The audio task was
   spawned detached and looped until a send failed, which on UDP is never. So
@@ -877,9 +893,30 @@ same daemon.
   return, such as a client that never sent its video ping, left the thread's
   stop flag set to run, and the thread held the control port for good. A
   guard now clears the flag on every return.
+- **Audio FEC parity was computed over the wrong bytes.** The host's parity
+  covered each whole datagram, RTP header included. The client takes a data
+  shard to be the payload after the header (`completeFecBlock`:
+  `dataPackets[i] + 1`) and rebuilds a recovered packet's header from the
+  FEC header. So every parity shard was 12 bytes longer than the block it
+  protected. The client reads parity only once a data packet is missing,
+  which on loopback is almost never, so every session passed. The first time
+  one was lost, a release client switched audio FEC off for the session
+  ("Audio block size mismatch"), and the `LC_DEBUG` probe asserted. The
+  second client in the revocation test hit it. The captured session (§4)
+  had pinned the wrong parity byte for byte, so it was regenerated. The
+  replay now also recovers every captured block as the client lays it out,
+  a check the old capture fails.
 
 ### What is left
 
+- **Under heavy loss, a revocation early in a session can go untold.** At 40%
+  loss each way on the control port, the host's half of the ENet handshake
+  was sometimes still incomplete two seconds into a stream, because each
+  `VERIFY_CONNECT` round trip then succeeds about a third of the time.
+  Upstream ENet behaves the same. In 2 of 10 runs the one-second cap ran out
+  before the peer connected. The client was disconnected rather than told,
+  and stopped about 1.2 s after the revoke with code −1 instead of 0. At 20%
+  and 30% loss, 8 of 8 runs each were graceful.
 - **The peer-credential refusal is untested**: exercising it needs a second
   uid, which an unprivileged test cannot get.
 
@@ -1074,7 +1111,8 @@ each point with its reasoning:
   client's 24 datagrams through the new host. All 23 control messages come
   out, nothing is refused, and the acknowledgements match the old host's
   exactly. The `VERIFY_CONNECT` is byte for byte the one the client accepted
-  from `rusty_enet`.
+  from `rusty_enet`. That capture has since been replaced (§5) by one taken
+  against this host.
 - **Against the real client:** `real_moonlight.rs` passes unchanged. So does
   `tests/tools/control-loss.sh`, the same test with netem dropping 20%, 30%
   and 40% of datagrams on the control port alone. The test asserts that
@@ -1115,6 +1153,12 @@ against. The findings are about the old arrangement:
 - **Only `TERMINATION` is sent.** Its round trip through `Host::send` is
   checked against the real client (§5). Rumble and HDR mode have no source in
   either backend.
+- **At 40% loss the real-client test fails about a third of the time**, on
+  this host before §5 as well as after (6 of 10 at the §7 merge). The
+  failures are input not arriving within the test's window: the host drops a
+  client's data until its half of the handshake completes, which under that
+  much loss takes several retransmissions. One baseline run also hit the
+  audio FEC defect §5 fixed. 20% and 30% pass.
 - **The control-loss script is manual.** It belongs in the nightly loss tier
   (`docs/testing.md` §5) when there is one.
 
