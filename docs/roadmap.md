@@ -306,13 +306,14 @@ unprefixed framing in the direction they drive.
 
 **M7 — audio.** Opus packets are forwarded as `AudioFormat::Opus` rather than
 decoded, which is the repacketise-not-transcode path §7 of the protocol notes
-hoped for. Whether the *pipeline* can actually repacketise them still depends
-on the frame duration lining up with `x-nv-aqos.packetDuration`, which is a
-question for the pipeline and is not yet answered.
+hoped for. Whether the pipeline can pass them straight through is now
+answered, by measurement against a real guest: `spice-server` sends 10 ms
+stereo packets and Moonlight asks for 5 ms unless the client is slow or the
+stream is thin, so in the common case it cannot (§2.7).
 
 ### 2.4 How it is tested
 
-- **232 unit and mock tests** in the crate, plus the 88 in
+- **235 unit and mock tests** in the crate, plus the 88 in
   `solstice-spice-codec`.
 - **A mock server** (`mock.rs`, `tests/mock_server.rs`) that mints a real
   1024-bit RSA key and decrypts a real ticket, so the OAEP path is exercised
@@ -378,13 +379,15 @@ protocol, because the packaged `Xspice` launcher cannot start a
 | | |
 |---|---|
 | Link and session | the handshake, the RSA-OAEP ticket, capability negotiation, `MAIN_INIT`, `CHANNELS_LIST`, four channels, the ack window |
-| Display | surfaces, draw commands, incremental updates, every pixel of a repaint |
-| Image codecs | `off`, `quic`, `lz`, `glz`, `auto_glz`, each forced with `image-compression=`, each decoding to exactly the right colour across every pixel |
+| Display | surfaces, draw commands, incremental updates, every pixel of a repaint; lines, glyphs and an XOR stipple through the real QXL driver, each held against QEMU's own screendump pixel for pixel |
+| Image codecs | `off`, `quic`, `lz`, `glz`, `auto_glz`, each forced with `image-compression=`, and **counted**: each test asserts that the images it decoded after its repaint were of the forced kind, and that the screen equals QEMU's screendump |
+| GLZ over a long session | the soak in §2.7, on demand rather than per merge |
 | Video streams | `streaming-video=all`, MJPEG negotiated by `PREFERRED_VIDEO_CODEC_TYPE`, decoded and composited into a clipped sub-rectangle |
 | Input | pointer and keyboard reaching the guest, verified with `xev -root` as the oracle |
 | Mouse mode | client mode granted and in force **by a real `spice-vdagent`**; absolute positions land where they were sent |
 | The agent | `MONITORS_CONFIG` resize granted, applied by the guest, and the new geometry tracked back by the client (virtio-gpu; see `testing.md` §4.1) |
 | The clipboard | both directions through a real `spice-vdagent`: a guest `xclip` copy offered, requested and delivered byte for byte, and this client's offer requested by the guest, answered, pasted by `xclip -o`, then withdrawn so the paste stops finding an owner |
+| Audio | a tone from `speaker-test` arriving as Opus, 48 kHz stereo, every packet 10 ms by its TOC byte |
 
 Every test connects to a **black** screen, repaints it **while connected**,
 and asserts the pixels. That shape matters: a client that only ever sees the
@@ -425,6 +428,60 @@ bit, and `CLIPBOARD_SELECTION`, which this client does not announce. With
 that change, reintroducing the bug fails seven mock tests rather than none,
 which is the position the mock is supposed to be in.
 
+#### What counting found
+
+The session now reports how many of each draw command it has executed and of
+each image encoding it has decoded (`SpiceSession::draw_counts` and
+`image_counts`). The point was to close the first item of §2.7. The first run
+with the counts in place showed that two of the tests above had been passing
+without testing what they were named for, and the investigation that
+followed found two client bugs.
+
+1. **The codec sweep exercised no codec.** Every one of the five tests decoded
+   exactly one image, an `LZ_RGB`, whatever `image-compression=` it forced.
+   That image was the screen QEMU sends on connect. The repaint the test
+   asserted on arrives as a `DRAW_FILL`, which carries no image at all. The
+   tests now draw glyphs and a stipple after the repaint, which the QXL
+   driver sends as bitmaps, compare the screen with QEMU's screendump, and
+   assert that the images decoded *after the repaint* are the forced kind.
+2. **This client overrode the server's codec.** With the sweep fixed, `off`
+   and `quic` still decoded GLZ. `DISPLAY_INIT` was followed by an
+   unconditional `PREFERRED_COMPRESSION = AUTO_GLZ`, and `spice-server` does
+   not weigh that against its own configuration: it adopts it. So whatever
+   an operator gave QEMU, a Solstice session got GLZ. `spice-gtk` sends a
+   preference only if its user set one. This client now does the same:
+   `SpiceConfig::preferred_compression`, default `None`.
+3. **Client mouse mode was asked for once, too early.** It was requested only
+   in answer to `MAIN_INIT`, and only if the server already offered it then.
+   An agent that attaches later is announced in `MAIN_MOUSE_MODE` instead, and
+   the request never followed. That happens with any guest still booting or
+   any agent that restarts. The session then stayed in server mode for good,
+   sending relative motion that a tablet-only guest drops. Under TCG the
+   input test hit this every time. The client now asks again on every
+   `MOUSE_MODE` that offers client mode, as `spice-gtk`'s `set_mouse_mode`
+   does, and has a unit test for the late case.
+4. **`DRAW_STROKE`, `DRAW_TEXT` and `DRAW_ROP3` are not reachable from this
+   guest at all.** `solstice-draw stroke|text|rop3` was written to force them
+   out of the QXL driver, and the earlier claim that it did had only ever
+   been checked against the screendump. Counted, a 64-line stroke arrives as
+   about 480 one-pixel `DRAW_FILL`s and the glyphs and the stipple as
+   `DRAW_COPY`s. `xf86-video-qxl` accelerates fills, copies, composites and
+   uploads, and renders everything else in software first.
+   `core_x11_primitives_reach_the_screen_exactly_through_fills_and_copies`
+   now asserts what is true, and fails if one of the three ever does appear.
+
+One more was in the test harness rather than the client, and cost the most
+time, because it presents as a guest bug. With the counts in place a stroke
+took 57 seconds inside the guest and then delivered nothing. `#[tokio::test]`
+is single-threaded, and the `Guest` calls block the thread, so the whole
+SPICE client was frozen for as long as the guest command ran. A stroke is
+more messages than the server's ack window. `spice-server` stopped sending
+until it was acked, stopped draining the QXL ring while its pipe was full, and
+the X server blocked in `qxl_ring_push`, so the command never returned. After
+30 seconds without a pong the server dropped the client and everything came
+unstuck at once. Every test in `real_server.rs` is now multi-threaded, and the
+module comment says why.
+
 #### Running them
 
 The guest is built once and cached; the tests skip with a printed note when
@@ -433,7 +490,13 @@ it or QEMU is absent.
 ```sh
 ./tests/guest/build-image.sh
 cargo test -p solstice-spice --test real_server -- --test-threads=4
+# the GLZ soak, minutes long; SOLSTICE_GLZ_SOAK_ROUNDS lengthens it
+cargo test -p solstice-spice --test real_server -- --ignored glz_soak
 ```
+
+The SPICE tier needs QEMU's SPICE support, which Debian packages separately
+as `qemu-system-modules-spice`. Without it every test here skips, because
+`-spice` is not recognised.
 
 `docs/testing.md` §4.0 carries the part worth knowing before writing a new
 one: QEMU drops guest damage while no display client is attached, so a test
@@ -447,23 +510,41 @@ Smaller than it was. Each item says what would close it.
 All three agent items are now closed: resize, client-mode absolute mouse and
 the clipboard are each validated against a real `spice-vdagent` (§2.6).
 
-- **The QXL draw-command mix is reachable but not asserted.**
-  `DRAW_ROP3`, `DRAW_STROKE` and `DRAW_TEXT` had never been seen from any
-  real server, because `Xspice` renders through the frame buffer and emits
-  `DRAW_COPY` and `DRAW_FILL` for everything. The guest can now emit all
-  three on demand -- `solstice-draw stroke|text|rop3` drives the core X11
-  primitives straight through the QXL driver. What is missing is on our side:
-  the display channel keeps no record of which command kinds it has executed,
-  so a test can provoke them but cannot assert they arrived. A small counter
-  on `DisplayChannel`, exposed on the session, closes this.
-- **Audio.** The playback channel is unit-tested and the guest ships
-  `alsa-utils`, but the open question is not whether Opus arrives: it is
-  whether it can be **repacketised rather than transcoded**, which depends on
-  the frame duration matching `x-nv-aqos.packetDuration` -- a pipeline
-  question (`docs/spice-protocol.md` §7).
-- **A long GLZ soak.** The codec tests repaint once. GLZ's dictionary spans
-  the session and the bugs are in window management, which needs thousands of
-  images rather than one. A nightly job, not a merge gate.
+- **`DRAW_STROKE`, `DRAW_TEXT` and `DRAW_ROP3` have still never been seen
+  from a real server**, and the Linux guest cannot change that (§2.6, item
+  4). Their executors and the raster-operation mapping behind them are
+  unit-tested only. A Windows guest with the QXL display driver is the source
+  to try next. It is not known for certain to emit them either, so check
+  with the counts before building on it.
+- **Audio is measured, not yet wired.** `spice-server` sends Opus at 48 kHz
+  stereo in 10 ms packets. Moonlight asks for 5 ms by default and 10 ms only
+  for a slow decoder or a stream under 5 Mbit/s (`SdpGenerator.c`), and it
+  sizes its decoder buffer from that. So passing packets through works only
+  when the client asked for 10 ms. The default needs a decode and re-encode,
+  and so does surround. Meanwhile the supervisor sends Opus silence
+  whatever the backend, so none of this reaches a client yet. Wiring it in
+  means an Opus decoder and encoder in the tree, and that is the actual
+  remaining work.
+- **The GLZ soak exists, and nothing runs it on a schedule.**
+  `glz_soak_keeps_the_screen_exact_across_thousands_of_images` repaints with
+  changing content and compares the screen with QEMU's screendump every
+  twenty rounds. It has run clean for 3,000 rounds: 36,000 GLZ images and
+  25.6 million fills over 46 minutes, with the screen exact at every check.
+  Nothing has yet been found wrong in the GLZ window itself.
+- **The soak sometimes stalls, and the cause is not found.** Three of five
+  runs, after the runtime fix in §2.6, stalled a few minutes in. Each time a
+  guest command hung because its X server was blocked on a full QXL ring.
+  The client's runtime was alive (a task printing its counters kept
+  printing), but the session received nothing more. QEMU's threads were
+  all idle, and the SPICE worker was waiting in its poll loop, which is what
+  it does when it is waiting on a client's `ACK` or socket. That points at the
+  join between this client's display channel and the server. Candidates
+  include an `ACK` dropped by `try_send` on a full queue, or a task parked
+  somewhere unexpected. It is not certain the harness is innocent either.
+  **Until it is explained, treat it as able to hang a real session.** What
+  closes it: a backtrace of the test process at the moment of a stall.
+  `gdb -p` works on this box. One capture caught QEMU's side but attached to
+  the wrong process for the client.
 - **Nothing is tuned.** The rasteriser's inner loops are per-pixel closures.
   A debug build keeps up with a scrolling terminal over MJPEG; nothing
   heavier has been measured, and it should be measured against a real frame

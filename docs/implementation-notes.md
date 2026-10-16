@@ -325,16 +325,17 @@ independent 80-line Python SPICE client was what settled it — and that is the
 general lesson, because the same symptom had three plausible causes on the
 client side and one on the server's.
 
-Neither of the things `Xspice` could not reach is out of reach now. A real
-`spice-vdagent` answers in the QEMU guest, and `solstice-draw` drives the
-core X11 primitives through a real QXL driver, so `DRAW_ROP3`, `DRAW_STROKE`
-and `DRAW_TEXT` can be provoked at will. What is still missing is the other
-half of that test: the display channel keeps no record of which command
-kinds it has executed, so they can be sent but not yet asserted. Until then
-the raster-operation mapping behind them — `ropd_descriptor_to_rop`,
-transcribed from C that exists nowhere else — has only its transcription and
-a unit test for an oracle. The ROP3 truth table at least has `rop3.c`'s own
-self-test constants, reproduced as a test over all 256 opcodes.
+One of the two things `Xspice` could not reach is reachable now: a real
+`spice-vdagent` answers in the QEMU guest. The other turned out not to be. The
+plan was for `solstice-draw` to provoke `DRAW_ROP3`, `DRAW_STROKE` and
+`DRAW_TEXT` through a real QXL driver, but once the session could count the
+commands it executed, the count said the Linux driver never sends them:
+`xf86-video-qxl` accelerates fills, copies, composites and uploads, and draws
+everything else in software. So the raster-operation mapping behind those
+three — `ropd_descriptor_to_rop`, transcribed from C that exists nowhere
+else — still has only its transcription and a unit test for an oracle. The
+ROP3 truth table at least has `rop3.c`'s own self-test constants, reproduced
+as a test over all 256 opcodes. A Windows guest is the remaining route.
 `docs/roadmap.md` §2.7.
 
 ### The whole path is tested, but only against one real server

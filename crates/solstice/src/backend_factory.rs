@@ -93,6 +93,9 @@ pub fn build(config: &Config) -> Result<Arc<dyn Backend>, FactoryError> {
                     security,
                     limits: Default::default(),
                     audio: spice.audio,
+                    // The operator configured QEMU's `image-compression=`;
+                    // a preference from here would silently replace it.
+                    preferred_compression: None,
                 },
             )))
         }

@@ -37,6 +37,7 @@ pub mod stream;
 pub mod surface;
 pub mod types;
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -51,7 +52,7 @@ use crate::display::stream::StreamSet;
 use crate::display::surface::{Surface, SurfaceSet};
 use crate::display::types::{Clip, SpiceRect};
 use crate::error::{Result, SpiceError};
-use crate::protocol::{display_msg, display_msgc, image_compression, surface_fmt, video_codec};
+use crate::protocol::{display_msg, display_msgc, image_type, surface_fmt, video_codec};
 use crate::wire::{Reader, Writer};
 
 /// Something for the display task to act on.
@@ -89,6 +90,95 @@ impl Default for DisplayLimits {
     }
 }
 
+/// Every message [`commands::execute`] runs, in the order `enums.h` numbers
+/// them.
+const DRAW_KINDS: [u16; 13] = [
+    display_msg::COPY_BITS,
+    display_msg::DRAW_FILL,
+    display_msg::DRAW_OPAQUE,
+    display_msg::DRAW_COPY,
+    display_msg::DRAW_BLEND,
+    display_msg::DRAW_BLACKNESS,
+    display_msg::DRAW_WHITENESS,
+    display_msg::DRAW_INVERS,
+    display_msg::DRAW_ROP3,
+    display_msg::DRAW_STROKE,
+    display_msg::DRAW_TEXT,
+    display_msg::DRAW_TRANSPARENT,
+    display_msg::DRAW_ALPHA_BLEND,
+];
+
+/// Every image encoding [`image::ImageDecoder`] can be handed, by
+/// `image_type` number.
+const IMAGE_KINDS: [u8; 12] = [
+    image_type::BITMAP,
+    image_type::QUIC,
+    image_type::LZ_PLT,
+    image_type::LZ_RGB,
+    image_type::GLZ_RGB,
+    image_type::FROM_CACHE,
+    image_type::SURFACE,
+    image_type::JPEG,
+    image_type::FROM_CACHE_LOSSLESS,
+    image_type::ZLIB_GLZ_RGB,
+    image_type::JPEG_ALPHA,
+    image_type::LZ4,
+];
+
+/// How many of each draw command the display channel has executed, and how
+/// many of each image encoding it has decoded.
+///
+/// A test can make a guest *emit* `DRAW_STROKE`, but without this it cannot
+/// tell whether one arrived: a correct screen is equally consistent with the
+/// server having rasterised the line itself and sent a `DRAW_COPY` of the
+/// result. The same goes for images -- a soak that means to exercise GLZ's
+/// window has to know that GLZ is what it got. Counted only on success, so a
+/// command or image that was received and then dropped as undecodable does
+/// not count as covered.
+///
+/// One atomic per kind rather than a map behind a lock, because the display
+/// task bumps it once per command and a full-screen redraw is hundreds.
+#[derive(Debug, Default)]
+pub struct DisplayCounts {
+    draws: [AtomicU64; DRAW_KINDS.len()],
+    images: [AtomicU64; IMAGE_KINDS.len()],
+}
+
+impl DisplayCounts {
+    fn record_draw(&self, kind: u16) {
+        if let Some(i) = DRAW_KINDS.iter().position(|&k| k == kind) {
+            self.draws[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_image(&self, kind: u8) {
+        if let Some(i) = IMAGE_KINDS.iter().position(|&k| k == kind) {
+            self.images[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The draw commands executed at least once, keyed by `display_msg`
+    /// number.
+    pub fn draws(&self) -> BTreeMap<u16, u64> {
+        snapshot(&DRAW_KINDS, &self.draws)
+    }
+
+    /// The image encodings decoded at least once, keyed by `image_type`
+    /// number.
+    pub fn images(&self) -> BTreeMap<u8, u64> {
+        snapshot(&IMAGE_KINDS, &self.images)
+    }
+}
+
+fn snapshot<K: Copy + Ord>(kinds: &[K], counts: &[AtomicU64]) -> BTreeMap<K, u64> {
+    kinds
+        .iter()
+        .zip(counts)
+        .map(|(&kind, count)| (kind, count.load(Ordering::Relaxed)))
+        .filter(|&(_, count)| count > 0)
+        .collect()
+}
+
 /// The display channel's state.
 pub struct DisplayChannel {
     surfaces: SurfaceSet,
@@ -107,6 +197,12 @@ pub struct DisplayChannel {
     /// The primary surface's size, packed, for the session to read without
     /// taking the framebuffer lock the encoder is holding.
     dimensions: Arc<AtomicU64>,
+    /// The `image_compression` to ask the server for, if any; see
+    /// [`DisplayChannel::init_messages`].
+    preferred_compression: Option<u8>,
+    /// What has been executed and decoded; see [`DisplayCounts`]. Shared
+    /// with the image decoder, which counts the images.
+    counts: Arc<DisplayCounts>,
     /// Whether the server has said the primary surface is worth showing.
     ///
     /// `DISPLAY_MARK` is the server saying the surface has been filled in.
@@ -124,9 +220,12 @@ impl DisplayChannel {
         outgoing: mpsc::Sender<OutMessage>,
         limits: DisplayLimits,
     ) -> Self {
+        let images = ImageDecoder::new(limits.codec, limits.pixmap_cache_bytes);
         DisplayChannel {
             surfaces: SurfaceSet::new(),
-            images: ImageDecoder::new(limits.codec, limits.pixmap_cache_bytes),
+            counts: images.counts(),
+            images,
+            preferred_compression: None,
             streams: StreamSet::new(),
             cursor: CursorState::default(),
             fb,
@@ -149,6 +248,18 @@ impl DisplayChannel {
         self.dimensions.clone()
     }
 
+    /// Ask the server for one `image_compression` rather than leaving its
+    /// configuration alone. `None`, the default, sends no preference.
+    pub fn with_preferred_compression(mut self, preferred: Option<u8>) -> Self {
+        self.preferred_compression = preferred;
+        self
+    }
+
+    /// A handle to the counts of what has been executed and decoded.
+    pub fn counts_handle(&self) -> Arc<DisplayCounts> {
+        self.counts.clone()
+    }
+
     /// The messages to send as soon as the channel is up.
     ///
     /// `DISPLAY_INIT` declares the pixmap cache and the GLZ window **in
@@ -164,16 +275,21 @@ impl DisplayChannel {
             .u32((self.limits.codec.glz_window_bytes / 4) as u32);
         out.push(OutMessage::new(display_msgc::INIT, init.finish()));
 
-        // Ask for the cheapest thing to decode that is still lossless. The
-        // server is free to ignore it -- `PREFERRED_COMPRESSION` is a hint,
-        // not a contract -- which is why all of QUIC, LZ and GLZ are
-        // implemented anyway (`docs/spice-protocol.md` §5.1).
-        let mut compression = Writer::new();
-        compression.u8(image_compression::AUTO_GLZ);
-        out.push(OutMessage::new(
-            display_msgc::PREFERRED_COMPRESSION,
-            compression.finish(),
-        ));
+        // Only when asked. `PREFERRED_COMPRESSION` is not a hint the server
+        // weighs against its own configuration: `spice-server` adopts it
+        // outright, so sending one overrides whatever `image-compression=`
+        // the operator gave QEMU. `spice-gtk` sends nothing unless its user
+        // set a preference, and this client follows it. (This used to send
+        // `AUTO_GLZ` unconditionally, which is also how the real-server codec
+        // sweep came to exercise GLZ under every name it forced.)
+        if let Some(preferred) = self.preferred_compression {
+            let mut compression = Writer::new();
+            compression.u8(preferred);
+            out.push(OutMessage::new(
+                display_msgc::PREFERRED_COMPRESSION,
+                compression.finish(),
+            ));
+        }
 
         // MJPEG is the only stream codec with a pure-Rust decoder in the
         // tree, and the frames are re-encoded immediately anyway; see
@@ -372,6 +488,7 @@ impl DisplayChannel {
             | display_msg::DRAW_ALPHA_BLEND
             | display_msg::COPY_BITS => {
                 let damage = commands::execute(kind, body, &mut self.surfaces, &mut self.images)?;
+                self.counts.record_draw(kind);
                 if let Some(damage) = damage {
                     self.marked = true;
                     self.accumulate(damage.surface_id, damage.rect);
@@ -854,6 +971,30 @@ mod tests {
     }
 
     #[test]
+    fn no_compression_is_preferred_unless_one_was_asked_for() {
+        let (display, _, _) = channel();
+        assert!(
+            !display
+                .init_messages()
+                .iter()
+                .any(|m| m.kind == display_msgc::PREFERRED_COMPRESSION),
+            "a preference overrides the server's own image-compression="
+        );
+
+        let display =
+            display.with_preferred_compression(Some(crate::protocol::image_compression::QUIC));
+        let preferred = display
+            .init_messages()
+            .into_iter()
+            .find(|m| m.kind == display_msgc::PREFERRED_COMPRESSION)
+            .expect("an explicit preference should be sent");
+        assert_eq!(
+            preferred.body,
+            vec![crate::protocol::image_compression::QUIC]
+        );
+    }
+
+    #[test]
     fn a_primary_surface_resizes_the_framebuffer_and_says_so() {
         let (mut display, mut events, _) = channel();
         display
@@ -1133,8 +1274,29 @@ mod tests {
     }
 
     #[test]
+    fn executed_draw_commands_are_counted_by_kind() {
+        let (mut display, _, _) = channel();
+        let counts = display.counts_handle();
+        display
+            .handle(DisplayEvent::Message(surface_create(0, 8, 8, true)))
+            .unwrap();
+        assert!(counts.draws().is_empty(), "a surface is not a draw");
+        for _ in 0..3 {
+            display
+                .handle(DisplayEvent::Message(fill(0, 0, 0, 4, 4, 0x00FF_0000)))
+                .unwrap();
+        }
+        assert_eq!(
+            counts.draws(),
+            BTreeMap::from([(display_msg::DRAW_FILL, 3)])
+        );
+        assert!(counts.images().is_empty(), "a solid fill carries no image");
+    }
+
+    #[test]
     fn an_undecodable_image_costs_one_command_rather_than_the_session() {
         let (mut display, _, _) = channel();
+        let counts = display.counts_handle();
         display
             .handle(DisplayEvent::Message(surface_create(0, 8, 8, true)))
             .unwrap();
@@ -1161,5 +1323,9 @@ mod tests {
                 body: w.finish(),
             }))
             .is_ok());
+        // Received and dropped is not executed: a test that relied on the
+        // count to prove a kind was covered would otherwise be fooled.
+        assert!(counts.draws().is_empty(), "{:?}", counts.draws());
+        assert!(counts.images().is_empty(), "{:?}", counts.images());
     }
 }

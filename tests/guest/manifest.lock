@@ -4,6 +4,9 @@ alpine-branch v3.24
 arch          x86_64
 kernel        6.18.56-0-virt
 bootstrap     apk-tools-static-3.0.8-r0.apk alpine-keys-2.6-r0.apk
+input         init 5b68124bd9f91cff
+input         xorg.conf 4140ef90fa9df23e
+input         draw-helper.c 8952f05cbad0e2a5
 ---
 alpine-base-3.24.2-r0
 alpine-baselayout-3.7.2-r1

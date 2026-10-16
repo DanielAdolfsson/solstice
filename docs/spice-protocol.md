@@ -273,10 +273,15 @@ cross-image history window), **JPEG**, **JPEG + LZ alpha**, **ZLIB-over-GLZ**,
 
 QUIC and GLZ were the problem: both are SPICE-specific, neither had a Rust
 implementation, and GLZ is *stateful across images* — a message cannot be
-decoded in isolation. A client can bias the server away from them with
-`PREFERRED_COMPRESSION` but cannot forbid them, and QEMU's default
+decoded in isolation. A client cannot forbid them, and QEMU's default
 `image-compression=auto_glz` picks between the two per image, so neither can
 be skipped for real use.
+
+`PREFERRED_COMPRESSION` is stronger than its name: `spice-server` adopts it
+outright, replacing the `image-compression=` QEMU was started with. A client
+that always sends one has overridden the operator. `spice-gtk` sends it only
+when its user set a preference, and `solstice-spice` does the same
+(`SpiceConfig::preferred_compression`, default `None`).
 
 **This is now `crates/solstice-spice-codec`** — QUIC, LZ and GLZ ported to
 Rust from `spice-common` and `spice-gtk`, verified against the real C encoders
@@ -371,8 +376,17 @@ bunches outstanding.
 This is a genuine advantage over RFB: GameStream's audio stream is Opus, so a
 SPICE Opus playback stream can in principle be **repacketised rather than
 transcoded**, provided the channel layout and frame duration line up with what
-the client requested in `x-nv-aqos.packetDuration`. Worth confirming
-experimentally before relying on it.
+the client requested in `x-nv-aqos.packetDuration`.
+
+**Confirmed experimentally, and the answer is "only sometimes".** QEMU 10.0
+with `spice-server` 0.15.2 sends Opus at 48 kHz stereo in **10 ms** packets,
+every one of them (`guest_audio_arrives_as_opus_packets_of_one_fixed_duration`
+reads each packet's TOC byte). Moonlight asks for 10 ms only for a client that
+declares a slow Opus decoder, or one that accepts arbitrary durations on a
+stream under 5 Mbit/s; everyone else gets **5 ms**
+(`moonlight-common-c` `SdpGenerator.c`). So the common case needs a decode
+and re-encode; repacketising is the fast path for the 10 ms case, and
+surround needs a transcode regardless, since SPICE's playback is stereo.
 
 ---
 

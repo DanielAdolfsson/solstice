@@ -197,6 +197,7 @@ pub struct ImageDecoder {
     pixmaps: PixmapCache,
     palettes: HashMap<u64, Palette>,
     limits: Limits,
+    counts: Arc<super::DisplayCounts>,
 }
 
 impl ImageDecoder {
@@ -212,7 +213,13 @@ impl ImageDecoder {
             pixmaps: PixmapCache::new(pixmap_cache_bytes),
             palettes: HashMap::new(),
             limits,
+            counts: Arc::default(),
         }
+    }
+
+    /// The counts this decoder records each decoded image into.
+    pub fn counts(&self) -> Arc<super::DisplayCounts> {
+        self.counts.clone()
     }
 
     /// Forget everything. Correct only on `DISPLAY_RESET`, where the server
@@ -283,15 +290,18 @@ impl ImageDecoder {
         };
 
         if matches!(image.body, ImageBody::FromCache) {
-            return self.pixmaps.get(image.descriptor.id).ok_or_else(|| {
+            let cached = self.pixmaps.get(image.descriptor.id).ok_or_else(|| {
                 SpiceError::protocol(format!(
                     "image {:#x} is not in the pixmap cache",
                     image.descriptor.id
                 ))
-            });
+            })?;
+            self.counts.record_image(image.descriptor.kind);
+            return Ok(cached);
         }
 
         let decoded = Arc::new(self.decode_body(image, body, &limits)?);
+        self.counts.record_image(image.descriptor.kind);
         if image.descriptor.cache_me() {
             self.pixmaps.insert(image.descriptor.id, decoded.clone());
         }

@@ -4,20 +4,23 @@
  * Two jobs.
  *
  * 1. `fill` is how every test paints a known colour. It exists instead of
- *    `xsetroot -solid` because of XSetCloseDownMode below, which xsetroot
+ *    `xsetroot -solid` because of XSetCloseDownMode in finish_retained, which xsetroot
  *    does not reliably apply on this X server: without it the server frees
  *    the client's state on disconnect and the root reverts to black the
  *    instant the painting process exits, so the assertion that follows reads
  *    stale pixels and the test fails for a reason that has nothing to do
  *    with Solstice.
  *
- * 2. `stroke`, `text` and `rop3` force the core-X11 primitives that
- *    `docs/roadmap.md` 2.7 records as never having been seen from any real
- *    server. The QXL driver turns them into SPICE_MSG_DISPLAY_DRAW_STROKE,
- *    _DRAW_TEXT and _DRAW_ROP3; Xspice renders through the frame buffer and
- *    emits DRAW_COPY and DRAW_FILL for everything, which is why this needs a
- *    real guest driver to reach at all. Deliberate and targeted -- x11perf
- *    would be a scattergun, and is not packaged for Alpine in any case.
+ * 2. `stroke`, `text` and `rop3` drive the core-X11 primitives. They were
+ *    written to force SPICE_MSG_DISPLAY_DRAW_STROKE, _DRAW_TEXT and
+ *    _DRAW_ROP3 out of the QXL driver, and they do not: xf86-video-qxl
+ *    accelerates only fills, copies, composites and uploads, so a line
+ *    arrives as one DRAW_FILL per span and glyphs and the XOR stipple as
+ *    DRAW_COPYs of the software-rendered result (docs/roadmap.md 2.7). They
+ *    stay because that output is still a demanding thing to reproduce
+ *    exactly, and the real-server tests hold it against QEMU's screendump.
+ *    Deliberate and targeted -- x11perf would be a scattergun, and is not
+ *    packaged for Alpine in any case.
  *
  * Built into the image by build-image.sh, in the guest's own toolchain.
  */
@@ -31,10 +34,25 @@ static Display *dpy;
 static Window   root;
 static int      W, H;
 
+/*
+ * Retain this client's server-side state past exit, as fill needs; see the
+ * comment above. RetainTemporary rather than RetainPermanent, and the
+ * previous holder killed first, which is xsetroot's own arrangement: each
+ * retained client counts against the X server's limit of 256 for good, so a
+ * soak that painted a few hundred times ran out of clients and every later
+ * XOpenDisplay failed with "Maximum number of clients reached".
+ */
+static void finish_retained(void)
+{
+    XKillClient(dpy, AllTemporary);
+    XSetCloseDownMode(dpy, RetainTemporary);
+    XSync(dpy, False);
+    XCloseDisplay(dpy);
+}
+
+/* The other primitives leave pixels behind, not state: nothing to retain. */
 static void finish(void)
 {
-    /* Retain this client's server-side state past exit; see the comment above. */
-    XSetCloseDownMode(dpy, RetainPermanent);
     XSync(dpy, False);
     XCloseDisplay(dpy);
 }
@@ -74,7 +92,7 @@ int main(int argc, char **argv)
         unsigned long c = strtoul(argv[2], NULL, 16);
         XSetWindowBackground(dpy, root, c);
         XClearWindow(dpy, root);
-        finish();
+        finish_retained();
         return 0;
     }
 
