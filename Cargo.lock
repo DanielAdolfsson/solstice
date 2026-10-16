@@ -1357,6 +1357,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "rustls-pki-types",
+ "rusty_enet",
  "serde",
  "serde_json",
  "solstice-backend",

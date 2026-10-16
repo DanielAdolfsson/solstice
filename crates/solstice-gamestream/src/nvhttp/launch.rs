@@ -135,10 +135,8 @@ pub fn cancel(host: &Host, ctx: &RequestContext) -> (u16, String) {
     if !host.is_paired(client_cert) {
         return (401, Root::error(401, "Not paired").render());
     }
-    let mut sessions = host.sessions.lock().expect("session lock");
-    let before = sessions.len();
-    sessions.retain(|s| s.client_cert_der != client_cert);
-    tracing::info!(closed = before - sessions.len(), "cancel");
+    let closed = host.end_sessions_of(client_cert);
+    tracing::info!(closed, "cancel");
     (200, Root::ok().child("cancel", 1).render())
 }
 

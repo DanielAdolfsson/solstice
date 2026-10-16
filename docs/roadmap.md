@@ -38,7 +38,7 @@ What is left is ordinary work.
 | 2 | [SPICE backend](#2-spice-backend) | **implemented and validated against a real QEMU guest**, agent and clipboard included (§2.6); what is left is in §2.7 | nothing |
 | 3 | [Validate against real Moonlight](#3-validate-against-real-moonlight) | **done** — a real `moonlight-common-c` client streams from this host; the eight defects it found are in §3 | nothing |
 | 4 | [Captured golden vectors](#4-captured-sunshine--moonlight-vectors) | **done** — a real session, frozen and replayed in CI; the two defects it found are in §4 | nothing |
-| 5 | [`solstice pair` management socket](#5-solstice-pair-and-a-management-socket) | **done** — `pair`, `status`, `list-clients` and `revoke` reach the running daemon; what is left is in §5 | nothing |
+| 5 | [`solstice pair` management socket](#5-solstice-pair-and-a-management-socket) | **done** — `pair`, `status`, `list-clients` and `revoke` reach the running daemon, and a revocation ends a stream already running; what is left is in §5 | nothing |
 | 6 | [The still-frame encode cost](#6-the-still-frame-encode-cost) | **done** — a still screen drops to a keep-alive rate, about 12× cheaper, and a real `moonlight-common-c` sits through it; what is left is in §6 | nothing |
 | 7 | [ENet: audit or reimplement](#7-enet-audit-or-reimplement) | **done** — reimplemented: the subset Moonlight uses, stricter than ENet before authentication, and held against upstream ENet under loss, the captured session and the real client; what is left is in §7 | nothing |
 | 8 | [Smaller items](#8-smaller-items) | varies | |
@@ -822,15 +822,101 @@ Telling a successful window from an expired one needed the pairing manager to
 remember its result (`PairingManager::paired`): Moonlight reuses its
 certificate, so a client re-pairing leaves the store looking unchanged.
 
+### Revocation ends a running stream
+
+`docs/security.md` §3.4 asks for revocation "with existing sessions torn
+down", and at first `Host::revoke` only removed the launch record. That
+stopped anything new from starting, but a stream already running went on. Now
+`Host` carries a signal that changes whenever a session is ended from outside
+its stream, by `revoke` or by `/cancel`. Each stream subscribes before it
+starts. When its launch record has gone, it sends the client a `TERMINATION`
+and stops.
+
+The details came from the reference client, not from Sunshine:
+
+- **On an encrypted stream, the type is `0x0109` with a four-byte big-endian
+  HRESULT** (`packetTypesGen7Enc`). The host sends
+  `NVST_DISCONN_SERVER_TERMINATED_CLOSED`, `0x80030023`. Once a frame has
+  arrived, Moonlight reports it as `ML_ERROR_GRACEFUL_TERMINATION`, so the
+  user sees the stream end rather than an error. Before the first frame it
+  reports an early termination instead.
+- **Moonlight hangs up the moment it reads one.** It calls
+  `enet_peer_disconnect_now` without waiting for anything. So the host's own
+  `DISCONNECT` must not overtake the `TERMINATION`: the control thread drains
+  what it was asked to send before it looks at its stop flag, then lingers
+  until the client has acknowledged it. The linger is capped at a second, for
+  a client that has already gone.
+- **The stream can be up before the host's half of the handshake is.** Video
+  starts once the client has seen `VERIFY_CONNECT`. The host counts the peer
+  connected only when the client's acknowledgement of it arrives, and under
+  loss that can be a retransmission later. A `TERMINATION` asked for in that
+  gap is held until the peer connects, inside the same one-second cap, rather
+  than refused.
+- **`/cancel` ends the stream too.** It is the client quitting the app, and
+  Sunshine tears the stream down for it.
+- **One stream at a time holds the ports.** Every stream binds the same
+  fixed ports, so a client that relaunches straight after a `TERMINATION`
+  used to arrive while the old stream was still lingering, and got
+  `EADDRINUSE`. A new stream now waits for the previous one to let go, and
+  the client retries its `CONNECT` meanwhile.
+
+`security.pairing_enabled` went with it. The window was always the switch,
+and the key never did anything. It is still accepted, and warned about, so
+that a configuration copied from an older example keeps loading under
+`deny_unknown_fields`.
+
+Tested at three levels. `nvhttp` unit tests check that the signal changes on
+revoke and on `/cancel`, and only for the client that had a session. Four
+tests in `net/control.rs` drive the control thread over a real socket, with
+`rusty_enet` as the client:
+
+- a client that hangs up on `TERMINATION`, as Moonlight does, receives it
+  before any disconnect;
+- a `TERMINATION` asked for before the handshake waits for it;
+- a vanished client holds the thread for no longer than the linger;
+- stopping with nothing outstanding does not linger at all.
+
+Then `revoking_the_client_ends_its_running_stream` in `real_moonlight.rs`
+revokes the reference client mid-stream. `moonlight-common-c` reports a
+graceful termination about 200 ms later, and a newly paired client then
+streams from the same daemon. `tests/tools/control-loss.sh 40 revoke` runs
+the same test with 40% loss on the control port.
+
+**Three things it found**, all older than this change:
+
+- **A daemon could serve one stream in its lifetime.** The audio task was
+  spawned detached and looped until a send failed, which on UDP is never. So
+  it outlived its stream and kept the audio port bound, and every later
+  stream failed to bind with `EADDRINUSE`. Nothing had ever run two streams
+  in one process. The media tasks now belong to the stream and end with it.
+- **A stream that failed during setup leaked its control thread.** An early
+  return, such as a client that never sent its video ping, left the thread's
+  stop flag set to run, and the thread held the control port for good. A
+  guard now clears the flag on every return.
+- **Audio FEC parity was computed over the wrong bytes.** The host's parity
+  covered each whole datagram, RTP header included. The client takes a data
+  shard to be the payload after the header (`completeFecBlock`:
+  `dataPackets[i] + 1`) and rebuilds a recovered packet's header from the
+  FEC header. So every parity shard was 12 bytes longer than the block it
+  protected. The client reads parity only once a data packet is missing,
+  which on loopback is almost never, so every session passed. The first time
+  one was lost, a release client switched audio FEC off for the session
+  ("Audio block size mismatch"), and the `LC_DEBUG` probe asserted. The
+  second client in the revocation test hit it. The captured session (§4)
+  had pinned the wrong parity byte for byte, so it was regenerated. The
+  replay now also recovers every captured block as the client lays it out,
+  a check the old capture fails.
+
 ### What is left
 
-- **Revocation does not end a stream already running.** `Host::revoke` removes
-  the client and its launch record, so nothing new starts, but the supervisor's
-  stream task does not watch for it — short of `docs/security.md` §3.4,
-  "with existing sessions torn down". Closing that means giving `run_stream` a
-  cancellation the revoke path can fire.
-- **`security.pairing_enabled` does nothing.** The window is the switch; the
-  key is a leftover from before there was one and could be removed.
+- **Under heavy loss, a revocation early in a session can go untold.** At 40%
+  loss each way on the control port, the host's half of the ENet handshake
+  was sometimes still incomplete two seconds into a stream, because each
+  `VERIFY_CONNECT` round trip then succeeds about a third of the time.
+  Upstream ENet behaves the same. In 2 of 10 runs the one-second cap ran out
+  before the peer connected. The client was disconnected rather than told,
+  and stopped about 1.2 s after the revoke with code −1 instead of 0. At 20%
+  and 30% loss, 8 of 8 runs each were graceful.
 - **The peer-credential refusal is untested**: exercising it needs a second
   uid, which an unprivileged test cannot get.
 
@@ -1025,7 +1111,8 @@ each point with its reasoning:
   client's 24 datagrams through the new host. All 23 control messages come
   out, nothing is refused, and the acknowledgements match the old host's
   exactly. The `VERIFY_CONNECT` is byte for byte the one the client accepted
-  from `rusty_enet`.
+  from `rusty_enet`. That capture has since been replaced (§5) by one taken
+  against this host.
 - **Against the real client:** `real_moonlight.rs` passes unchanged. So does
   `tests/tools/control-loss.sh`, the same test with netem dropping 20%, 30%
   and 40% of datagrams on the control port alone. The test asserts that
@@ -1063,10 +1150,15 @@ against. The findings are about the old arrangement:
   256-byte buffer above. If Moonlight ever builds a larger control message,
   the client retransmits it unacknowledged until it times out. The `fragments`
   counter in the host's stats is where that would show first.
-- **The host's own sends are untested against a real client.** `Host::send`
-  exists and is covered against upstream ENet, but nothing in the daemon sends
-  `TERMINATION`, rumble or HDR mode yet. Revocation ending a live stream (§5)
-  would be the first user.
+- **Only `TERMINATION` is sent.** Its round trip through `Host::send` is
+  checked against the real client (§5). Rumble and HDR mode have no source in
+  either backend.
+- **At 40% loss the real-client test fails about a third of the time**, on
+  this host before §5 as well as after (6 of 10 at the §7 merge). The
+  failures are input not arriving within the test's window: the host drops a
+  client's data until its half of the handshake completes, which under that
+  much loss takes several retransmissions. One baseline run also hit the
+  audio FEC defect §5 fixed. 20% and 30% pass.
 - **The control-loss script is manual.** It belongs in the nightly loss tier
   (`docs/testing.md` §5) when there is one.
 

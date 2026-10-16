@@ -58,7 +58,12 @@ client changes it on the way.
 **The host's bytes are pinned.** These are the RTSP responses and the video
 and audio datagrams. They are Solstice's output, but output the reference
 client accepted: with `LC_DEBUG` on, every frame was FEC-validated and
-decoded. The replay feeds the same inputs through `RtspServer`,
+decoded. Audio parity is the exception. The client reads it only when a
+data packet is missing, which on loopback is almost never, so its acceptance
+says nothing about parity. An earlier capture pinned parity computed over
+the wrong bytes (`docs/roadmap.md` §5).
+`every_captured_audio_block_recovers_as_the_client_lays_it_out` now checks
+the parity itself, laid out as `RtpAudioQueue.c` lays it out. The replay feeds the same inputs through `RtspServer`,
 `VideoPacketizer` and `AudioPacketizer` and requires identical bytes. A
 change to the wire format therefore fails here first, showing which packet
 moved. If the change is intentional, recapture.

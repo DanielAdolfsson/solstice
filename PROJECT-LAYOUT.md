@@ -511,9 +511,8 @@ state_dir    = "/var/lib/solstice"
 
 [security]
 require_encryption = true       # SS_ENC_VIDEO | SS_ENC_AUDIO mandatory
-pairing_enabled    = false      # opened by `solstice pair`, time-boxed
-pairing_window     = "60s"   # the PIN is 4 digits and client-chosen, so
-max_pair_attempts  = 3       # the window and the lockout are the real control
+pairing_window     = "60s"      # opened only by `solstice pair`; the PIN is
+max_pair_attempts  = 3          # 4 digits, so the window and lockout are the control
 allow_pairing_from = ["192.168.0.0/16"]
 
 [limits]

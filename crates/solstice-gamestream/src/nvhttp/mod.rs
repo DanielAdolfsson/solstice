@@ -96,6 +96,10 @@ pub struct Host {
     pub pairing: Mutex<PairingManager>,
     /// Live launch sessions.
     pub sessions: Mutex<Vec<LaunchSession>>,
+    /// Bumped whenever a session is ended from outside its stream -- by
+    /// revocation or `/cancel` -- so a running stream can notice its launch
+    /// record has gone and end itself (`docs/security.md` §3.4).
+    ended: tokio::sync::watch::Sender<u64>,
 }
 
 impl Host {
@@ -107,7 +111,47 @@ impl Host {
             clients: RwLock::new(clients),
             pairing: Mutex::new(PairingManager::default()),
             sessions: Mutex::new(Vec::new()),
+            ended: tokio::sync::watch::Sender::new(0),
         }
+    }
+
+    /// Whether the launch session `id` is still live.
+    pub fn has_session(&self, id: &str) -> bool {
+        self.sessions
+            .lock()
+            .expect("session lock")
+            .iter()
+            .any(|s| s.id == id)
+    }
+
+    /// Changes whenever sessions are ended from outside their streams. A
+    /// stream subscribes before it starts and checks [`Host::has_session`]
+    /// on every change.
+    pub fn watch_ended(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.ended.subscribe()
+    }
+
+    /// End every session `cert_der` launched, and tell their streams.
+    /// Returns how many there were.
+    pub fn end_sessions_of(&self, cert_der: &[u8]) -> usize {
+        let mut sessions = self.sessions.lock().expect("session lock");
+        let before = sessions.len();
+        sessions.retain(|s| s.client_cert_der != cert_der);
+        let closed = before - sessions.len();
+        drop(sessions);
+        if closed > 0 {
+            self.ended.send_modify(|n| *n = n.wrapping_add(1));
+        }
+        closed
+    }
+
+    /// Forget one session whose stream has finished. Nothing is told, because
+    /// the only listener was that stream.
+    pub fn remove_session(&self, id: &str) {
+        self.sessions
+            .lock()
+            .expect("session lock")
+            .retain(|s| s.id != id);
     }
 
     /// Whether this exact certificate is paired *right now*.
@@ -159,10 +203,7 @@ impl Host {
             .remove(cert_der)
             .unwrap_or(false);
         if removed {
-            self.sessions
-                .lock()
-                .expect("session lock")
-                .retain(|s| s.client_cert_der != cert_der);
+            self.end_sessions_of(cert_der);
         }
         removed
     }
@@ -443,6 +484,64 @@ mod tests {
         assert!(h.sessions.lock().unwrap().is_empty());
         let req = request("/applist");
         assert_eq!(handle(&h, &ctx(&req, true, Some(&der))).status, 401);
+    }
+
+    /// A running stream learns of it: the signal changes, and its session is
+    /// gone when it looks.
+    #[test]
+    fn revoking_a_client_tells_its_running_stream() {
+        let (h, der) = paired_host();
+        let req = request(
+            "/launch?rikey=000102030405060708090a0b0c0d0e0f&rikeyid=1&localAudioPlayMode=0&appid=1",
+        );
+        handle(&h, &ctx(&req, true, Some(&der)));
+        let id = h.sessions.lock().unwrap()[0].id.clone();
+        let mut ended = h.watch_ended();
+        assert!(!ended.has_changed().unwrap());
+
+        assert!(h.revoke(&der));
+        assert!(ended.has_changed().unwrap());
+        ended.mark_unchanged();
+        assert!(!h.has_session(&id));
+
+        // Revoking someone with nothing running says nothing.
+        assert!(!h.revoke(&der));
+        assert!(!ended.has_changed().unwrap());
+    }
+
+    /// `/cancel` is the client quitting the app; Sunshine ends the stream for
+    /// it, and so does this host.
+    #[test]
+    fn cancel_tells_the_running_stream_and_spares_other_clients() {
+        let (h, der) = paired_host();
+        let launch = request(
+            "/launch?rikey=000102030405060708090a0b0c0d0e0f&rikeyid=1&localAudioPlayMode=0&appid=1",
+        );
+        handle(&h, &ctx(&launch, true, Some(&der)));
+        let id = h.sessions.lock().unwrap()[0].id.clone();
+        let ended = h.watch_ended();
+
+        let other = vec![0x11, 0x22];
+        h.clients
+            .write()
+            .unwrap()
+            .add(crate::crypto::certs::PairedClient {
+                cert_der: other.clone(),
+                device_name: "other".into(),
+                unique_id: "o".into(),
+            })
+            .unwrap();
+        let cancel = request("/cancel");
+        assert_eq!(handle(&h, &ctx(&cancel, true, Some(&other))).status, 200);
+        assert!(
+            !ended.has_changed().unwrap(),
+            "nothing of theirs was running"
+        );
+        assert!(h.has_session(&id));
+
+        assert_eq!(handle(&h, &ctx(&cancel, true, Some(&der))).status, 200);
+        assert!(ended.has_changed().unwrap());
+        assert!(!h.has_session(&id));
     }
 
     #[test]

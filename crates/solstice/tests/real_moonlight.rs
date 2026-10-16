@@ -115,6 +115,8 @@ fn parse_probe_output(stdout: &str) -> ProbeReport {
 
 /// What `/launch` hands a Moonlight port to pass to `LiStartConnection`.
 struct Launched {
+    /// The paired client, for the tests that revoke it.
+    client: HostIdentity,
     session_url: String,
     rikey: [u8; 16],
     rikey_id: i32,
@@ -162,6 +164,7 @@ async fn pair_and_launch(ports: Ports) -> Launched {
         "the probe is built to exercise encrypted RTSP: {session_url}"
     );
     Launched {
+        client: client_identity,
         session_url,
         rikey,
         rikey_id,
@@ -560,6 +563,188 @@ async fn the_reference_client_sits_through_a_still_screen_at_the_idle_rate() {
 }
 
 /// The value repeated longest in a row, and how many times.
+/// Roadmap §5: revoking a client ends a stream it already has running, and
+/// says so, rather than only refusing the next one (`docs/security.md` §3.4).
+/// The reference client is the judge of "says so": it must read the host's
+/// `TERMINATION` as a graceful end, promptly, instead of timing out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoking_the_client_ends_its_running_stream() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
+        )
+        .try_init();
+    let probe = probe_path();
+    if !probe.is_file() {
+        eprintln!(
+            "skipping: no mlc-probe at {} -- build it with tests/tools/mlc-probe/build.sh",
+            probe.display()
+        );
+        return;
+    }
+
+    /// Far longer than the test should take: a probe that sits it out was not
+    /// told anything.
+    const HOLD: u64 = 60;
+    /// `CONTROL_STREAM_TIMEOUT_SEC` is 10: a client that noticed only by
+    /// timing out would take at least that long.
+    const PROMPT: Duration = Duration::from_secs(5);
+
+    const PORTS: Ports = Ports::from_base(49689);
+    let mut config = Config::default();
+    config.server.port = PORTS.http;
+    config.backend.kind = BackendKind::TestPattern;
+    config.video.encoder = Encoder::OpenH264;
+    config.limits.max_width = WIDTH;
+    config.limits.max_height = HEIGHT;
+    config.limits.max_fps = FPS;
+
+    let backend = Arc::new(TestPatternBackend::new(WIDTH, HEIGHT, FPS));
+    let (host, state_dir) = start_daemon_with(config, "mlc-revoke", backend);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let launched = pair_and_launch(PORTS).await;
+
+    let mut command = probe_command(&probe, &launched);
+    command
+        .arg("frames=1")
+        .arg(format!("hold={HOLD}"))
+        .arg(format!("timeout={}", HOLD + 30));
+    let mut child = tokio::process::Command::from(command)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to run mlc-probe");
+
+    // The probe's own report of a decoded frame is what "up" means. Input on
+    // the backend would be a weaker signal: the probe sends it once, and the
+    // loss script can drop it.
+    let (first_frame, up) = tokio::sync::oneshot::channel();
+    let stdout_reader = tokio::spawn({
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut first_frame = Some(first_frame);
+        async move {
+            let mut all = String::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.starts_with("PROBE frame ") {
+                    if let Some(tx) = first_frame.take() {
+                        let _ = tx.send(());
+                    }
+                }
+                all.push_str(&line);
+                all.push('\n');
+            }
+            all
+        }
+    });
+    let stderr_reader = tokio::spawn({
+        use tokio::io::AsyncReadExt;
+        let mut stderr = child.stderr.take().unwrap();
+        async move {
+            let mut all = String::new();
+            let _ = stderr.read_to_string(&mut all).await;
+            all
+        }
+    });
+    if !matches!(
+        tokio::time::timeout(Duration::from_secs(30), up).await,
+        Ok(Ok(()))
+    ) {
+        let _ = child.kill().await;
+        panic!(
+            "the stream never came up; the probe said:\n{}\n{}",
+            stdout_reader.await.unwrap(),
+            stderr_reader.await.unwrap()
+        );
+    }
+
+    // Revoke a stream that is running, not one still being set up: the
+    // host's half of the ENet handshake can finish after the first frame, and
+    // under the loss script that can take a retransmission or two.
+    // `net/control.rs` covers a revocation inside that window.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // The same call the management socket's `revoke` makes; `management.rs`
+    // drives that path with the real binary.
+    let revoked_at = std::time::Instant::now();
+    assert!(host.revoke(launched.client.cert_der()));
+
+    tokio::time::timeout(PROMPT * 3, child.wait())
+        .await
+        .expect("the client was still streaming long after the revoke")
+        .unwrap();
+    let ended_after = revoked_at.elapsed();
+    let stdout = stdout_reader.await.unwrap();
+    let report = parse_probe_output(&stdout);
+    if std::env::var("MLC_DEBUG").is_ok() || ended_after >= PROMPT {
+        eprintln!("--- mlc-probe stdout ---\n{stdout}");
+        eprintln!("--- mlc-probe stderr ---\n{}", stderr_reader.await.unwrap());
+    }
+    eprintln!("revoked; the client stopped after {ended_after:?}");
+
+    assert!(report.connected, "the stream never connected");
+    assert!(
+        ended_after < PROMPT,
+        "the client took {ended_after:?} to stop: it was not told"
+    );
+    // `ML_ERROR_GRACEFUL_TERMINATION` is 0: the client read the host's
+    // `NVST_DISCONN_SERVER_TERMINATED_CLOSED` after seeing frames.
+    let terminated: Vec<&String> = report
+        .lines
+        .iter()
+        .filter(|line| line.starts_with("terminated "))
+        .collect();
+    assert_eq!(
+        terminated,
+        ["terminated code=0"],
+        "the client did not see a graceful termination"
+    );
+    assert!(host.sessions.lock().unwrap().is_empty());
+
+    // The revoked certificate is refused; the host itself is not stuck. A
+    // newly paired client streams on the same ports, which a control thread
+    // left holding its socket would prevent.
+    let refused = https_get(&https_client(&launched.client), PORTS, "/applist").await;
+    assert!(refused.contains("401"), "{refused}");
+    host.pairing
+        .lock()
+        .unwrap()
+        .open(
+            common::PIN,
+            Duration::from_secs(60),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+    let again = pair_and_launch(PORTS).await;
+    let output = tokio::task::spawn_blocking(move || {
+        probe_command(&probe, &again)
+            .arg(format!("frames={WANT_FRAMES}"))
+            .arg("timeout=30")
+            .output()
+            .expect("failed to run mlc-probe")
+    })
+    .await
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let report = parse_probe_output(&stdout);
+    if !report.result_ok {
+        eprintln!("--- mlc-probe stdout ---\n{stdout}");
+        eprintln!(
+            "--- mlc-probe stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(
+        output.status.success() && report.result_ok,
+        "the next client could not stream: {:?}",
+        report.summary
+    );
+
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
 fn longest_run(values: &[u32]) -> (u32, usize) {
     let mut best = (0, 0);
     let mut i = 0;

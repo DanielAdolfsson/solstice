@@ -97,9 +97,13 @@ pub struct Security {
     /// WAN -- but the content of this stream is someone's screen rather than a
     /// game (`docs/security.md` §2.2).
     pub require_encryption: bool,
-    /// Whether the pairing listener accepts handshakes at all. Opened by
-    /// `solstice pair`, time-boxed.
-    pub pairing_enabled: bool,
+    /// The old `pairing_enabled`, which never did anything: the window
+    /// `solstice pair` opens is the only switch. Still accepted, so that a
+    /// configuration copied from an older example keeps loading, and warned
+    /// about when present.
+    #[serde(rename = "pairing_enabled")]
+    #[doc(hidden)]
+    pub legacy_pairing_enabled: Option<bool>,
     /// How long `solstice pair` holds the window open.
     #[serde(with = "humantime_serde")]
     pub pairing_window: Duration,
@@ -113,7 +117,7 @@ impl Default for Security {
     fn default() -> Self {
         Self {
             require_encryption: true,
-            pairing_enabled: false,
+            legacy_pairing_enabled: None,
             // The PIN is four digits and client-chosen, so the window and the
             // lockout are the real control.
             pairing_window: Duration::from_secs(60),
@@ -340,6 +344,12 @@ impl Config {
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let config: Self = toml::from_str(text).map_err(|e| ConfigError::Toml(e.to_string()))?;
         config.validate()?;
+        if config.security.legacy_pairing_enabled.is_some() {
+            tracing::warn!(
+                "security.pairing_enabled is ignored and can be removed: \
+                 pairing opens only with `solstice pair`"
+            );
+        }
         Ok(config)
     }
 
@@ -433,10 +443,6 @@ mod tests {
             config.server.bind.is_loopback(),
             "the default bind must not be 0.0.0.0"
         );
-        assert!(
-            !config.security.pairing_enabled,
-            "pairing must be off by default"
-        );
         assert!(config.security.require_encryption);
         assert_eq!(config.limits.max_sessions, 1);
         assert!(config.security.allow_pairing_from.is_empty());
@@ -452,6 +458,14 @@ mod tests {
         assert_eq!(s.control_port(), 47999);
         assert_eq!(s.audio_port(), 48000);
         assert_eq!(s.rtsp_port(), 48010);
+    }
+
+    /// A configuration from before the key was retired still loads.
+    #[test]
+    fn the_retired_pairing_enabled_key_is_accepted_and_ignored() {
+        let config = Config::parse("[security]\npairing_enabled = true\n").unwrap();
+        assert_eq!(config.security.legacy_pairing_enabled, Some(true));
+        assert_eq!(Config::default().security.legacy_pairing_enabled, None);
     }
 
     #[test]

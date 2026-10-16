@@ -694,6 +694,75 @@ fn video_repacketises_byte_for_byte() {
 
 // --------------------------------------------------------------- audio --
 
+/// The parity the client accepted is parity it can use. Each block is laid out
+/// as `RtpAudioQueue.c` lays it out -- a data shard is everything after the RTP
+/// header, a parity shard everything after the RTP and FEC headers -- and every
+/// data shard must come back from the other five.
+///
+/// Byte-for-byte replay alone could not catch the alternative: until it was
+/// fixed, the host computed parity over whole datagrams, and a capture of that
+/// replayed perfectly. The client only reads parity once a packet is missing,
+/// which on loopback is almost never, so it accepted the session too.
+#[test]
+fn every_captured_audio_block_recovers_as_the_client_lays_it_out() {
+    use solstice_gamestream::stream::fec::Rs;
+    use std::collections::BTreeMap;
+
+    const RTP: usize = 12;
+    const FEC_HEADER: usize = 12;
+    let v = load();
+    #[derive(Default)]
+    struct Block {
+        data: Vec<Vec<u8>>,
+        parity: Vec<Vec<u8>>,
+    }
+    let mut blocks: BTreeMap<u16, Block> = BTreeMap::new();
+    for packet in &v.audio.packets {
+        let w = &packet.wire;
+        match w[1] {
+            97 => blocks
+                .entry(packet.sequence / 4 * 4)
+                .or_default()
+                .data
+                .push(w[RTP..].to_vec()),
+            // A parity packet borrows the next block's RTP sequence numbers;
+            // its own block is the FEC header's base sequence number.
+            127 => blocks
+                .entry(u16::from_be_bytes([w[RTP + 2], w[RTP + 3]]))
+                .or_default()
+                .parity
+                .push(w[RTP + FEC_HEADER..].to_vec()),
+            other => panic!("audio payload type {other}"),
+        }
+    }
+    let mut checked = 0;
+    for (base, Block { data, parity }) in &blocks {
+        if data.len() < 4 || parity.len() < 2 {
+            continue; // the capture's last, unfinished block
+        }
+        for shard in data.iter().chain(parity) {
+            assert_eq!(
+                shard.len(),
+                data[0].len(),
+                "block {base}: the client would see a block size mismatch"
+            );
+        }
+        for lost in 0..4 {
+            let mut slots: Vec<Option<Vec<u8>>> =
+                data.iter().chain(parity).cloned().map(Some).collect();
+            slots[lost] = None;
+            Rs::audio().reconstruct(&mut slots).unwrap();
+            assert_eq!(
+                slots[lost].as_ref().unwrap(),
+                &data[lost],
+                "block {base}: shard {lost} did not recover"
+            );
+        }
+        checked += 1;
+    }
+    assert!(checked >= 8, "only {checked} complete audio blocks");
+}
+
 #[test]
 fn audio_decrypts_and_repacketises_byte_for_byte() {
     let v = load();
