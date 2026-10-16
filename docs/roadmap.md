@@ -1074,12 +1074,39 @@ against. The findings are about the old arrangement:
 
 ## 8. Smaller items
 
-- **Fuzzing in CI.** Ten targets exist and run clean for a minute each, and
-  `enet_host` for ten minutes (§7). There is no committed seed corpus, no
-  persistent corpus, and no nightly job. The captured session (§4) has real
-  input batches, control envelopes, RTSP messages and ENet datagrams to seed
-  four of them with (`docs/testing.md` §6 describes the tier). `cargo fuzz`
-  needs a nightly toolchain; §7 records how `enet_host` was run on stable.
+- **Fuzzing: seeded and scripted, not scheduled.** Five targets now start
+  from real traffic. `tests/tools/gen_fuzz_seeds.py` cuts
+  `fuzz/seeds/<target>/` out of the captured session (§4): the RTSP requests,
+  the ANNOUNCE body, the input batches, the control messages and the ENet
+  datagrams, 66 inputs in all. The control envelopes are re-sealed under the
+  target's fixed key; as captured, every one would fail authentication at the
+  first check. Before re-sealing, each is sealed again under the session key
+  and must reproduce the captured bytes exactly. The seeds start each target
+  well ahead of an empty corpus:
+
+  | Target | Coverage at start, empty | Seeded |
+  |---|---|---|
+  | `rtsp_message` | 10 | 103 |
+  | `sdp_announce` | 47 | 146 |
+  | `input_batch` | 16 | 118 |
+  | `control_envelope` | 34 | 154 |
+  | `enet_host` | 196 | 327 |
+
+  `tests/tools/fuzz.sh [seconds] [target…]` builds every target on stable,
+  with cargo-fuzz's instrumentation flags, and runs each from its seeds and
+  its own growing `fuzz/corpus/<target>/`. `fuzz/corpus` stays ignored, so the
+  persistent corpus lives on whichever machine runs it. Its first two full
+  runs each found an overflow in `spice_draw` within a minute, both in the
+  sampler behind `DRAW_OPAQUE` and `DRAW_COPY`, and both from `i32` geometry
+  at the extremes. The fixed-point `dx * src_w * 256` overflowed in `i64`,
+  and `x - dest.left` overflowed in `i32` before it was widened. Each panics
+  in a debug build and wraps in a release one. The arithmetic is now widened
+  first, the scaling is done in `i128`, and both inputs are a unit test.
+  `spice_draw` then ran clean for five minutes, 8.2 million runs.
+
+  **No scheduled job.** There is no CI in this repository yet, and a nightly
+  fuzz run is the place to start one. `docs/testing.md` §6 sketches it, and
+  `fuzz.sh` is what it would call.
 - **More RFB servers.** `docs/testing.md` §3.3 lists exactly what dropping
   `wayvnc`, `x11vnc`, TurboVNC and QEMU's `-vnc` costs. x11vnc is the
   interesting one: libvncserver implements QEMU extended key events in its

@@ -1,0 +1,6 @@
+PLAY / RTSP/1.0
+CSeq: 7
+X-GS-ClientVersion: 14
+Host: 0.0.0.0
+Session: 959A9AB469CD43E7
+
