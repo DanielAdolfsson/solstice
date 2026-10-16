@@ -16,11 +16,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use solstice::config::{BackendKind, Config, Encoder};
-use solstice::supervisor::{build_host, Supervisor};
-use solstice_gamestream::crypto::certs::{ClientStore, HostIdentity};
+use solstice_gamestream::crypto::certs::HostIdentity;
 use solstice_gamestream::crypto::gcm::SessionCrypto;
-use solstice_gamestream::crypto::pairing::client::ClientPairing;
 use solstice_gamestream::rtsp::encrypted;
+use solstice_gamestream::wire::control::Origin;
 use solstice_gamestream::wire::ping::Ping;
 use solstice_gamestream::wire::video::{
     flags, EncPrefix, FrameHeader, NvVideoPacket, VideoPacketHeader,
@@ -29,209 +28,20 @@ use solstice_gamestream::wire::Reader;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
-const PIN: &str = "4242";
-
-/// Base ports well away from the defaults, so a developer running a real
-/// Sunshine or Solstice does not collide with the test. One per test, because
-/// the suite runs them concurrently.
-#[derive(Clone, Copy)]
-struct Ports {
-    http: u16,
-    https: u16,
-    video: u16,
-    audio: u16,
-    rtsp: u16,
-}
-
-impl Ports {
-    const fn from_base(base: u16) -> Self {
-        Self {
-            http: base,
-            https: base - 5,
-            video: base + 9,
-            audio: base + 11,
-            rtsp: base + 21,
-        }
-    }
-}
-
-// ----------------------------------------------------------------- client --
-
-/// Moonlight pins the certificate it saw at pairing time; there is no CA and no
-/// chain. The test client does the same thing, which means accepting whatever
-/// the host presents on the first connection.
-#[derive(Debug)]
-struct PinnedServerCert(Arc<rustls::crypto::CryptoProvider>);
-
-impl rustls::client::danger::ServerCertVerifier for PinnedServerCert {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
-async fn http_get(port: u16, target: &str) -> String {
-    let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
-        .await
-        .unwrap();
-    let request = format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).await.unwrap();
-    let mut response = String::new();
-    stream.read_to_string(&mut response).await.unwrap();
-    response
-}
-
-async fn https_get(client: &HttpsClient, ports: Ports, target: &str) -> String {
-    let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, ports.https))
-        .await
-        .unwrap();
-    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-    let mut tls = client.connector.connect(name, stream).await.unwrap();
-    let request = format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
-    tls.write_all(request.as_bytes()).await.unwrap();
-    let mut response = Vec::new();
-    let _ = tls.read_to_end(&mut response).await;
-    String::from_utf8_lossy(&response).into_owned()
-}
-
-struct HttpsClient {
-    connector: tokio_rustls::TlsConnector,
-}
-
-fn https_client(identity: &HostIdentity) -> HttpsClient {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let certs = vec![rustls::pki_types::CertificateDer::from(
-        identity.cert_der().to_vec(),
-    )];
-    let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(identity.key_pem().as_bytes()))
-        .unwrap()
-        .unwrap();
-    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedServerCert(provider)))
-        .with_client_auth_cert(certs, key)
-        .unwrap();
-    HttpsClient {
-        connector: tokio_rustls::TlsConnector::from(Arc::new(config)),
-    }
-}
-
-fn xml_field<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
-    let open = format!("<{name}>");
-    let close = format!("</{name}>");
-    let start = xml.find(&open)? + open.len();
-    let end = xml[start..].find(&close)? + start;
-    Some(&xml[start..end])
-}
-
-// ---------------------------------------------------------------- pairing --
-
-async fn pair(ports: Ports, client_identity: &HostIdentity) {
-    let salt = [0x5Au8; 16];
-    let client_cert_pem = client_identity.cert_pem();
-
-    let response = http_get(
-        ports.http,
-        &format!(
-            "/pair?devicename=test&updateState=1&phrase=getservercert&salt={}&clientcert={}",
-            hex::encode(salt),
-            hex::encode(client_cert_pem.as_bytes())
-        ),
-    )
-    .await;
-    assert!(
-        response.contains("<paired>1</paired>"),
-        "step 1 failed: {response}"
-    );
-    let plaincert = xml_field(&response, "plaincert").expect("no plaincert");
-    let host_cert_pem = String::from_utf8(hex::decode(plaincert).unwrap()).unwrap();
-    let host_cert_der = solstice_gamestream::crypto::certs::pem_to_der(&host_cert_pem).unwrap();
-
-    let mut pairing = ClientPairing::new(&salt, PIN);
-    let challenge = pairing.client_challenge().unwrap();
-    let response = http_get(
-        ports.http,
-        &format!("/pair?clientchallenge={}", hex::encode(&challenge)),
-    )
-    .await;
-    let challenge_response = xml_field(&response, "challengeresponse")
-        .unwrap_or_else(|| panic!("step 2 failed: {response}"));
-
-    let step3 = pairing
-        .server_challenge_response(
-            &hex::decode(challenge_response).unwrap(),
-            &host_cert_der,
-            &client_identity.signature().unwrap(),
-        )
-        .unwrap();
-    let response = http_get(
-        ports.http,
-        &format!("/pair?serverchallengeresp={}", hex::encode(&step3)),
-    )
-    .await;
-    assert!(
-        response.contains("<pairingsecret>"),
-        "step 3 failed: {response}"
-    );
-
-    let body = pairing
-        .client_pairing_secret(|m| client_identity.sign(m))
-        .unwrap();
-    let response = http_get(
-        ports.http,
-        &format!("/pair?clientpairingsecret={}", hex::encode(&body)),
-    )
-    .await;
-    assert!(
-        response.contains("<paired>1</paired>"),
-        "step 4 failed: {response}"
-    );
-}
+mod common;
+use common::{http_get, https_client, https_get, pair, start_daemon, Ports};
 
 // ------------------------------------------------------------------- rtsp --
 
+/// A client that opens a connection per message, the way
+/// `moonlight-common-c` does (`RtspConnection.c:386-517`).
+///
+/// This used to hold one connection open for the whole negotiation, which
+/// worked only because the host did too -- the shape of agreement that
+/// `docs/testing.md` §0 warns about. The reference client never does this, so
+/// neither does this one any more.
 struct Rtsp {
-    stream: TcpStream,
+    ports: Ports,
     crypto: SessionCrypto,
     sequence: u32,
     cseq: u32,
@@ -239,12 +49,8 @@ struct Rtsp {
 
 impl Rtsp {
     async fn connect(ports: Ports, key: &[u8; 16]) -> Self {
-        let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, ports.rtsp))
-            .await
-            .unwrap();
-        stream.set_nodelay(true).unwrap();
         Self {
-            stream,
+            ports,
             crypto: SessionCrypto::new(key),
             sequence: 0,
             cseq: 0,
@@ -263,25 +69,36 @@ impl Rtsp {
         message.push_str("\r\n");
         message.push_str(body);
 
-        let sealed = encrypted::seal(&self.crypto, self.sequence, message.as_bytes()).unwrap();
+        let sealed = encrypted::seal(
+            &self.crypto,
+            self.sequence,
+            Origin::Client,
+            message.as_bytes(),
+        )
+        .unwrap();
         self.sequence += 1;
-        self.stream.write_all(&sealed).await.unwrap();
-        self.stream.flush().await.unwrap();
 
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, self.ports.rtsp))
+            .await
+            .unwrap();
+        stream.set_nodelay(true).unwrap();
+        stream.write_all(&sealed).await.unwrap();
+        stream.flush().await.unwrap();
+
+        // Read to end of stream: the host's close is the message terminator.
         let mut buf = Vec::new();
-        loop {
-            let mut chunk = [0u8; 4096];
-            let read = tokio::time::timeout(Duration::from_secs(5), self.stream.read(&mut chunk))
-                .await
-                .expect("RTSP response timed out")
-                .unwrap();
-            assert!(read > 0, "RTSP connection closed during {method}");
-            buf.extend_from_slice(&chunk[..read]);
-            if let Some((plaintext, used)) = encrypted::open(&self.crypto, &buf).unwrap() {
-                buf.drain(..used);
-                return String::from_utf8_lossy(&plaintext).into_owned();
-            }
-        }
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf))
+            .await
+            .expect("RTSP response timed out")
+            .unwrap();
+        assert!(
+            !buf.is_empty(),
+            "the host closed without answering {method}"
+        );
+        let (plaintext, _) = encrypted::open(&self.crypto, Origin::Host, &buf)
+            .unwrap()
+            .unwrap_or_else(|| panic!("truncated RTSP response to {method}"));
+        String::from_utf8_lossy(&plaintext).into_owned()
     }
 }
 
@@ -331,10 +148,10 @@ struct PartialFrame {
 
 impl Depacketizer {
     fn push(&mut self, header: &VideoPacketHeader, payload: &[u8]) {
-        if header.nv.flags & flags::CONTAINS_PIC_DATA == 0 {
+        let (shard_index, data_shards, _) = NvVideoPacket::unpack_fec_info(header.nv.fec_info);
+        if shard_index >= data_shards {
             return; // parity
         }
-        let (shard_index, data_shards, _) = NvVideoPacket::unpack_fec_info(header.nv.fec_info);
         let (block_index, block_count) =
             NvVideoPacket::unpack_multi_fec_blocks(header.nv.multi_fec_blocks);
         let frame = self.frames.entry(header.nv.frame_index).or_default();
@@ -544,9 +361,16 @@ async fn run_client(
 
         let (header, payload) = VideoPacketHeader::parse(&plaintext).unwrap();
         assert_eq!(header.rtp.header, 0x90);
-        assert_eq!(header.nv.multi_fec_flags, 0x10);
-        if header.nv.flags & flags::CONTAINS_PIC_DATA == 0 {
+        // A shard is parity by its index within the block, not by its flags:
+        // a parity shard's `flags` and `multiFecFlags` bytes are Reed-Solomon
+        // output, because the host writes them before the encode and never
+        // again (`stream.cpp:1704-1711`).
+        let (shard_index, data_shards, _) = NvVideoPacket::unpack_fec_info(header.nv.fec_info);
+        if shard_index >= data_shards {
             saw_parity = true;
+        } else {
+            assert_eq!(header.nv.multi_fec_flags, 0x10);
+            assert_ne!(header.nv.flags & flags::CONTAINS_PIC_DATA, 0);
         }
         depacketizer.push(&header, payload);
 
@@ -599,38 +423,6 @@ async fn run_client(
         frames.len()
     );
     frames
-}
-
-/// Start a daemon with a pairing window already open.
-fn start_daemon(
-    config: Config,
-    tag: &str,
-) -> (Arc<solstice_gamestream::nvhttp::Host>, std::path::PathBuf) {
-    let state_dir = std::env::temp_dir().join(format!("solstice-e2e-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&state_dir);
-    let mut config = config;
-    config.server.state_dir = state_dir.clone();
-
-    let identity = HostIdentity::load_or_generate(&state_dir, "solstice-e2e").unwrap();
-    let clients = ClientStore::load(state_dir.join("clients.tsv")).unwrap();
-    let host = Arc::new(build_host(&config, identity, clients));
-
-    // `solstice pair` would do this over the management socket; the window is
-    // opened directly here because that socket is not built yet.
-    host.pairing
-        .lock()
-        .unwrap()
-        .open(PIN, Duration::from_secs(120), std::time::Instant::now())
-        .unwrap();
-
-    let backend = solstice::backend_factory::build(&config).unwrap();
-    let supervisor = Supervisor::new(config, host.clone(), backend);
-    tokio::spawn(async move {
-        if let Err(e) = supervisor.run().await {
-            eprintln!("supervisor ended: {e}");
-        }
-    });
-    (host, state_dir)
 }
 
 // ------------------------------------------------------------------- tests --
@@ -695,7 +487,9 @@ async fn a_client_receives_the_pixels_of_a_real_vnc_desktop() {
     const PORTS: Ports = Ports::from_base(49189);
 
     let Some(guest) = solstice_test_guest::Guest::start(
-        solstice_test_guest::GuestConfig::new().geometry(640, 480).vnc(),
+        solstice_test_guest::GuestConfig::new()
+            .geometry(640, 480)
+            .vnc(),
     ) else {
         return;
     };

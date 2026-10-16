@@ -10,9 +10,7 @@
 //! its "no audio stream" edge cases (`docs/bridging-design.md` §3).
 
 use crate::crypto::gcm::cbc_encrypt;
-use crate::wire::audio::{
-    audio_iv, AudioFecHeader, AUDIO_DATA_SHARDS, AUDIO_FEC_HEADER_LEN, AUDIO_PARITY_SHARDS,
-};
+use crate::wire::audio::{audio_iv, AudioFecHeader, AUDIO_DATA_SHARDS, AUDIO_FEC_HEADER_LEN};
 use crate::wire::rtp::{RtpHeader, AUDIO_FEC_PAYLOAD_TYPE, AUDIO_PAYLOAD_TYPE, RTP_HEADER_LEN};
 
 use super::fec::Rs;
@@ -121,13 +119,13 @@ impl AudioPacketizer {
             .expect("RS(4,2) over four equal shards");
         self.block.clear();
 
-        // The two parity shards occupy the sequence slots after the four data
-        // shards: the client indexes a block as `seq - baseSequenceNumber` and
-        // expects data at 0..=3 and parity at 4..=5, so the next block starts
-        // six later (`RtpAudioQueue.c:11-13`).
-        self.sequence = self
-            .block_base_sequence
-            .wrapping_add((AUDIO_DATA_SHARDS + AUDIO_PARITY_SHARDS) as u16);
+        // The parity shards borrow the next two sequence numbers but do not
+        // consume them: Sunshine increments the audio sequence once per *data*
+        // packet and nothing else (`stream.cpp:1913`), so the data numbering
+        // stays contiguous and every FEC block begins on a multiple of four.
+        // The client requires exactly that and switches FEC off for the whole
+        // session when it does not hold (`RtpAudioQueue.c:269-280`). A parity
+        // packet is told apart by its payload type, not its sequence number.
 
         parity
             .into_iter()
@@ -224,13 +222,41 @@ mod tests {
                         AudioFecHeader::parse(&mut Reader::new(&parity[RTP_HEADER_LEN..])).unwrap();
                     assert_eq!(fec.fec_shard_index, j as u8);
                     assert_eq!(fec.payload_type, AUDIO_PAYLOAD_TYPE);
-                    assert_eq!(fec.base_sequence_number, (i as u16 / 4) * 6);
+                    assert_eq!(fec.base_sequence_number, (i as u16 / 4) * 4);
                 }
             } else {
                 assert_eq!(out.len(), 1);
             }
         }
         assert_eq!(emitted, 8 + 4);
+    }
+
+    /// `RtpAudioQueue.c:269-280` refuses a block whose base sequence number
+    /// is not a multiple of four, and disables audio FEC for the rest of the
+    /// session when it sees one. Skipping sequence numbers for the parity
+    /// shards -- which is the intuitive reading of the layout -- produces
+    /// bases of 0, 6, 12, and only the first one passes.
+    #[test]
+    fn every_fec_block_starts_on_a_four_boundary() {
+        let mut p = AudioPacketizer::new(AudioConfig::default(), None);
+        let mut bases = Vec::new();
+        let mut data_sequences = Vec::new();
+        for _ in 0..16 {
+            for packet in p.packetize(b"opus-packet") {
+                let rtp = parse_rtp(&packet);
+                if rtp.packet_type == AUDIO_FEC_PAYLOAD_TYPE {
+                    let fec =
+                        AudioFecHeader::parse(&mut Reader::new(&packet[RTP_HEADER_LEN..])).unwrap();
+                    bases.push(fec.base_sequence_number);
+                } else {
+                    data_sequences.push(rtp.sequence_number);
+                }
+            }
+        }
+        assert_eq!(bases, vec![0, 0, 4, 4, 8, 8, 12, 12]);
+        assert!(bases.iter().all(|b| b % 4 == 0));
+        // And the data numbering is contiguous, with no gap left for parity.
+        assert_eq!(data_sequences, (0..16u16).collect::<Vec<_>>());
     }
 
     /// The whole point of the parity: lose a data packet and get it back.
@@ -256,7 +282,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(parity.len(), AUDIO_PARITY_SHARDS);
+        assert_eq!(parity.len(), crate::wire::audio::AUDIO_PARITY_SHARDS);
 
         let shard_len = data.iter().map(|d| d.len()).max().unwrap();
         let mut slots: Vec<Option<Vec<u8>>> = data

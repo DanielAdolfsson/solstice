@@ -84,6 +84,22 @@ impl NvVideoPacket {
         out[12..16].copy_from_slice(&self.fec_info.to_le_bytes());
     }
 
+    /// Overwrite only the fields Sunshine patches *after* Reed-Solomon
+    /// (`stream.cpp:1745-1759`).
+    ///
+    /// The split matters: anything written here is destroyed in the parity
+    /// shards and therefore cannot be recovered, so the set has to match what
+    /// the client re-derives for itself. `streamPacketIndex`, `flags`,
+    /// `extraFlags` and `multiFecFlags` are deliberately absent -- the client
+    /// asserts those come back out of the parity intact
+    /// (`RtpVideoQueue.c:385-389`).
+    pub fn patch_after_fec(out: &mut [u8], frame_index: u32, multi_fec_blocks: u8, fec_info: u32) {
+        assert!(out.len() >= NV_VIDEO_PACKET_LEN);
+        out[4..8].copy_from_slice(&frame_index.to_le_bytes());
+        out[11] = multi_fec_blocks;
+        out[12..16].copy_from_slice(&fec_info.to_le_bytes());
+    }
+
     /// Parse.
     pub fn parse(r: &mut Reader<'_>) -> Result<Self> {
         Ok(Self {

@@ -17,24 +17,30 @@ protocols.
 
 ## Order
 
-The biggest remaining gap is not a missing feature: **the GameStream host has
-never been connected to by a real Moonlight.** The SPICE backend had the same
-gap and it is now closed (§2.6) -- which is the argument for closing this one,
-because doing it found two real bugs in a day.
+Both halves of this project have now been held against a real peer, and both
+exercises paid for themselves on the first day: the SPICE backend against a
+real `spice-server` (§2.6, two bugs) and the GameStream host against a real
+`moonlight-common-c` (§3, **eight**). Neither set was reachable from a mock,
+because a mock written from the same research agrees with the same mistakes.
+
+What is left is ordinary work. §4 is the next one worth doing, and it is worth
+less than it was: the probe now covers what the captured vectors were meant to
+catch, so the case for them is regression-pinning in CI without a C toolchain
+rather than discovery.
 
 | | Item | Size | Blocked on |
 |---|---|---|---|
 | 1 | [Tight encoding](#1-tight-encoding-rfb) | ~1 week | nothing |
 | 2 | [SPICE backend](#2-spice-backend) | **implemented and validated against a real QEMU guest**, agent included (§2.6); what is left is in §2.7 | nothing |
-| 3 | [Validate against real Moonlight](#3-validate-against-real-moonlight) | days | nothing — **do this before 1** |
-| 4 | [Captured golden vectors](#4-captured-sunshine--moonlight-vectors) | days | §3 |
+| 3 | [Validate against real Moonlight](#3-validate-against-real-moonlight) | **done** — a real `moonlight-common-c` client streams from this host; the eight defects it found are in §3 | nothing |
+| 4 | [Captured golden vectors](#4-captured-sunshine--moonlight-vectors) | days | nothing |
 | 5 | [`solstice pair` management socket](#5-solstice-pair-and-a-management-socket) | ~2 days | nothing |
 | 6 | [The still-frame encode cost](#6-the-still-frame-encode-cost) | ~2 days | nothing |
-| 7 | [ENet: audit or reimplement](#7-enet-audit-or-reimplement) | 1–3 weeks | §3 |
+| 7 | [ENet: audit or reimplement](#7-enet-audit-or-reimplement) | 1–3 weeks | nothing |
 | 8 | [Smaller items](#8-smaller-items) | varies | |
 
-§3 should go first. It is the one place left where a wrong assumption made
-consistently at both ends of a test still passes.
+§4 is next. With §3 done, the place where a wrong assumption made consistently
+at both ends still passes is CI, which has no `mlc-probe` in it.
 
 ---
 
@@ -448,41 +454,104 @@ properties of the environment rather than of the backend:
 
 ## 3. Validate against real Moonlight
 
-**Do this first.** It is cheap, everything else assumes the host half is
-correct, and the SPICE half of this project just demonstrated what the
-exercise is worth: pointing the backend at a real `spice-server` for the
-first time found two bugs in an afternoon, neither of which any mock could
-have caught (§2.6).
+**Done.** `tests/tools/mlc-probe/` is a driver linking the real
+`moonlight-common-c` -- the library every Moonlight port shares -- built with
+`LC_DEBUG` (which turns on `FEC_VALIDATION_MODE` and the `LC_ASSERT_VT`
+checks on host-supplied values) and `LC_DEBUG_RECORD_MODE`.
+`crates/solstice/tests/real_moonlight.rs` pairs, launches, hands the session
+to the probe, and asserts on what came back: thirty decoded frames, SPS and
+PPS where the format says they are, audio unwrapped, the recorded elementary
+stream decoded and its barcode counter increasing, and the input the probe
+sent arriving at the backend over ENet. Both skip with a printed note when the
+probe has not been built.
 
-The end-to-end tests use a client written from the same research as the server,
-so a wrong assumption made at *both* ends passes. `moonlight-embedded
--platform fake` is a headless client sharing `moonlight-common-c` with every
-real Moonlight port (`docs/testing.md` §2.1), and `-pin 1234` makes pairing
-scriptable.
+The probe does the streaming half only. Pairing, `/serverinfo` and `/launch`
+are mutual-TLS HTTP that `moonlight-common-c` does not implement -- each port
+has its own app layer for that -- so the harness performs them and passes the
+negotiated parameters in.
 
-Most likely to break, in order:
+### What it found
 
-1. **The ENet control channel** — `rusty_enet` has never met a real peer, and
-   input rides on it.
-2. **The encrypted-RTSP IV byte order** — written little-endian by inference
-   from the control-stream construction, never verified
-   (`docs/implementation-notes.md` §4).
-3. **`NV_KEYBOARD_PACKET.keyCode` endianness** — read from the *absence* of a
-   byte-swap macro rather than from a capture.
+Eight defects, in the order they surfaced. Every one of them was invisible to
+the end-to-end test, because that test's client was written from the same
+notes as the server and agreed with it.
 
-Build the probe client with the three debug flags `docs/testing.md` §2.2
-describes — `FEC_VALIDATION_MODE` especially, which turns the reference client
-into a continuously-asserting FEC oracle — and keep it in
-`tests/tools/mlc-probe/`.
+1. **The encrypted-RTSP IV was missing its tag bytes.** `iv[10]` is `'C'` or
+   `'H'` for the originator and `iv[11]` is `'R'` for the RTSP stream
+   (`RtspConnection.c:122-132`); Solstice zeroed both. The host refused the
+   client's first `OPTIONS` with an authentication failure. The byte order --
+   risk 2 on the old list below -- turned out to be right; the fixed field
+   nobody had looked for was not.
+2. **RTSP is one message per TCP connection**, terminated by the host closing
+   it (`RtspConnection.c:386-517`). Solstice held one connection open for the
+   whole negotiation and kept its state machine on it. Fixed by replying and
+   closing, and moving the negotiation state -- stage ordering, streams set
+   up, and the encryption sequence number -- to the launch session.
+3. **`X-SS-Connect-Data` was never sent.** It is how the client learns the
+   ENet connect data; absent, it connects with `0`, and the host refused the
+   peer as belonging to no session. Dead at
+   `STAGE_CONTROL_STREAM_ESTABLISHMENT`.
+4. **The control port was bound after waiting for the video ping.** The client
+   establishes ENet *before* starting the video stream that sends the ping
+   (`Connection.c:483-497`), so the two sides waited for each other. Our test
+   client pinged immediately and never showed it.
+5. **`X-SS-Ping-Payload` was never sent**, so the client fell back to the
+   4-byte legacy `"PING"` -- which this host refuses on purpose as
+   unauthenticated (`docs/security.md` §2.3). The host therefore never learned
+   where to send and the client timed out with `ML_ERROR_NO_VIDEO_TRAFFIC`.
+   The refusal was right; it was only safe once the payload was actually
+   handed out.
+6. **The FEC parity covered the wrong bytes.** Caught by
+   `FEC_VALIDATION_MODE`: `nvPacket->flags == droppedNvPacket->flags` failed.
+   The NV header has to be written *before* the Reed-Solomon encode and only
+   the fields Sunshine patches afterwards -- the RTP header, `fecInfo`,
+   `multiFecBlocks`, `frameIndex` -- written after it
+   (`docs/moonlight-sunshine-protocol.md` §5.4). Solstice zeroed all 32 header
+   bytes for the encode, so nothing in the NV header survived recovery.
+7. **The declared FEC percentage did not re-derive to the parity count.** When
+   `minRequiredFecPackets` bumps the count, the percentage must be recomputed
+   as `100*P/D`; Solstice bumped the count and declared the configured
+   percentage, so the client built a Reed-Solomon matrix a row short of the
+   host's and every recovery was silently wrong. Also caught by the FEC
+   oracle.
+8. **Audio FEC blocks did not start on a multiple of four.** Solstice reserved
+   sequence numbers for its parity shards, giving bases of 0, 6, 12; the
+   client requires multiples of four and switches audio FEC off for the whole
+   session otherwise (`RtpAudioQueue.c:269-280`). Sunshine's parity packets
+   borrow the next two sequence numbers without consuming them.
 
----
+Two of the three risks named when this item was written are closed by
+inspection rather than by a bug:
+
+- **The ENet control channel** (risk 1) works against a real peer, including
+  input: the probe sends a fixed script of pointer, button, keyboard and
+  scroll events and the test asserts each one reaches the backend.
+- **`NV_KEYBOARD_PACKET.keyCode` endianness** (risk 3) is confirmed correct,
+  and now from the source rather than from the absence of a macro:
+  `InputStream.c:952` writes `LE16(keyCode)`, which is the little-endian read
+  Solstice already had.
+
+### What is still not covered
+
+- **No third-party Moonlight *application* has connected.** The probe is the
+  shared protocol core, which is the part that matters, but moonlight-qt's
+  own HTTP layer, its certificate handling and its platform decoders are not
+  exercised. That is the manual tier (`docs/testing.md` §8).
+- **Only the encrypted paths.** The probe asks for `ENCFLG_ALL`, so the
+  plaintext RTSP and unencrypted video paths still have only our own client.
+- **Only H.264 at one geometry**, and only against the colour-bar backend.
+- **No loss.** `FEC_VALIDATION_MODE` exercises recovery on every frame, but
+  the real network is loopback; §5 of `docs/testing.md` is still the plan for
+  injected loss.
 
 ## 4. Captured Sunshine ↔ Moonlight vectors
 
 `docs/testing.md` §2.4 calls this *"the highest-value artefact early on"* and
 says to capture it **before** writing the packetiser. That did not happen. It
 is the gap that catches a field-offset or endianness error both of our ends
-make consistently — i.e. exactly the three risks in §3.
+make consistently. §3 now catches those too, and caught eight of them — but it
+needs a C toolchain, a network to fetch `moonlight-common-c`, and a minute to
+build. Frozen vectors are what put the same coverage in CI.
 
 Since the *client* generates `rikey`, an instrumented probe can log the session
 key and decrypt the control stream and encrypted RTSP offline. Land the result
@@ -551,8 +620,9 @@ reaches the input parser. That reduces blast radius; it does not remove a
 pre-auth state machine with fragment reassembly and retransmission timers.
 
 `docs/security.md` §2.4 asks for an audit, fuzzing, and readiness to implement
-the subset Moonlight actually uses. §3 should come first — knowing which ENet
-features a real client exercises is what makes "the subset" a finite thing.
+the subset Moonlight actually uses. §3 is done, so "the subset" is now a
+finite thing that can be read off a real session: `mlc-probe` establishes the
+peer, sends input and tears the connection down over it.
 
 ---
 

@@ -9,10 +9,19 @@ the two.
 Moonlight ──GameStream──▶ Solstice ──RFB / SPICE──▶ remote desktop
 ```
 
-**Status: it works end to end.** A Moonlight-shaped client can pair, launch,
-negotiate encrypted RTSP, and receive an encrypted, FEC-protected H.264 stream
-of a real VNC desktop, which decodes to the right pixels. That path is a test
-(`a_client_receives_the_pixels_of_a_real_vnc_desktop`), not a claim.
+**Status: a real Moonlight client streams from it.** Not a Moonlight-shaped
+client of our own -- the actual `moonlight-common-c`, the library every
+Moonlight port shares, built with its FEC oracle and its host-value assertions
+turned on. It pairs, launches, negotiates encrypted RTSP, establishes the ENet
+control stream, receives an encrypted FEC-protected H.264 stream, and sends
+input back. That path is a test (`real_moonlight.rs`), not a claim. Pointing
+it at the host for the first time found **eight** defects that the project's
+own end-to-end test could not, because that test's client was written from the
+same research as the server and agreed with every mistake in it
+([the list](docs/roadmap.md#3-validate-against-real-moonlight)).
+
+The same stack delivers a real VNC desktop to a client that decodes it to the
+right pixels (`a_client_receives_the_pixels_of_a_real_vnc_desktop`).
 
 **Both backends work against a real server.** The SPICE one is complete —
 channel links, the 2D rasteriser, all six image types, video streams, the
@@ -35,7 +44,7 @@ source). No cmake, no nasm, no system libraries.
 
 ```sh
 cargo build --release
-cargo test --workspace        # 660 tests, about 30 s
+cargo test --workspace        # 665 tests, about 30 s
 cargo clippy --workspace --all-targets
 ```
 
@@ -52,6 +61,18 @@ runs entirely without `sudo`: no installer is ever booted, the root
 filesystem is assembled on the host and packed as a stateless initramfs. The
 guest serves **both** backends — QEMU's RFB server and `spice-server` with a
 real `spice-vdagent` — so one image covers the whole T3 tier.
+
+The GameStream half has an equivalent, and it is the one that matters most:
+
+```sh
+./tests/tools/mlc-probe/build.sh  # ~30 s; needs git, gcc, libssl-dev
+```
+
+That fetches `moonlight-common-c` at a pinned commit and builds the real
+client headless, with `FEC_VALIDATION_MODE` and the host-value assertions on.
+`crates/solstice/tests/real_moonlight.rs` then drives a full session through
+it. Same deal: skipped with a printed note when it has not been built.
+[The README](tests/tools/mlc-probe/README.md).
 
 The default features are `vnc` and `openh264`. SPICE is **not** on by default:
 it is excludable at compile time along with its whole dependency tree — the

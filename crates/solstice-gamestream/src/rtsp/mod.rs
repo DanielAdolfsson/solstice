@@ -16,4 +16,4 @@ pub mod sdp;
 
 mod server;
 
-pub use server::{RtspOutcome, RtspServer, StreamPorts};
+pub use server::{RtspOutcome, RtspServer, SessionParams, StreamPorts};

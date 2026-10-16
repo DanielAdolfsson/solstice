@@ -231,20 +231,33 @@ anywhere in this codebase. Worth investigating before anything else.
 > These are *findings* — what is known to be unresolved and why. The plan for
 > acting on them is [`docs/roadmap.md`](roadmap.md).
 
-### The encrypted-RTSP IV construction is assumed, not verified
+### What a real Moonlight found — and what "assumed, not verified" cost
 
-`docs/moonlight-sunshine-protocol.md` §4.1 says the sequence number becomes
-"the low 4 bytes of the AES IV" without saying in which byte order. This
-implementation writes it little-endian, consistent with the control-stream
-construction at `ControlStream.c:548-580`. Both ends of the end-to-end test use
-the same code, so the test would pass either way — this is exactly the class of
-bug a captured Sunshine ↔ Moonlight session would settle, and
-`docs/testing.md` §2.4 is right that the capture should come first.
+This section used to open with a worry: the encrypted-RTSP IV was written
+little-endian *by inference* from the control-stream construction, with both
+ends of the end-to-end test using the same code, so the test would pass either
+way. The worry was well placed and aimed slightly wrong. The byte order was
+right. What was missing was that the IV has a **fixed field** as well as a
+counter — `iv[10]` for the originator and `iv[11]` for the stream
+(`RtspConnection.c:122-132`) — which nobody had looked for, because
+`docs/moonlight-sunshine-protocol.md` §4.1 did not mention it. A real client
+refused the host's first reply and the host refused the client's first
+`OPTIONS`.
 
-The same caveat applies, less severely, to `NV_KEYBOARD_PACKET.keyCode`:
-`moonlight-common-c` assigns it without a byte swap, so it is native-endian and
-therefore little-endian on every platform Moonlight runs on, but that is read
-from the absence of a macro rather than from a capture.
+It was one of eight defects that `tests/tools/mlc-probe/` found on its first
+run; the list is in `docs/roadmap.md` §3. The pattern behind all eight is the
+same and worth stating plainly, because it is the most expensive lesson in
+this project's history: **a test whose client and server were written from the
+same notes tests the notes, not the protocol.** Seven of the eight were in
+code that had unit tests, an end-to-end test, and a documented source
+citation. The eighth — the FEC parity layout — had all of that *and* a
+correct description in the protocol document that the implementation did not
+follow.
+
+`NV_KEYBOARD_PACKET.keyCode` is the happy counter-example: it was read from
+the *absence* of a byte-swap macro and flagged here as weak evidence. It is
+correct, and now rests on `InputStream.c:952` writing `LE16(keyCode)`
+explicitly.
 
 ### `rusty_enet` has not been audited
 
@@ -255,6 +268,16 @@ whose connect data does not match the launch session, and a message layer that
 authenticates every packet with AES-GCM before a byte reaches the input parser.
 That reduces the blast radius; it does not remove the pre-authentication state
 machine.
+
+It does now interoperate: a real `moonlight-common-c` peer connects, carries
+input and disconnects cleanly. That is worth something for the audit, which
+needs to know which ENet features a real client actually exercises — but it
+is evidence about the happy path only, and the advisory in question
+(GHSA-c428-87f8-rrv5) is about the unhappy one.
+
+The connect-data check was also, until the probe ran, *unreachable*: the host
+minted a random value and never told the client, so the only peer it would
+ever have accepted was one that guessed. See `docs/roadmap.md` §3, defect 3.
 
 ### Scaling is nearest-neighbour
 
