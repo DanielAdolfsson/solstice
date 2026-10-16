@@ -38,7 +38,7 @@ What is left is ordinary work.
 | 2 | [SPICE backend](#2-spice-backend) | **implemented and validated against a real QEMU guest**, agent and clipboard included (§2.6); what is left is in §2.7 | nothing |
 | 3 | [Validate against real Moonlight](#3-validate-against-real-moonlight) | **done** — a real `moonlight-common-c` client streams from this host; the eight defects it found are in §3 | nothing |
 | 4 | [Captured golden vectors](#4-captured-sunshine--moonlight-vectors) | **done** — a real session, frozen and replayed in CI; the two defects it found are in §4 | nothing |
-| 5 | [`solstice pair` management socket](#5-solstice-pair-and-a-management-socket) | **done** — `pair`, `status`, `list-clients` and `revoke` reach the running daemon; what is left is in §5 | nothing |
+| 5 | [`solstice pair` management socket](#5-solstice-pair-and-a-management-socket) | **done** — `pair`, `status`, `list-clients` and `revoke` reach the running daemon, and a revocation ends a stream already running; what is left is in §5 | nothing |
 | 6 | [The still-frame encode cost](#6-the-still-frame-encode-cost) | **done** — a still screen drops to a keep-alive rate, about 12× cheaper, and a real `moonlight-common-c` sits through it; what is left is in §6 | nothing |
 | 7 | [ENet: audit or reimplement](#7-enet-audit-or-reimplement) | **done** — reimplemented: the subset Moonlight uses, stricter than ENet before authentication, and held against upstream ENet under loss, the captured session and the real client; what is left is in §7 | nothing |
 | 8 | [Smaller items](#8-smaller-items) | varies | |
@@ -822,15 +822,64 @@ Telling a successful window from an expired one needed the pairing manager to
 remember its result (`PairingManager::paired`): Moonlight reuses its
 certificate, so a client re-pairing leaves the store looking unchanged.
 
+### Revocation ends a running stream
+
+`docs/security.md` §3.4 asks for revocation "with existing sessions torn
+down", and at first `Host::revoke` only removed the launch record. That
+stopped anything new from starting, but a stream already running went on. Now
+`Host` carries a signal that changes whenever a session is ended from outside
+its stream, by `revoke` or by `/cancel`. Each stream subscribes before it
+starts. When its launch record has gone, it sends the client a `TERMINATION`
+and stops.
+
+The details came from the reference client, not from Sunshine:
+
+- **On an encrypted stream, the type is `0x0109` with a four-byte big-endian
+  HRESULT** (`packetTypesGen7Enc`). The host sends
+  `NVST_DISCONN_SERVER_TERMINATED_CLOSED`, `0x80030023`. Once a frame has
+  arrived, Moonlight reports it as `ML_ERROR_GRACEFUL_TERMINATION`, so the
+  user sees the stream end rather than an error. Before the first frame it
+  reports an early termination instead.
+- **Moonlight hangs up the moment it reads one.** It calls
+  `enet_peer_disconnect_now` without waiting for anything. So the host's own
+  `DISCONNECT` must not overtake the `TERMINATION`: the control thread drains
+  what it was asked to send before it looks at its stop flag, then lingers
+  until the client has acknowledged it. The linger is capped at a second, for
+  a client that has already gone.
+- **`/cancel` ends the stream too.** It is the client quitting the app, and
+  Sunshine tears the stream down for it.
+
+`security.pairing_enabled` went with it. The window was always the switch,
+and the key never did anything. It is still accepted, and warned about, so
+that a configuration copied from an older example keeps loading under
+`deny_unknown_fields`.
+
+Tested at three levels. `nvhttp` unit tests check that the signal changes on
+revoke and on `/cancel`, and only for the client that had a session. Three
+tests in `net/control.rs` drive the control thread over a real socket with
+`rusty_enet` as the client. One hangs up on `TERMINATION` the way Moonlight
+does and checks it arrived before any disconnect. One shows that a vanished
+client holds the thread for no more than the linger. The third shows that
+stopping with nothing outstanding does not linger at all. Then
+`revoking_the_client_ends_its_running_stream` in `real_moonlight.rs` revokes
+the reference client mid-stream. `moonlight-common-c` reports a graceful
+termination about 200 ms later. A newly paired client then streams from the
+same daemon.
+
+**Two things it found**, both older than this change:
+
+- **A daemon could serve one stream in its lifetime.** The audio task was
+  spawned detached and looped until a send failed, which on UDP is never. So
+  it outlived its stream and kept the audio port bound, and every later
+  stream failed to bind with `EADDRINUSE`. Nothing had ever run two streams
+  in one process. The media tasks now belong to the stream and end with it.
+- **A stream that failed during setup leaked its control thread.** An early
+  return, such as a client that never sent its video ping, left the thread's
+  stop flag set to run, and the thread held the control port for good. A
+  guard now clears the flag on every return.
+
 ### What is left
 
-- **Revocation does not end a stream already running.** `Host::revoke` removes
-  the client and its launch record, so nothing new starts, but the supervisor's
-  stream task does not watch for it — short of `docs/security.md` §3.4,
-  "with existing sessions torn down". Closing that means giving `run_stream` a
-  cancellation the revoke path can fire.
-- **`security.pairing_enabled` does nothing.** The window is the switch; the
-  key is a leftover from before there was one and could be removed.
 - **The peer-credential refusal is untested**: exercising it needs a second
   uid, which an unprivileged test cannot get.
 
@@ -1063,10 +1112,9 @@ against. The findings are about the old arrangement:
   256-byte buffer above. If Moonlight ever builds a larger control message,
   the client retransmits it unacknowledged until it times out. The `fragments`
   counter in the host's stats is where that would show first.
-- **The host's own sends are untested against a real client.** `Host::send`
-  exists and is covered against upstream ENet, but nothing in the daemon sends
-  `TERMINATION`, rumble or HDR mode yet. Revocation ending a live stream (§5)
-  would be the first user.
+- **Only `TERMINATION` is sent.** Its round trip through `Host::send` is
+  checked against the real client (§5). Rumble and HDR mode have no source in
+  either backend.
 - **The control-loss script is manual.** It belongs in the nightly loss tier
   (`docs/testing.md` §5) when there is one.
 

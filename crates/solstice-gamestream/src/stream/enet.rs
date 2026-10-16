@@ -290,6 +290,13 @@ impl Host {
         self.peer.as_ref().is_some_and(|p| p.connected)
     }
 
+    /// The host's own reliable sends still awaiting acknowledgement. Zero
+    /// means everything sent has arrived, so a caller about to disconnect
+    /// knows a last message was not lost to the disconnect overtaking it.
+    pub fn unacknowledged(&self) -> usize {
+        self.peer.as_ref().map_or(0, |p| p.in_flight.len())
+    }
+
     /// The next event, if any.
     pub fn poll_event(&mut self) -> Option<Event> {
         self.events.pop_front()
@@ -1511,7 +1518,9 @@ mod tests {
     #[test]
     fn the_hosts_own_sends_are_retransmitted_until_acknowledged() {
         let (mut host, mut c, t) = connected();
+        assert_eq!(host.unacknowledged(), 0);
         host.send(t, 0, b"rumble").unwrap();
+        assert_eq!(host.unacknowledged(), 1);
         let (h, cmds) = drain(&mut host).remove(0);
         assert_eq!(cmds[0].body, Body::SendReliable { data: b"rumble" });
         assert_eq!(cmds[0].header.reliable_sequence, 1);
@@ -1529,6 +1538,7 @@ mod tests {
             client(),
             &c.datagram(&[ack_of(0, 1, h2.sent_time.unwrap())]),
         );
+        assert_eq!(host.unacknowledged(), 0);
         host.handle_timeout(later + Duration::from_secs(5));
         assert!(drain(&mut host).is_empty());
         assert!(host.is_connected());

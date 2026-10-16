@@ -10,21 +10,27 @@
 # No root: `unshare -rn` makes us root of a network namespace that holds
 # nothing but its own loopback, and netem goes on that.
 #
-#   ./tests/tools/control-loss.sh          # 20% loss, both directions
-#   ./tests/tools/control-loss.sh 40       # 40%
+#   ./tests/tools/control-loss.sh            # 20% loss, both directions
+#   ./tests/tools/control-loss.sh 40         # 40%
+#   ./tests/tools/control-loss.sh 30 revoke  # a revocation mid-stream, whose
+#                                            # TERMINATION must survive the loss
 #
 # Needs: the probe (tests/tools/mlc-probe/build.sh), unshare, ip, tc, and a
 # kernel with sch_netem.
 set -euo pipefail
 
 LOSS=${1:-20}
+WHICH=${2:-stream}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 MLC=${SOLSTICE_MLC_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/solstice/mlc}
 PROBE=${SOLSTICE_MLC_PROBE:-$MLC/mlc-probe}
-# `the_reference_moonlight_client_streams_from_this_host` runs from base port
-# 49289, and the control port is base + 10.
-CONTROL_PORT=49299
+# Each test runs from its own base port, and the control port is base + 10.
+case $WHICH in
+    stream) TEST=the_reference_moonlight_client_streams_from_this_host; CONTROL_PORT=49299 ;;
+    revoke) TEST=revoking_the_client_ends_its_running_stream; CONTROL_PORT=49699 ;;
+    *) echo "unknown test: $WHICH (stream or revoke)" >&2; exit 2 ;;
+esac
 
 say() { printf '\033[1m==>\033[0m %s\n' "$*" >&2; }
 
@@ -46,7 +52,7 @@ for l in sys.stdin:
 
 say "streaming with ${LOSS}% loss on UDP $CONTROL_PORT"
 unshare -rn env LOSS="$LOSS" PORT="$CONTROL_PORT" TEST_BIN="$TEST_BIN" PROBE="$PROBE" \
-    ROOT="$ROOT" bash -euo pipefail -c '
+    ROOT="$ROOT" TEST="$TEST" bash -euo pipefail -c '
     ip link set lo up
     # Everything to band 1, which is a plain FIFO; only the filters below send
     # anything to band 3, which is netem.
@@ -59,7 +65,7 @@ unshare -rn env LOSS="$LOSS" PORT="$CONTROL_PORT" TEST_BIN="$TEST_BIN" PROBE="$P
     cd "$ROOT/crates/solstice"
     rc=0
     SOLSTICE_MLC_PROBE="$PROBE" "$TEST_BIN" \
-        --exact the_reference_moonlight_client_streams_from_this_host --nocapture || rc=$?
+        --exact "$TEST" --nocapture || rc=$?
     # The proof that loss happened at all.
     tc -s qdisc show dev lo | grep -A1 netem >&2
     exit $rc

@@ -149,9 +149,12 @@ impl Supervisor {
             let backend = self.backend.clone();
             let host = self.host.clone();
             tokio::spawn(async move {
+                let session_id = negotiated.session_id;
                 let result = run_stream(
                     config,
                     backend,
+                    &host,
+                    &session_id,
                     *negotiated.config,
                     key,
                     rikey_id,
@@ -163,8 +166,9 @@ impl Supervisor {
                 if let Err(e) = result {
                     tracing::warn!(error = %e, "stream session ended with an error");
                 }
-                // Whatever happened, the session is over.
-                host.sessions.lock().expect("session lock").clear();
+                // Whatever happened, this session is over. Only this one: with
+                // `max_sessions` above one, another client's is still running.
+                host.remove_session(&session_id);
             });
         }
         Ok(())
@@ -175,6 +179,8 @@ impl Supervisor {
 async fn run_stream(
     config: Config,
     backend: Arc<dyn Backend>,
+    host: &Host,
+    session_id: &str,
     stream_config: StreamConfig,
     key: [u8; 16],
     rikey_id: i32,
@@ -182,6 +188,11 @@ async fn run_stream(
     connect_data: u32,
     bind: IpAddr,
 ) -> std::io::Result<()> {
+    // 0. Watch for the launch record going away -- revocation, or `/cancel`.
+    //    Subscribed before anything else, so an end that lands while the
+    //    stream is still being set up is seen when the loop below starts.
+    let mut ended = host.watch_ended();
+
     // 1. The backend first: if the desktop is unreachable there is no point
     //    binding sockets.
     let session = backend
@@ -224,19 +235,26 @@ async fn run_stream(
     //    own test client pings immediately and so never showed it
     //    (`docs/roadmap.md` §3).
     let (control_tx, mut control_rx) = mpsc::channel(256);
+    let (outgoing_tx, outgoing_rx) = std::sync::mpsc::channel();
     let running = Arc::new(AtomicBool::new(true));
-    {
+    // Every return from here on stops the thread, the early ones included: a
+    // client that never sends its video ping must not leave the control port
+    // held by a thread nobody will stop.
+    let _stop_control = StopOnDrop(running.clone());
+    let control_thread = {
         let socket = control::bind(SocketAddr::new(bind, config.server.control_port()))?;
         let key = stream_config.control_encrypted().then_some(key);
         let running = running.clone();
         std::thread::Builder::new()
             .name("solstice-control".into())
             .spawn(move || {
-                if let Err(e) = control::run(socket, key, connect_data, control_tx, running) {
+                if let Err(e) =
+                    control::run(socket, key, connect_data, control_tx, outgoing_rx, running)
+                {
                     tracing::warn!(error = %e, "control thread ended");
                 }
-            })?;
-    }
+            })?
+    };
 
     // 4b. Now the pings can be waited for.
     let video_peer = media::await_peer(&video_socket, &ping_payload).await?;
@@ -249,9 +267,16 @@ async fn run_stream(
     };
 
     // 5. The pipeline.
+    //
+    //    The media tasks belong to this session and hold its sockets, so they
+    //    are spawned into a set the session owns: dropping it aborts them,
+    //    whichever way this function returns. Left detached, the audio task
+    //    outlived every stream and kept the audio port bound, so a daemon
+    //    could serve exactly one stream in its lifetime (`docs/roadmap.md` §5).
+    let mut media_tasks = tokio::task::JoinSet::new();
     let frame_interval = Duration::from_nanos(1_000_000_000 / stream_config.fps.max(1) as u64);
     let (packets_tx, packets_rx) = mpsc::channel(8);
-    tokio::spawn(media::sender_task(
+    media_tasks.spawn(media::sender_task(
         video_socket.clone(),
         video_peer,
         packets_rx,
@@ -286,7 +311,7 @@ async fn run_stream(
             };
             let channels = stream_config.audio_channels as u8;
             let key = stream_config.audio_encrypted().then_some(key);
-            tokio::spawn(async move {
+            media_tasks.spawn(async move {
                 let mut packetizer = AudioPacketizer::new(audio_config, key.as_ref());
                 let mut ticker = tokio::time::interval(Duration::from_millis(
                     audio_config.packet_duration_ms.max(1) as u64,
@@ -336,8 +361,22 @@ async fn run_stream(
     };
     tokio::pin!(pipeline);
 
+    // An end that landed during setup has already changed the value.
+    ended.mark_changed();
     loop {
         tokio::select! {
+            Ok(()) = ended.changed() => {
+                if !host.has_session(session_id) {
+                    // `docs/security.md` §3.4: a revoked client's session is
+                    // torn down, not left to run out. Told, so that it stops
+                    // rather than reconnecting into a host that refuses it.
+                    tracing::info!(session = %session_id, "the session was ended by the host");
+                    let _ = outgoing_tx.send(control::Outgoing::Terminate(
+                        control::TERMINATED_CLOSED,
+                    ));
+                    break;
+                }
+            }
             exit = &mut pipeline => {
                 tracing::info!(?exit, "pipeline ended");
                 break;
@@ -380,7 +419,21 @@ async fn run_stream(
     let _ = stop_tx.send(());
     running.store(false, std::sync::atomic::Ordering::Relaxed);
     session.close().await;
+    // Their sockets are the next session's ports.
+    media_tasks.shutdown().await;
+    // The thread may linger to see a `TERMINATION` acknowledged. Waited for,
+    // so that the control port is free again before the next session binds it.
+    let _ = tokio::task::spawn_blocking(move || control_thread.join()).await;
     Ok(())
+}
+
+/// Clears the flag the control thread polls, however the stream ends.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 async fn forward_input(session: &dyn Session, event: InputEvent) {

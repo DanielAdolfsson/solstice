@@ -145,7 +145,8 @@ pointed at a client before any desktop is involved.
   state machine each have a named negative test.
 - **`solstice pair`, `status`, `list-clients` and `revoke`** against the
   running daemon, over a Unix socket rather than a web UI. A revocation takes
-  effect in the daemon at once, not at its next restart.
+  effect in the daemon at once, not at its next restart, and ends a stream
+  that client already has running.
 - **RTSP**, plaintext and AES-GCM wrapped, with the ANNOUNCE attribute parser
   and server-side clamping of everything the client asks for.
 - **The video path**: a synthetic frame clock that slows to a keep-alive rate

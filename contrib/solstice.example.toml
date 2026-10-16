@@ -16,8 +16,8 @@ app_title = "Desktop"
 # Require SS_ENC_VIDEO | SS_ENC_AUDIO and refuse clients that will not
 # negotiate them. The stream is someone's screen, not a game.
 require_encryption = true
-# Pairing is opened by `solstice pair --pin NNNN`, never by the config file.
-pairing_enabled    = false
+# Pairing is opened by `solstice pair --pin NNNN`, never by the config file;
+# this is how long it stays open.
 pairing_window     = "60s"
 max_pair_attempts  = 3
 # Empty means loopback only. Widen this deliberately, if at all.
