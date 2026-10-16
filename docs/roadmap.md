@@ -23,6 +23,9 @@ real `spice-server` (§2.6, two bugs) and the GameStream host against a real
 `moonlight-common-c` (§3, **eight**). Neither set was reachable from a mock,
 because a mock written from the same research agrees with the same mistakes.
 
+§1, Tight, is now done too, and validated the same way: offered alone to
+QEMU's RFB server, it reproduces QEMU's own screendump pixel for pixel.
+
 What is left is ordinary work. §4 is the next one worth doing, and it is worth
 less than it was: the probe now covers what the captured vectors were meant to
 catch, so the case for them is regression-pinning in CI without a C toolchain
@@ -30,7 +33,7 @@ rather than discovery.
 
 | | Item | Size | Blocked on |
 |---|---|---|---|
-| 1 | [Tight encoding](#1-tight-encoding-rfb) | ~1 week | nothing |
+| 1 | [Tight encoding](#1-tight-encoding-rfb) | **done** — lossless, advertised first, and exact against a real QEMU server; what is left is in §1 | nothing |
 | 2 | [SPICE backend](#2-spice-backend) | **implemented and validated against a real QEMU guest**, agent and clipboard included (§2.6); what is left is in §2.7 | nothing |
 | 3 | [Validate against real Moonlight](#3-validate-against-real-moonlight) | **done** — a real `moonlight-common-c` client streams from this host; the eight defects it found are in §3 | nothing |
 | 4 | [Captured golden vectors](#4-captured-sunshine--moonlight-vectors) | days | nothing |
@@ -46,107 +49,97 @@ at both ends still passes is CI, which has no `mlc-probe` in it.
 
 ## 1. Tight encoding (RFB)
 
-### Why
+**Done.** `crates/solstice-vnc/src/encodings/tight.rs` decodes fill and basic
+compression with the copy, palette (both widths) and gradient filters, over
+four independently resettable zlib streams. It is advertised first in
+`ENCODINGS`, ahead of ZRLE, and **lossless-only**: no JPEG quality level is
+advertised, and a JPEG rectangle is a protocol error. The byte layout,
+with line references, is `docs/rfb-vnc-protocol.md` §5.1.
 
-Not for performance. `docs/implementation-notes.md` §3 measures the RFB
-decoders at ~14% of a core against an H.264 encoder at 36–83%, so Tight cannot
-move the number that matters. The honest reasons to want it are:
+### Why it was worth doing
 
-- **Compatibility.** Tight is what TigerVNC, TurboVNC and libvncserver prefer.
-  Today Solstice negotiates them all down to ZRLE, which works, but it means
-  every server runs a code path it uses less often than its default.
-- **Bandwidth off-loopback.** `docs/security.md` §6.8 puts the backend on
-  loopback or an SSH tunnel, where 13 Mbit/s is free. If that constraint is
-  ever relaxed — a VNC host across a LAN — Tight's palette and fill
-  sub-encodings beat ZRLE on typical desktop content.
-- **It is the last common encoding missing**, and the decoders are the one part
-  of the RFB client that is genuinely finished otherwise.
+Not for performance, and the measurement agrees (below). The reasons were
+**compatibility** — Tight is what TigerVNC, TurboVNC and libvncserver prefer,
+and negotiating them all down to ZRLE ran every server on a path it uses less
+often — and **bandwidth off-loopback**, should `docs/security.md` §6.8's
+loopback-or-tunnel constraint ever be relaxed.
 
-### What exactly
+### The JPEG question, settled from source
 
-A `tight` module decoding, at minimum:
+The plan said to verify, not assume, that a server sends no JPEG to a client
+that never asked for a quality level. Both servers were read:
 
-- the **compression-control byte**: four zlib-stream reset bits plus a
-  compression-type field;
-- **fill** — a single colour for the whole rectangle (very common, very cheap);
-- **basic**, with its filter-id: *copy*, *palette* (1-bit and 8-bit indexed)
-  and *gradient*;
-- **four independent zlib streams**, selected per rectangle and resettable
-  individually. This is the detail that makes Tight stateful in a *different*
-  way from ZRLE, which has exactly one stream — see the gotcha below;
-- **compact length encoding** (1–3 bytes) for compressed payload sizes.
+- **TigerVNC**: `TightJPEGEncoder::isSupported` is false unless the client sent
+  a quality level, a fine quality level or a subsampling level.
+- **QEMU**: every client starts at `tight.quality = -1`, *"lossless by
+  default"*, and the JPEG path is gated on it. Its gradient filter is further
+  gated on the display's `lossy` option, so a default QEMU never sends one.
 
-> The byte layout above is from general knowledge of the encoding, **not** from
-> a source reading, which is not how the rest of this project's protocol detail
-> was produced. **Task zero is to read `rfbproto.rst` §Tight Encoding and write
-> the layout into `docs/rfb-vnc-protocol.md` §5 with line references**, the way
-> §2 and §3 of that document were done. Everything else here assumes that has
-> happened.
+So no JPEG decoder was needed, and no `zune-jpeg` dependency was taken.
+`set_encodings_lists_what_we_can_actually_decode` now asserts that no quality
+level (−23..−32) and no Tight PNG (−260) is ever listed.
 
-### JPEG: don't
+### How it is tested
 
-Tight's headline win is its JPEG sub-encoding, and for this architecture it is
-a regression. Solstice re-encodes everything to H.264 afterwards, so a JPEG hop
-means double-lossy compression, and `docs/testing.md` §8 names exactly that
-failure — *"the text looks smeary at 10 Mbit"* — as what desktop remoting is
-judged on.
+- **Unit tests** in `tight.rs` per sub-encoding: fill (including that it is
+  one TPIXEL and nothing else, and is exempt from the 2048 width limit), copy
+  with and without a filter id, both palette widths with padded rows, the
+  gradient filter by hand and by round trip, at 888 and 565, and the
+  under-12-bytes raw path, including that it leaves the stream alone.
+- **Four-stream continuity** (`four_streams_stay_continuous_independently`),
+  a **reset mid-session** carried on a fill that must restart only the named
+  stream, and the negative: a missed reset is an error, not garbage.
+- **Decompression bombs**: a chunk is inflated with its rectangle's exact size
+  as the cap, so a bomb is stopped at a few kilobytes rather than at 64 MB,
+  and a chunk that inflates short is refused as well.
+- **The mock** emits Tight on request (`MockConfig::offer_tight`), choosing
+  the sub-encoding by colour count the way real encoders do and spreading
+  rectangles across all four streams as QEMU does. `mock_server.rs` round-
+  trips every sub-encoding exactly, twice, with a full stream reset between.
+- **A real server**: `real_server.rs` offers QEMU **only** Tight and requires
+  the decoded framebuffer to equal QEMU's screendump exactly. QEMU used fill,
+  copy and both palette widths on three of the four streams to draw it.
+  Breaking the TPIXEL byte order makes 463 344 of 480 000 pixels differ.
+- **Fuzzing**: `rfb_rect` reaches `tight::decode` from the wire and
+  `tight::decode_pixels` directly; 5.3 million runs, clean.
 
-Implement Tight **lossless-only**, and do not advertise the JPEG quality-level
-pseudo-encodings (−23..−32). The working assumption is that a server will not
-send JPEG to a client that never asked for a quality level; **verify that in
-TigerVNC's `TightEncoder` before relying on it**, and if it is wrong, the
-decoder needs a JPEG path after all (pure-Rust `zune-jpeg` rather than
-`turbojpeg`, to stay off a C dependency — see `docs/security.md` §5.5).
+### Measured
 
-### Where it plugs in
+`encoding_bench.rs` has a Tight row. Two runs on this machine, against the
+QEMU guest under TCG rather than KVM (the user running them was not in the
+`kvm` group), so the absolute numbers are not comparable with the `Xvnc` table
+in `docs/implementation-notes.md` §3 -- only the rows with each other:
 
 ```
-crates/solstice-vnc/src/encodings/tight.rs      new
-crates/solstice-vnc/src/encodings/mod.rs        declare it; drop the "not implemented" note
-crates/solstice-vnc/src/session.rs              UpdateLoop::framebuffer_update, add the arm
-crates/solstice-vnc/src/session.rs:27 ENCODINGS add encoding::TIGHT — see the invariant below
-crates/solstice-vnc/src/protocol.rs             add TIGHT = 7
-crates/solstice-vnc/src/mock.rs                 teach the mock to emit each sub-encoding
+encoding                     MB/s   updates     CPU %   MPixel/s  bytes/pixel
+ZRLE                         0.74       188      12.0      21.89        0.034
+Tight                        0.63       158       8.8      18.33        0.034
+ZRLE                         0.75       183      11.8      21.80        0.034
+Tight                        0.69       174       9.8      20.72        0.033
 ```
 
-The ZRLE decoder is the closest model: `zrle.rs` already separates the zlib
-stream (owned by the session, passed in) from the tile decoding (a pure
-function over an inflated buffer, which is what makes it testable and
-fuzzable). Tight should follow that split, with four streams instead of one.
+Same bytes per pixel. Tight costs this client about 13% less CPU per pixel
+(0.47–0.48% of a core per MPixel/s against ZRLE's 0.54–0.55). Throughput was
+slightly lower; the likeliest cause is QEMU's side, which defaults Tight to
+compression level 9 and was itself running under TCG, but that has not been
+isolated. Neither moves the number
+that matters, the H.264 encoder at 36–83% of a core.
 
-> **Invariant: do not add `encoding::TIGHT` to `ENCODINGS` until it decodes.**
-> Advertising an encoding this build cannot decode converts a missing feature
-> into a corrupt framebuffer. `set_encodings_lists_what_we_can_actually_decode`
-> (`session.rs`) asserts Tight is absent today; that assertion flips when, and
-> only when, the decoder lands.
+### What is left
 
-### Known gotchas
-
-- **Four zlib streams, not one.** The reset bits are per-stream, and a server
-  may reset one mid-session. Getting this wrong desynchronises the stream and
-  the symptom is not an error — it is a picture that slowly turns to garbage.
-  The ZRLE continuity test (`the_zlib_stream_is_continuous_across_rectangles`)
-  is the model for the regression test, times four.
-- **Decompression bombs.** `zrle.rs` caps inflation at 64 MB per rectangle
-  (`MAX_INFLATED`) because the backend may be a VM the user does not control
-  (`docs/security.md` §5.4). Tight needs the same cap.
-- **Fill rectangles carry no length.** A single pixel, no compression, no
-  stream involvement — easy to get wrong by routing it through the zlib path.
-
-### Done when
-
-- Unit tests per sub-encoding — fill, copy, palette (both widths), gradient —
-  in the style of `zrle.rs`'s tests.
-- A four-stream continuity test, and a reset-mid-session test.
-- The mock server (`mock.rs`) can emit Tight, so `mock_server.rs` covers it.
-- `real_server.rs` gains a case that offers **only** Tight to the guest's
-  RFB server, which is
-  the cleanest way to get deterministic per-encoding coverage from one server
-  (`docs/testing.md` §3.1).
-- `encoding_bench.rs` gains a Tight row, so the performance claim in
-  `docs/implementation-notes.md` §3 is settled with a measurement rather than
-  an argument.
-- The `rfb_rect` fuzz target reaches the Tight decoder.
+- **No TigerVNC or libvncserver Tight server has been tested against.** QEMU
+  is the only real Tight encoder that has met this decoder, and it never sends
+  the gradient filter. The gradient path is covered by unit and mock tests
+  only — an implementation of our own reading, which is exactly the class of
+  risk §3 warns about. libvncserver's encoder (`x11vnc`) has a gradient path
+  and is the obvious second server; whether it can be made to take that path
+  without a quality level has not been checked.
+- **Basic compression without zlib** (`1010`, `1110`) needs its own
+  pseudo-encoding and is not advertised; it would only help on loopback, where
+  the zlib cost is already a small fraction of the encoder's.
+- **No compression-level pseudo-encoding** (−256..−247) is sent. QEMU's level-9
+  default costs the server CPU for bytes that cross loopback; asking for a
+  lower level is a one-line change worth measuring on a real deployment.
 
 ---
 

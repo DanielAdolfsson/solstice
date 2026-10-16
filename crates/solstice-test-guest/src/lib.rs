@@ -519,9 +519,17 @@ impl Guest {
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
 
-        // KVM where it exists, TCG where it does not: a CI runner without
-        // nested virtualisation still runs these, just slower.
-        if Path::new("/dev/kvm").exists() {
+        // KVM where it is usable, TCG where it is not: a CI runner without
+        // nested virtualisation still runs these, just slower. "Usable" means
+        // openable, not merely present -- a user outside the `kvm` group sees
+        // the device node, and `-accel kvm` then fails before QMP is up, which
+        // surfaces as a boot timeout that names nothing useful.
+        if std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/kvm")
+            .is_ok()
+        {
             qemu.args(["-accel", "kvm"]);
         }
 

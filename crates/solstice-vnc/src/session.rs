@@ -10,21 +10,25 @@
 //! (-312) gives a barrier so updates cannot queue unboundedly on a slow link.
 //! Both are requested; both fall back cleanly.
 
+use std::collections::BTreeMap;
+
 use solstice_backend::{BackendEvent, Framebuffer, FramebufferHandle, Rect};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc};
 
+use crate::encodings::tight::TightStreams;
 use crate::encodings::zrle::ZlibStream;
-use crate::encodings::{copy_rect, hextile, raw, rre, zrle};
+use crate::encodings::{copy_rect, hextile, raw, rre, tight, zrle};
 use crate::pixel::PixelFormat;
 use crate::protocol::{client_msg, encoding, server_msg, RectHeader, Result, RfbError};
 
 /// The encodings Solstice advertises, in preference order.
 ///
-/// Tight is absent deliberately: it is not implemented, and advertising an
-/// encoding this build cannot decode would turn a missing feature into a
-/// corrupt framebuffer.
+/// Only what this build decodes: advertising anything else would turn a
+/// missing feature into a corrupt framebuffer. In particular no JPEG quality
+/// level (−23..−32) is listed, which is what keeps Tight lossless.
 pub const ENCODINGS: &[i32] = &[
+    encoding::TIGHT,
     encoding::ZRLE,
     encoding::HEXTILE,
     encoding::RRE,
@@ -132,8 +136,10 @@ pub struct UpdateLoop<R> {
     events: broadcast::Sender<BackendEvent>,
     outgoing: mpsc::Sender<Vec<u8>>,
     zlib: ZlibStream,
+    tight: TightStreams,
     caps: ServerCapabilities,
     continuous: bool,
+    rectangles: BTreeMap<i32, u64>,
 }
 
 impl<R: AsyncRead + Unpin> UpdateLoop<R> {
@@ -157,14 +163,23 @@ impl<R: AsyncRead + Unpin> UpdateLoop<R> {
             events,
             outgoing,
             zlib: ZlibStream::new(),
+            tight: TightStreams::new(),
             caps: ServerCapabilities::default(),
             continuous: false,
+            rectangles: BTreeMap::new(),
         }
     }
 
     /// What the server turned out to support.
     pub fn capabilities(&self) -> ServerCapabilities {
         self.caps
+    }
+
+    /// How many rectangles of each true encoding have been decoded. A server
+    /// may answer with any encoding the client listed, so this is how a test
+    /// learns which ones it actually got.
+    pub fn rectangles_by_encoding(&self) -> &BTreeMap<i32, u64> {
+        &self.rectangles
     }
 
     /// Read and dispatch one server message.
@@ -245,8 +260,12 @@ impl<R: AsyncRead + Unpin> UpdateLoop<R> {
                 encoding::ZRLE => {
                     zrle::decode(&mut self.reader, &self.format, rect, fb, &mut self.zlib).await?
                 }
+                encoding::TIGHT => {
+                    tight::decode(&mut self.reader, &self.format, rect, fb, &mut self.tight).await?
+                }
                 other => return Err(RfbError::UnsupportedEncoding(other)),
             }
+            *self.rectangles.entry(header.encoding).or_default() += 1;
             damage = Some(damage.map_or(rect, |d| d.union(&rect)));
         }
 
@@ -390,9 +409,12 @@ mod tests {
             u16::from_be_bytes([msg[2], msg[3]]) as usize,
             ENCODINGS.len()
         );
-        // Tight must not be advertised: it is not implemented.
-        assert!(!ENCODINGS.contains(&7));
+        assert!(ENCODINGS.contains(&encoding::TIGHT));
         assert!(ENCODINGS.contains(&encoding::ZRLE));
+        // No JPEG quality level, and no Tight PNG: Tight stays lossless, and
+        // the decoder has no JPEG path to receive one.
+        assert!(!ENCODINGS.iter().any(|e| (-32..=-23).contains(e)));
+        assert!(!ENCODINGS.contains(&-260));
         assert!(ENCODINGS.contains(&encoding::PSEUDO_QEMU_EXTENDED_KEY));
     }
 
@@ -630,7 +652,7 @@ mod tests {
                 y: 0,
                 width: 2,
                 height: 2,
-                encoding: 7,
+                encoding: encoding::ZLIB,
             }
             .to_bytes(),
         );
@@ -643,7 +665,7 @@ mod tests {
         );
         assert!(matches!(
             loop_.step().await,
-            Err(RfbError::UnsupportedEncoding(7))
+            Err(RfbError::UnsupportedEncoding(encoding::ZLIB))
         ));
     }
 

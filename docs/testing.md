@@ -228,7 +228,9 @@ A single real server risks coding to *that server's* quirks and shipping a
 client that only works with QEMU's. The cheap guard is not another daemon —
 it is a deliberately minimal server of our own:
 
-- Raw encoding only; no Tight, no ZRLE, no CopyRect
+- Raw encoding only; no ZRLE, no CopyRect. Tight is opt-in
+  (`MockConfig::offer_tight`), because no real server can be made to send each
+  Tight sub-encoding on demand
 - no ContinuousUpdates, no Fence — forces the request/response fallback loop
 - no QEMU Extended Key Event — forces the VK→keysym path
 - RFB 3.3 and 3.8 handshakes; `None` and `VNC Authentication`
@@ -511,7 +513,13 @@ Three practical constraints:
 - **Nested virtualisation.** The guest boots in about five seconds with
   `/dev/kvm` and well under a minute without it, under TCG. Either is fine
   nightly; only the first is comfortable on every push. Whether hosted
-  runners expose `/dev/kvm` should be checked rather than assumed.
+  runners expose `/dev/kvm` should be checked rather than assumed -- and
+  "exposes" means *openable*: a node the user cannot open (not in the `kvm`
+  group) used to make `-accel kvm` fail and surface as a QMP timeout. The
+  harness now opens the device to decide, and falls back to TCG.
+- **QXL needs QEMU's SPICE module** (`qemu-system-modules-spice` on Debian).
+  Without it `-vga qxl` refuses to start, so the RFB tier asks for virtio-gpu
+  instead: QEMU's VNC server reads the same console surface either way.
 - **Memory.** Each guest wants about 1 GiB, and below that the initramfs
   unpacks *partially* — a guest that boots, starts X and is quietly missing
   binaries. The harness refuses to start one when the machine is short, and

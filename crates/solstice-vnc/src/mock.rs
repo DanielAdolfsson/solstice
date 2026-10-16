@@ -8,7 +8,9 @@
 //!
 //! So this server offers:
 //!
-//! * Raw encoding only -- no Tight, no ZRLE, no CopyRect;
+//! * Raw encoding only by default -- no ZRLE, no CopyRect -- with Tight as an
+//!   opt-in ([`MockConfig::offer_tight`]), because no real server the tests
+//!   run against can be made to send each Tight sub-encoding on demand;
 //! * no ContinuousUpdates and no Fence, forcing the request/response fallback;
 //! * no QEMU Extended Key Event, forcing the VK to keysym path;
 //! * RFB 3.3 and 3.8, `None` and `VNC Authentication`;
@@ -18,13 +20,16 @@
 //! precisely: inject a Moonlight key event at one end and assert on the exact
 //! RFB message that came out the other, rather than observing a live desktop.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
+use flate2::{Compress, Compression, FlushCompress};
 use solstice_backend::Rect;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::auth::vnc_auth_response;
+use crate::encodings::tight;
 use crate::pixel::PixelFormat;
 use crate::protocol::{client_msg, encoding, security, server_msg, RectHeader, Result, RfbError};
 
@@ -103,6 +108,11 @@ pub struct MockConfig {
     pub offer_flow_control: bool,
     /// Whether to acknowledge pseudo-encoding -308.
     pub offer_extended_desktop_size: bool,
+    /// Whether to send Tight (7) when the client lists it.
+    pub offer_tight: bool,
+    /// Under Tight, send full-colour rectangles through the gradient filter
+    /// rather than the copy filter.
+    pub tight_gradient: bool,
 }
 
 impl Default for MockConfig {
@@ -117,6 +127,8 @@ impl Default for MockConfig {
             offer_qemu_extended_key: false,
             offer_flow_control: false,
             offer_extended_desktop_size: false,
+            offer_tight: false,
+            tight_gradient: false,
         }
     }
 }
@@ -131,6 +143,19 @@ pub enum MockUpdate {
         /// BGRA colour.
         colour: [u8; 4],
     },
+    /// Arbitrary content, BGRA, row-major. Raw normally; under Tight the
+    /// sub-encoding follows the colour count the way real encoders choose it
+    /// -- one colour is a fill, two a 1-bit palette, up to 256 an 8-bit
+    /// palette, and more the copy or gradient filter.
+    Pixels {
+        /// Where.
+        rect: Rect,
+        /// `rect.width * rect.height` BGRA pixels.
+        pixels: Vec<[u8; 4]>,
+    },
+    /// Reset all four Tight zlib streams: the next Tight rectangle carries the
+    /// reset bits, and the mock's own compressors start over.
+    ResetTightStreams,
     /// A DesktopSize pseudo-rectangle.
     Resize {
         /// New width.
@@ -185,6 +210,8 @@ impl MockServer {
             )));
         };
         let pseudo_reply = self.pseudo_encodings(encodings);
+        let mut tight = (self.config.offer_tight && encodings.contains(&encoding::TIGHT))
+            .then(TightEncoder::new);
         self.record(second);
 
         // Answer the first update request with the acknowledged
@@ -218,23 +245,22 @@ impl MockServer {
         while let Some(update) = updates.recv().await {
             let frame = match update {
                 MockUpdate::Fill { rect, colour } => {
-                    let mut frame = vec![server_msg::FRAMEBUFFER_UPDATE, 0];
-                    frame.extend_from_slice(&1u16.to_be_bytes());
-                    frame.extend_from_slice(
-                        &RectHeader {
-                            x: rect.x as u16,
-                            y: rect.y as u16,
-                            width: rect.width as u16,
-                            height: rect.height as u16,
-                            encoding: encoding::RAW,
-                        }
-                        .to_bytes(),
+                    let pixels = vec![colour; rect.width as usize * rect.height as usize];
+                    self.pixels_frame(rect, &pixels, tight.as_mut())
+                }
+                MockUpdate::Pixels { rect, pixels } => {
+                    assert_eq!(
+                        pixels.len(),
+                        rect.width as usize * rect.height as usize,
+                        "MockUpdate::Pixels needs exactly one pixel per position"
                     );
-                    let pixel = self.encode_pixel(colour);
-                    for _ in 0..rect.width as usize * rect.height as usize {
-                        frame.extend_from_slice(&pixel);
+                    self.pixels_frame(rect, &pixels, tight.as_mut())
+                }
+                MockUpdate::ResetTightStreams => {
+                    if let Some(tight) = tight.as_mut() {
+                        tight.reset_all();
                     }
-                    frame
+                    continue;
                 }
                 MockUpdate::Resize { width, height } => {
                     let mut frame = vec![server_msg::FRAMEBUFFER_UPDATE, 0];
@@ -259,6 +285,49 @@ impl MockServer {
         drop(writer);
         let _ = reader_task.await;
         Ok(())
+    }
+
+    /// One `FramebufferUpdate` carrying `pixels` in `rect`, Raw or Tight.
+    fn pixels_frame(
+        &self,
+        rect: Rect,
+        pixels: &[[u8; 4]],
+        tight: Option<&mut TightEncoder>,
+    ) -> Vec<u8> {
+        let mut frame = vec![server_msg::FRAMEBUFFER_UPDATE, 0];
+        frame.extend_from_slice(&1u16.to_be_bytes());
+        frame.extend_from_slice(
+            &RectHeader {
+                x: rect.x as u16,
+                y: rect.y as u16,
+                width: rect.width as u16,
+                height: rect.height as u16,
+                encoding: if tight.is_some() {
+                    encoding::TIGHT
+                } else {
+                    encoding::RAW
+                },
+            }
+            .to_bytes(),
+        );
+        match tight {
+            Some(tight) => frame.extend(tight.encode(self, rect.width as usize, pixels)),
+            None => {
+                for &colour in pixels {
+                    frame.extend_from_slice(&self.encode_pixel(colour));
+                }
+            }
+        }
+        frame
+    }
+
+    /// A TPIXEL: red, green, blue for 888 formats, otherwise a whole pixel.
+    fn encode_tpixel(&self, bgra: [u8; 4]) -> Vec<u8> {
+        if tight::is_888(&self.config.format) {
+            vec![bgra[2], bgra[1], bgra[0]]
+        } else {
+            self.encode_pixel(bgra)
+        }
     }
 
     fn encode_pixel(&self, bgra: [u8; 4]) -> Vec<u8> {
@@ -366,6 +435,116 @@ impl MockServer {
         writer.write_all(&init).await?;
         writer.flush().await?;
         Ok(())
+    }
+}
+
+/// The mock's Tight encoder: four continuous deflate streams, one per kind of
+/// rectangle, as QEMU assigns them -- 0 for copy, 1 for two-colour, 2 for
+/// indexed and 3 for gradient -- so every stream is exercised and the
+/// interleaving between them is real.
+struct TightEncoder {
+    streams: [Compress; 4],
+    /// Reset bits for the next rectangle.
+    pending_reset: u8,
+}
+
+impl TightEncoder {
+    fn new() -> Self {
+        Self {
+            streams: std::array::from_fn(|_| Compress::new(Compression::default(), true)),
+            pending_reset: 0,
+        }
+    }
+
+    fn reset_all(&mut self) {
+        for stream in &mut self.streams {
+            stream.reset();
+        }
+        self.pending_reset = 0x0F;
+    }
+
+    fn encode(&mut self, server: &MockServer, width: usize, pixels: &[[u8; 4]]) -> Vec<u8> {
+        let reset = std::mem::take(&mut self.pending_reset);
+        let palette: Vec<[u8; 4]> = {
+            let mut seen = BTreeSet::new();
+            for &p in pixels {
+                seen.insert(p);
+                if seen.len() > 256 {
+                    break;
+                }
+            }
+            seen.into_iter().collect()
+        };
+
+        if palette.len() == 1 {
+            let mut out = vec![0x80 | reset];
+            out.extend(server.encode_tpixel(palette[0]));
+            return out;
+        }
+
+        let index = |p: &[u8; 4]| palette.binary_search(p).expect("colour is in the palette") as u8;
+        let (stream, filter, data): (u8, Vec<u8>, Vec<u8>) = if palette.len() <= 256 {
+            let mut filter = vec![1, (palette.len() - 1) as u8];
+            for &colour in &palette {
+                filter.extend(server.encode_tpixel(colour));
+            }
+            let data = if palette.len() == 2 {
+                pixels
+                    .chunks(width)
+                    .flat_map(|row| {
+                        row.chunks(8).map(|eight| {
+                            eight
+                                .iter()
+                                .enumerate()
+                                .fold(0u8, |byte, (i, p)| byte | index(p) << (7 - i))
+                        })
+                    })
+                    .collect()
+            } else {
+                pixels.iter().map(index).collect()
+            };
+            (if palette.len() == 2 { 1 } else { 2 }, filter, data)
+        } else if server.config.tight_gradient && tight::is_888(&server.config.format) {
+            let rgb: Vec<u8> = pixels.iter().flat_map(|p| [p[2], p[1], p[0]]).collect();
+            (3, vec![2], tight::gradient_filter_rgb(width, &rgb))
+        } else {
+            // The implicit copy filter: no filter-id byte at all.
+            let data = pixels
+                .iter()
+                .flat_map(|&p| server.encode_tpixel(p))
+                .collect();
+            (0, Vec::new(), data)
+        };
+
+        let explicit = if filter.is_empty() { 0 } else { 0x40 };
+        let mut out = vec![explicit | stream << 4 | reset];
+        out.extend(filter);
+        if data.len() < tight::MIN_TO_COMPRESS {
+            out.extend(data);
+        } else {
+            let compressed = self.deflate(stream as usize, &data);
+            out.extend(tight::compact_length(compressed.len()));
+            out.extend(compressed);
+        }
+        out
+    }
+
+    /// Continue stream `id` over `data`, sync-flushed so the rectangle is
+    /// complete on the wire while the window carries on.
+    fn deflate(&mut self, id: usize, data: &[u8]) -> Vec<u8> {
+        let stream = &mut self.streams[id];
+        let start = stream.total_in();
+        let mut out = Vec::with_capacity(data.len() + 1024);
+        loop {
+            let consumed = (stream.total_in() - start) as usize;
+            stream
+                .compress_vec(&data[consumed..], &mut out, FlushCompress::Sync)
+                .expect("deflate into a vector");
+            if (stream.total_in() - start) as usize == data.len() && out.len() < out.capacity() {
+                return out;
+            }
+            out.reserve(out.capacity());
+        }
     }
 }
 

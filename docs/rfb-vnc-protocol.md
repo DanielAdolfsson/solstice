@@ -242,6 +242,73 @@ Pseudo-encodings worth requesting (`rfbproto.rst:3066-3098`):
 A client declares its full set once via `SetEncodings`; order expresses
 preference.
 
+### 5.1 Tight (7)
+
+Read from `rfbproto.rst:3414-3627` on 2026-10-16, and checked against
+TigerVNC's `common/rfb/TightDecoder.cxx` and QEMU's `ui/vnc-enc-tight.c` where
+the prose leaves room. Implemented in `crates/solstice-vnc/src/encodings/tight.rs`.
+
+**Width.** A Tight rectangle may be at most 2048 pixels wide (`:3417-3421`).
+TigerVNC's decoder enforces that for everything *except* fill, because its own
+servers before 1.16 sent wider fills; Solstice does the same.
+
+**Compression control** — the first byte of every rectangle (`:3423-3479`):
+
+| Bits | Meaning |
+|---|---|
+| 0–3 | reset zlib stream *n* before decoding — one bit per stream, independent |
+| 7–4 = `0xxx` | **basic**: bits 5–4 pick stream 0–3, bit 6 says a *filter-id* byte follows |
+| 7–4 = `1000` | **fill** |
+| 7–4 = `1001` | **JPEG** — only if the client advertised a quality level (`:3481-3483`) |
+| 7–4 = `1010`, `1110` | **basic without zlib** — only if the client advertised it (`:3485-3486`) |
+| anything else | invalid |
+
+The reset bits apply **whatever the compression type**, fill and JPEG included
+(`:3617-3621`).
+
+**TPIXEL** (`:3488-3495`): a whole `PIXEL`, except that for 32-bit true colour
+with depth 24 and 8-bit channels it is **three bytes, red, green, blue** —
+not the byte order of the pixel. TigerVNC's `is888` additionally requires the
+shifts to be byte-aligned.
+
+**Fill** (`:3500-3503`): one TPIXEL, no length, no stream.
+
+**JPEG** (`:3505-3533`): a compact length, then a JFIF stream.
+
+**Compact length** (`:3516-3531`): one to three bytes, seven bits at a time,
+least significant first; the third byte contributes all eight. 10000 is
+`90 4E`.
+
+**Basic** (`:3535-3615`). With bit 6 set, a filter id follows: 0 copy, 1
+palette, 2 gradient; with it clear, copy.
+
+- *Copy*: TPIXELs.
+- *Palette* (`:3560-3572`): a byte holding size − 1, then that many TPIXELs.
+  Two colours or fewer pack **one bit per pixel, most significant bit
+  leftmost, each row padded to a byte**; more take a byte per pixel. TigerVNC
+  treats a one-colour palette as the 1-bit form too.
+- *Gradient* (`:3574-3594`): each component is sent as `V − P`, where
+  `P = V[left] + V[above] − V[above-left]` clamped to `0..=max`, and anything
+  outside the rectangle counts as zero. Not allowed at 8 bits per pixel. For
+  888 the components are the TPIXEL's bytes; otherwise they are the pixel's
+  channels in their own range.
+
+Filtered data **shorter than 12 bytes is sent as is**, with no length and
+without touching any stream (`:3596-3599`). Otherwise it is a compact length
+and that many bytes of zlib data on the selected stream (`:3604-3615`). The
+four streams are each continuous for the life of the connection until reset,
+and both servers checked sync-flush them per rectangle (QEMU's
+`tight_compress_data`, TigerVNC's `ZlibOutStream::flush`, both
+`Z_SYNC_FLUSH`), so a rectangle's chunk inflates to exactly its filtered size.
+
+**When a server sends JPEG.** The spec's rule (`:3481-3483`) is what the
+servers do. TigerVNC's `TightJPEGEncoder::isSupported` returns false unless
+the client sent a quality level, a fine quality level or a subsampling level.
+QEMU starts every client at `tight.quality = -1` ("lossless by default",
+`ui/vnc.c`) and only takes its JPEG path when that is set. QEMU's gradient
+filter also needs the display's `lossy` option. So a client that lists Tight
+and no quality pseudo-encoding gets lossless Tight from both.
+
 ---
 
 ## 6. Flow control: Fence and ContinuousUpdates
@@ -280,9 +347,9 @@ optimisation, not an architecture.
    a fixed rate and feed it the current framebuffer, repeating when nothing
    changed. Sunshine does the same thing for duplicate frames.
 3. **Decoding Tight and ZRLE is real work.** Tight in particular is a small
-   zoo of sub-encodings (basic/fill/jpeg/png, palette, gradient filters) over a
-   stateful zlib stream. Reaching for an existing client implementation rather
-   than writing one is the right call for v1.
+   zoo of sub-encodings (basic/fill/jpeg/png, palette, gradient filters) over
+   four resettable zlib streams. *(As it turned out, both were written
+   directly — see `PROJECT-LAYOUT.md` — Tight lossless-only, per §5.1.)*
 4. **Input maps cleanly.** Absolute pointer → `PointerEvent`; Moonlight VK
    codes → XT scancodes → `QEMU Extended Key Event`, with an X11-keysym
    fallback. Clipboard maps to `ClientCutText`/`ServerCutText`.
