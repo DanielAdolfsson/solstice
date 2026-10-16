@@ -322,8 +322,10 @@ impl<'a> Sampler<'a> {
         }
         let src_w = self.src.width();
         let src_h = self.src.height();
-        let dx = (x - self.dest.left) as i64;
-        let dy = (y - self.dest.top) as i64;
+        // Widened before subtracting: both are i32 off the wire, and their
+        // difference need not fit one.
+        let dx = x as i64 - self.dest.left as i64;
+        let dy = y as i64 - self.dest.top as i64;
 
         if self.is_one_to_one() {
             return self
@@ -331,10 +333,18 @@ impl<'a> Sampler<'a> {
                 .pixel_signed(self.src.left as i64 + dx, self.src.top as i64 + dy);
         }
 
+        // In i128: every factor is an i32-sized coordinate or extent off the
+        // wire, and a product of three of them does not fit an i64. The
+        // fuzzer found `dx * src_w * 256` overflowing on an 83-byte
+        // `DRAW_COPY`. A position that does not fit back samples nothing.
+        let (dx, dy) = (dx as i128, dy as i128);
+        let (src_w, src_h) = (src_w as i128, src_h as i128);
+        let (dest_w, dest_h) = (dest_w as i128, dest_h as i128);
+        let (left, top) = (self.src.left as i128, self.src.top as i128);
         match self.mode {
             ScaleMode::Nearest => {
-                let u = self.src.left as i64 + dx * src_w / dest_w;
-                let v = self.src.top as i64 + dy * src_h / dest_h;
+                let u = i64::try_from(left + dx * src_w / dest_w).ok()?;
+                let v = i64::try_from(top + dy * src_h / dest_h).ok()?;
                 self.image.pixel_signed(u, v)
             }
             ScaleMode::Interpolate => {
@@ -342,8 +352,8 @@ impl<'a> Sampler<'a> {
                 // tap and no floating point in the inner loop.
                 let fx = (dx * src_w * 256) / dest_w;
                 let fy = (dy * src_h * 256) / dest_h;
-                let u = self.src.left as i64 + (fx >> 8);
-                let v = self.src.top as i64 + (fy >> 8);
+                let u = i64::try_from(left + (fx >> 8)).ok()?;
+                let v = i64::try_from(top + (fy >> 8)).ok()?;
                 let tx = (fx & 0xFF) as u32;
                 let ty = (fy & 0xFF) as u32;
                 let p00 = self.image.pixel_signed(u, v)?;
