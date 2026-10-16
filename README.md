@@ -230,6 +230,7 @@ The strategy is in [docs/testing.md](docs/testing.md); what exists today:
 |---|---|---|
 | T0 | Unit and property tests on pure functions | throughout; 381 total |
 | T1 | **Differential FEC vectors against the real `nanors`** | `tests/vectors/fec/`, `crates/solstice-gamestream/tests/fec_vectors.rs` |
+| T1 | **A real Moonlight session, captured and replayed**: the client's RTSP, pings and control messages decoded, the host's responses and packets reproduced byte for byte | `tests/vectors/capture/`, `crates/solstice-gamestream/tests/capture_vectors.rs` |
 | T2 | The RFB client against a deliberately minimal recording mock server | `crates/solstice-vnc/tests/mock_server.rs` |
 | T3 | The RFB client against **QEMU's RFB server**, on the same guest the SPICE tests use — skipped with a note when QEMU or the guest image is absent | `crates/solstice-vnc/tests/real_server.rs` |
 | T3 | **The whole stack end to end**: pair, launch, RTSP, decrypt, reassemble, decode H.264 — twice, once against the colour-bar generator reading the frame counter off the picture, and once against a real guest desktop checking the pixels are the colour it was painted | `crates/solstice/tests/end_to_end.rs` |

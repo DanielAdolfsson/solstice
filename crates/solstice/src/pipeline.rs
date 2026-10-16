@@ -245,7 +245,10 @@ mod tests {
         assert!(!first.is_empty());
         let (header, payload) = VideoPacketHeader::parse(&first[0]).unwrap();
         assert!(header.nv.flags & flags::SOF != 0);
-        assert_eq!(header.nv.frame_index, 0);
+        assert_eq!(
+            header.nv.frame_index,
+            solstice_gamestream::stream::video_tx::FIRST_FRAME_INDEX
+        );
         let fh = solstice_gamestream::wire::video::FrameHeader::parse(
             &mut solstice_gamestream::wire::Reader::new(payload),
         )

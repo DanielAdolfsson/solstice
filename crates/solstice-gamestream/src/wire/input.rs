@@ -175,11 +175,12 @@ fn decode_record(magic: u32, r: &mut Reader<'_>) -> Result<InputRecord> {
             down: magic == magic::MOUSE_BUTTON_DOWN,
             button: r.u8()?,
         },
-        magic::SCROLL => {
-            r.skip(1)?; // zero1
-            let amount = r.i16be()?;
-            InputRecord::Scroll { amount }
-        }
+        // `NV_SCROLL_PACKET` is `scrollAmt1`, `scrollAmt2` (a copy) and
+        // `zero3`, straight after the header (`Input.h:113-118`). There is no
+        // padding byte in front: one was assumed here once, which read every
+        // real client's 120 as 0x7800, and the encoder below agreed with it.
+        // Caught by the captured session (`docs/roadmap.md` §4).
+        magic::SCROLL => InputRecord::Scroll { amount: r.i16be()? },
         magic::HSCROLL => InputRecord::HScroll { amount: r.i16be()? },
         magic::UTF8_TEXT => {
             let bytes = r.peek_rest();
@@ -248,7 +249,6 @@ pub fn encode_record(record: &InputRecord) -> Vec<u8> {
             }
         }
         InputRecord::Scroll { amount } => {
-            body.push(0);
             body.extend_from_slice(&amount.to_be_bytes());
             body.extend_from_slice(&amount.to_be_bytes());
             body.extend_from_slice(&0u16.to_be_bytes());
@@ -375,6 +375,21 @@ mod tests {
         }]);
         batch[0..4].copy_from_slice(&999u32.to_be_bytes());
         assert!(decode_batch(&batch).is_err());
+    }
+
+    /// The bytes `LiSendScrollEvent(-1)` produces (`InputStream.c:1225-1234`):
+    /// a big-endian size of 10, the little-endian magic, then -120 twice and
+    /// a zero.
+    #[test]
+    fn scroll_matches_the_reference_clients_layout() {
+        let wire = [
+            0x00, 0x00, 0x00, 0x0A, 0x0A, 0x00, 0x00, 0x00, 0xFF, 0x88, 0xFF, 0x88, 0x00, 0x00,
+        ];
+        assert_eq!(
+            decode_batch(&wire).unwrap(),
+            [InputRecord::Scroll { amount: -120 }]
+        );
+        assert_eq!(encode_batch(&[InputRecord::Scroll { amount: -120 }]), wire);
     }
 
     #[test]
