@@ -91,6 +91,55 @@ pub mod clipboard_type {
     pub const FILE_LIST: u32 = 6;
 }
 
+/// A clipboard payload type this client is willing to name.
+///
+/// `FILE_LIST` is deliberately absent. It names files the guest then expects
+/// to pull across with `FILE_XFER_START`, and file transfer is not
+/// implemented -- so claiming to understand the type would strand the guest
+/// waiting for a transfer that never begins. `NONE` is absent for a
+/// different reason: it is not a type but the answer "there is nothing", and
+/// it is carried by [`crate::backend::ClipboardEvent::Unavailable`] instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ClipboardType {
+    /// `VD_AGENT_CLIPBOARD_UTF8_TEXT`.
+    Utf8Text,
+    /// `VD_AGENT_CLIPBOARD_IMAGE_PNG`.
+    Png,
+    /// `VD_AGENT_CLIPBOARD_IMAGE_BMP`.
+    Bmp,
+    /// `VD_AGENT_CLIPBOARD_IMAGE_TIFF`.
+    Tiff,
+    /// `VD_AGENT_CLIPBOARD_IMAGE_JPG`.
+    Jpeg,
+}
+
+impl ClipboardType {
+    /// Read one off the wire, or `None` for a type this client will not
+    /// claim to handle.
+    pub fn from_wire(raw: u32) -> Option<Self> {
+        Some(match raw {
+            clipboard_type::UTF8_TEXT => ClipboardType::Utf8Text,
+            clipboard_type::IMAGE_PNG => ClipboardType::Png,
+            clipboard_type::IMAGE_BMP => ClipboardType::Bmp,
+            clipboard_type::IMAGE_TIFF => ClipboardType::Tiff,
+            clipboard_type::IMAGE_JPG => ClipboardType::Jpeg,
+            _ => return None,
+        })
+    }
+
+    /// The `VD_AGENT_CLIPBOARD_*` number.
+    pub fn to_wire(self) -> u32 {
+        match self {
+            ClipboardType::Utf8Text => clipboard_type::UTF8_TEXT,
+            ClipboardType::Png => clipboard_type::IMAGE_PNG,
+            ClipboardType::Bmp => clipboard_type::IMAGE_BMP,
+            ClipboardType::Tiff => clipboard_type::IMAGE_TIFF,
+            ClipboardType::Jpeg => clipboard_type::IMAGE_JPG,
+        }
+    }
+}
+
 /// `VD_AGENT_SUCCESS` (`vd_agent.h:265-268`).
 pub const REPLY_SUCCESS: u32 = 1;
 
@@ -101,6 +150,13 @@ pub const REPLY_SUCCESS: u32 = 1;
 /// without bound. Clipboard contents are the only thing that legitimately
 /// gets large, and a megabyte of it is already generous.
 pub const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
+
+/// The largest clipboard payload this client will send or accept.
+///
+/// [`MAX_MESSAGE_SIZE`] minus the four bytes `VDAgentClipboard` spends on
+/// the type, because `VD_AGENT_MAX_CLIPBOARD` counts the payload and not the
+/// word in front of it.
+pub const MAX_CLIPBOARD_PAYLOAD: u32 = MAX_MESSAGE_SIZE - 4;
 
 /// A reassembled agent message.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,6 +212,21 @@ impl Agent {
     /// Whether a resize request can be honoured.
     pub fn can_resize(&self) -> bool {
         self.is_connected() && self.guest_has(cap::MONITORS_CONFIG)
+    }
+
+    /// Whether clipboard messages can be exchanged.
+    ///
+    /// `CLIPBOARD_BY_DEMAND` alone, and deliberately **not** `CLIPBOARD` as
+    /// well. The bare bit means the superseded flow where a grab carries the
+    /// payload with it; the grab/request/data exchange implemented here is
+    /// the by-demand one. A real `spice-vdagent` announces only the latter
+    /// -- `vdagentd.c`'s `send_capabilities` never sets `CLIPBOARD` -- so a
+    /// gate that wanted both would refuse every guest in existence. That is
+    /// not a deduction: requiring both is what the first draft of this did,
+    /// and the real agent in `a_real_agent_hands_over_the_guests_clipboard`
+    /// is what caught it. `spice-gtk` gates on the same single bit.
+    pub fn can_clipboard(&self) -> bool {
+        self.is_connected() && self.guest_has(cap::CLIPBOARD_BY_DEMAND)
     }
 
     /// Tokens currently held.
@@ -223,8 +294,28 @@ impl Agent {
         self.send(msg::MONITORS_CONFIG, &w.finish())
     }
 
-    /// Offer the guest a clipboard payload type.
+    /// Tell the guest the largest clipboard payload this client will accept.
+    ///
+    /// Worth sending rather than relying on [`MAX_MESSAGE_SIZE`] alone. That
+    /// ceiling is enforced on arrival, and arriving past it ends the channel
+    /// -- the reassembler has no way to walk past a message it refused to
+    /// buffer. `VD_AGENT_MAX_CLIPBOARD` moves the enforcement into the
+    /// guest, where an oversized selection is simply never sent. Without it
+    /// a large copy inside the guest would cost the session.
+    pub fn max_clipboard(&mut self) -> Vec<OutMessage> {
+        if !self.is_connected() || !self.guest_has(cap::MAX_CLIPBOARD) {
+            return Vec::new();
+        }
+        let mut w = Writer::new();
+        w.i32(MAX_CLIPBOARD_PAYLOAD as i32);
+        self.send(msg::MAX_CLIPBOARD, &w.finish())
+    }
+
+    /// Offer the guest this client's clipboard in these types.
     pub fn clipboard_grab(&mut self, types: &[u32]) -> Vec<OutMessage> {
+        if !self.can_clipboard() {
+            return Vec::new();
+        }
         let mut w = Writer::new();
         for kind in types {
             w.u32(*kind);
@@ -234,20 +325,40 @@ impl Agent {
 
     /// Ask the guest for the clipboard in a type it offered.
     pub fn clipboard_request(&mut self, kind: u32) -> Vec<OutMessage> {
+        if !self.can_clipboard() {
+            return Vec::new();
+        }
         let mut w = Writer::new();
         w.u32(kind);
         self.send(msg::CLIPBOARD_REQUEST, &w.finish())
     }
 
-    /// Send the clipboard to the guest.
-    pub fn clipboard_data(&mut self, kind: u32, data: &[u8]) -> Vec<OutMessage> {
+    /// Send the clipboard to the guest, in answer to a request.
+    ///
+    /// `kind` may be [`clipboard_type::NONE`] with an empty payload, which
+    /// is how the protocol says "the offer cannot be honoured after all" --
+    /// and saying it matters, because the guest's paste blocks until
+    /// something answers.
+    pub fn clipboard_data(&mut self, kind: u32, data: &[u8]) -> Result<Vec<OutMessage>> {
+        if data.len() > MAX_CLIPBOARD_PAYLOAD as usize {
+            return Err(SpiceError::limit(format!(
+                "a clipboard payload of {} bytes exceeds the {MAX_CLIPBOARD_PAYLOAD} byte ceiling",
+                data.len()
+            )));
+        }
+        if !self.can_clipboard() {
+            return Ok(Vec::new());
+        }
         let mut w = Writer::new();
         w.u32(kind).bytes(data);
-        self.send(msg::CLIPBOARD, &w.finish())
+        Ok(self.send(msg::CLIPBOARD, &w.finish()))
     }
 
     /// Take back a clipboard offer.
     pub fn clipboard_release(&mut self) -> Vec<OutMessage> {
+        if !self.can_clipboard() {
+            return Vec::new();
+        }
         self.send(msg::CLIPBOARD_RELEASE, &[])
     }
 
@@ -351,11 +462,27 @@ impl Agent {
 /// honest one: monitors config and the clipboard, which this client
 /// implements, and nothing else -- announcing a capability a client does not
 /// have is how a guest ends up waiting for a reply that never comes.
+///
+/// `CLIPBOARD` is absent for that reason and not by oversight: it names the
+/// superseded flow in which a grab carries the payload with it, which this
+/// client neither sends nor would know what to do with. `CLIPBOARD_BY_DEMAND`
+/// is the grab/request/data exchange, and it is the only clipboard bit a real
+/// `spice-vdagent` or `spice-gtk` sets either.
+///
+/// `CLIPBOARD_SELECTION` is the notable absentee, and its absence is load
+/// bearing rather than incidental. With it, every clipboard message gains a
+/// four-byte `VDAgentClipboardSelection` prefix naming X11's `CLIPBOARD` or
+/// `PRIMARY`, and `spice-vdagent` decides whether to write that prefix from
+/// *this* announcement (`vdagentd.c` reads the client's capabilities, not
+/// its own). Leaving it out therefore keeps the unprefixed framing on both
+/// directions, and the selection defaults to `CLIPBOARD` -- the one a paste
+/// uses. `PRIMARY` is X11's middle-click selection, which no GameStream
+/// client has a way to ask for.
 pub fn announce_capabilities(request: bool) -> Vec<u8> {
     let caps = crate::protocol::Caps::from_bits(&[
         cap::MONITORS_CONFIG,
-        cap::CLIPBOARD,
         cap::CLIPBOARD_BY_DEMAND,
+        cap::MAX_CLIPBOARD,
         cap::REPLY,
     ]);
     let mut w = Writer::new();
@@ -527,8 +654,217 @@ mod tests {
         assert_eq!(r.u32().unwrap(), 1, "requests one back");
         let caps = crate::protocol::Caps::from_words(vec![r.u32().unwrap()]);
         assert!(caps.has(cap::MONITORS_CONFIG));
-        assert!(caps.has(cap::CLIPBOARD));
+        assert!(caps.has(cap::CLIPBOARD_BY_DEMAND));
         assert!(!caps.has(cap::FILE_XFER_DETAILED_ERRORS));
         assert!(!caps.has(cap::DISPLAY_CONFIG));
+    }
+
+    /// The prefix question, asserted rather than left to a comment: with
+    /// `CLIPBOARD_SELECTION` announced every clipboard message grows a
+    /// four-byte `VDAgentClipboardSelection` in front of its type, and
+    /// `spice-vdagent` decides to write it from *this* word. Every encoder
+    /// below writes the type first, so the two have to agree.
+    #[test]
+    fn the_clipboard_capabilities_announced_are_the_ones_the_encoding_assumes() {
+        let body = announce_capabilities(false);
+        let mut r = Reader::new(&body);
+        r.u32().unwrap();
+        let caps = crate::protocol::Caps::from_words(vec![r.u32().unwrap()]);
+        assert!(
+            caps.has(cap::CLIPBOARD_BY_DEMAND),
+            "the flow implemented here"
+        );
+        assert!(
+            caps.has(cap::MAX_CLIPBOARD),
+            "so the ceiling can be declared"
+        );
+        assert!(
+            !caps.has(cap::CLIPBOARD),
+            "the superseded flow, which a grab here never carries a payload for"
+        );
+        assert!(
+            !caps.has(cap::CLIPBOARD_SELECTION),
+            "announcing it would add a selection word in front of every type"
+        );
+    }
+
+    /// Enough of a guest to exchange a clipboard with.
+    fn clipboard_agent() -> Agent {
+        let mut agent = connected_agent(100);
+        agent
+            .note_capabilities(&announce_capabilities(false))
+            .unwrap();
+        agent.queue.clear();
+        agent
+    }
+
+    /// Strip the `VDAgentMessage` header off a queued chunk.
+    fn agent_body(message: &OutMessage) -> (u32, Vec<u8>) {
+        let mut r = Reader::new(&message.body);
+        assert_eq!(r.u32().unwrap(), PROTOCOL);
+        let kind = r.u32().unwrap();
+        r.u64().unwrap();
+        let size = r.u32().unwrap() as usize;
+        (
+            kind,
+            message.body[MESSAGE_HEADER..MESSAGE_HEADER + size].to_vec(),
+        )
+    }
+
+    #[test]
+    fn every_clipboard_message_needs_the_guest_to_have_said_it_can() {
+        let mut agent = connected_agent(100);
+        assert!(!agent.can_clipboard(), "nothing announced yet");
+        assert!(agent
+            .clipboard_grab(&[clipboard_type::UTF8_TEXT])
+            .is_empty());
+        assert!(agent
+            .clipboard_request(clipboard_type::UTF8_TEXT)
+            .is_empty());
+        assert!(agent
+            .clipboard_data(clipboard_type::UTF8_TEXT, b"x")
+            .unwrap()
+            .is_empty());
+        assert!(agent.clipboard_release().is_empty());
+        assert!(agent.max_clipboard().is_empty());
+
+        agent
+            .note_capabilities(&announce_capabilities(false))
+            .unwrap();
+        assert!(agent.can_clipboard());
+        assert!(!agent
+            .clipboard_grab(&[clipboard_type::UTF8_TEXT])
+            .is_empty());
+    }
+
+    /// The gate is `CLIPBOARD_BY_DEMAND` and nothing else. `CLIPBOARD`
+    /// alone is the superseded flow in which a grab carries the payload, and
+    /// a guest announcing only that cannot answer a request -- but, more to
+    /// the point, no guest announces it at all: `vdagentd`'s
+    /// `send_capabilities` sets `BY_DEMAND` and never the bare bit. A gate
+    /// wanting both refuses every real agent, which is exactly what the
+    /// first version of this did until a real one was pointed at it.
+    #[test]
+    fn the_clipboard_gate_is_by_demand_and_does_not_also_want_the_superseded_bit() {
+        let announce = |bits: &[u32]| {
+            let mut w = Writer::new();
+            w.u32(0)
+                .u32(crate::protocol::Caps::from_bits(bits).words()[0]);
+            w.finish()
+        };
+
+        let mut agent = connected_agent(100);
+        agent
+            .note_capabilities(&announce(&[cap::CLIPBOARD]))
+            .unwrap();
+        assert!(agent.guest_has(cap::CLIPBOARD));
+        assert!(
+            !agent.can_clipboard(),
+            "the superseded flow is not implemented"
+        );
+
+        // What `spice-vdagent` actually announces: by-demand, no bare bit.
+        let mut agent = connected_agent(100);
+        agent
+            .note_capabilities(&announce(&[cap::CLIPBOARD_BY_DEMAND]))
+            .unwrap();
+        assert!(!agent.guest_has(cap::CLIPBOARD));
+        assert!(agent.can_clipboard());
+    }
+
+    #[test]
+    fn a_grab_names_every_type_offered_in_order() {
+        let mut agent = clipboard_agent();
+        let messages =
+            agent.clipboard_grab(&[clipboard_type::UTF8_TEXT, clipboard_type::IMAGE_PNG]);
+        let (kind, body) = agent_body(&messages[0]);
+        assert_eq!(kind, msg::CLIPBOARD_GRAB);
+        let mut r = Reader::new(&body);
+        assert_eq!(r.u32().unwrap(), clipboard_type::UTF8_TEXT);
+        assert_eq!(r.u32().unwrap(), clipboard_type::IMAGE_PNG);
+        assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn a_payload_goes_out_as_its_type_followed_by_the_bytes() {
+        let mut agent = clipboard_agent();
+        let messages = agent
+            .clipboard_data(clipboard_type::UTF8_TEXT, b"hello")
+            .unwrap();
+        let (kind, body) = agent_body(&messages[0]);
+        assert_eq!(kind, msg::CLIPBOARD);
+        assert_eq!(&body[..4], clipboard_type::UTF8_TEXT.to_le_bytes());
+        assert_eq!(&body[4..], b"hello");
+    }
+
+    /// The ceiling is checked before the queue, so an oversized payload
+    /// costs an error rather than a megabyte of tokens.
+    #[test]
+    fn a_payload_past_the_ceiling_is_refused_before_it_is_queued() {
+        let mut agent = clipboard_agent();
+        let before = agent.tokens();
+        let huge = vec![0u8; MAX_CLIPBOARD_PAYLOAD as usize + 1];
+        let err = agent
+            .clipboard_data(clipboard_type::UTF8_TEXT, &huge)
+            .unwrap_err();
+        assert!(matches!(err, SpiceError::Limit(_)), "{err}");
+        assert!(agent.queue.is_empty());
+        assert_eq!(agent.tokens(), before, "nothing was spent");
+
+        // And the largest allowed one still fits inside the ceiling the
+        // receiving half enforces.
+        let biggest = vec![0u8; MAX_CLIPBOARD_PAYLOAD as usize];
+        let sent = agent
+            .clipboard_data(clipboard_type::UTF8_TEXT, &biggest)
+            .unwrap();
+        let declared: u32 = {
+            let mut r = Reader::new(&sent[0].body);
+            r.skip(12).unwrap();
+            r.u32().unwrap()
+        };
+        assert!(declared <= MAX_MESSAGE_SIZE);
+    }
+
+    #[test]
+    fn the_ceiling_is_declared_to_a_guest_that_can_hear_it() {
+        let mut agent = clipboard_agent();
+        let messages = agent.max_clipboard();
+        let (kind, body) = agent_body(&messages[0]);
+        assert_eq!(kind, msg::MAX_CLIPBOARD);
+        assert_eq!(body, (MAX_CLIPBOARD_PAYLOAD as i32).to_le_bytes());
+
+        // A guest that never announced the capability is not told, because
+        // it would read the message as one it does not know.
+        let mut agent = connected_agent(100);
+        let mut w = Writer::new();
+        w.u32(0).u32(
+            crate::protocol::Caps::from_bits(&[cap::CLIPBOARD, cap::CLIPBOARD_BY_DEMAND]).words()
+                [0],
+        );
+        agent.note_capabilities(&w.finish()).unwrap();
+        assert!(agent.can_clipboard());
+        assert!(agent.max_clipboard().is_empty());
+    }
+
+    #[test]
+    fn clipboard_types_round_trip_and_the_ones_this_client_will_not_claim_do_not() {
+        for kind in [
+            ClipboardType::Utf8Text,
+            ClipboardType::Png,
+            ClipboardType::Bmp,
+            ClipboardType::Tiff,
+            ClipboardType::Jpeg,
+        ] {
+            assert_eq!(ClipboardType::from_wire(kind.to_wire()), Some(kind));
+        }
+        assert_eq!(
+            ClipboardType::from_wire(clipboard_type::UTF8_TEXT),
+            Some(ClipboardType::Utf8Text)
+        );
+        // `NONE` is an answer, not a type; `FILE_LIST` would promise a file
+        // transfer this client does not implement.
+        assert_eq!(ClipboardType::from_wire(clipboard_type::NONE), None);
+        assert_eq!(ClipboardType::from_wire(clipboard_type::FILE_LIST), None);
+        assert_eq!(ClipboardType::from_wire(9999), None);
     }
 }

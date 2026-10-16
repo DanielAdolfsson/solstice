@@ -31,7 +31,7 @@ rather than discovery.
 | | Item | Size | Blocked on |
 |---|---|---|---|
 | 1 | [Tight encoding](#1-tight-encoding-rfb) | ~1 week | nothing |
-| 2 | [SPICE backend](#2-spice-backend) | **implemented and validated against a real QEMU guest**, agent included (§2.6); what is left is in §2.7 | nothing |
+| 2 | [SPICE backend](#2-spice-backend) | **implemented and validated against a real QEMU guest**, agent and clipboard included (§2.6); what is left is in §2.7 | nothing |
 | 3 | [Validate against real Moonlight](#3-validate-against-real-moonlight) | **done** — a real `moonlight-common-c` client streams from this host; the eight defects it found are in §3 | nothing |
 | 4 | [Captured golden vectors](#4-captured-sunshine--moonlight-vectors) | days | nothing |
 | 5 | [`solstice pair` management socket](#5-solstice-pair-and-a-management-socket) | ~2 days | nothing |
@@ -156,9 +156,9 @@ fuzzable). Tight should follow that split, with four streams instead of one.
 behind the `spice` Cargo feature. `backend.kind = "spice"` builds a working
 backend, and `tests/real_server.rs` drives it against a live `spice-server`
 inside a booted QEMU guest — across every image codec, video streams, input,
-and a real `spice-vdagent` (§2.6). What is left is the clipboard, the QXL
-draw-command assertions and audio (§2.7), plus the deliberate omissions in
-§2.5.
+and a real `spice-vdagent` (§2.6) — resize, absolute mouse and the clipboard.
+What is left is the QXL draw-command assertions and audio (§2.7), plus the
+deliberate omissions in §2.5.
 
 ### Why it was worth it
 
@@ -175,7 +175,7 @@ mouse**. `docs/spice-protocol.md` §8 is the full analysis.
 | `link.rs` | the per-channel handshake and the RSA-OAEP/MGF1-SHA-1 ticket |
 | `channel.rs` | mini and full message headers, sub-message lists, `PING`/`NOTIFY`/`DISCONNECTING`, and the `SET_ACK` window |
 | `main_channel.rs` | `MAIN_INIT`, `CHANNELS_LIST`, mouse mode, the agent tunnel |
-| `agent.rs` | `spice-vdagent`: `MONITORS_CONFIG` resize, capability exchange, clipboard, token flow control |
+| `agent.rs` | `spice-vdagent`: `MONITORS_CONFIG` resize, capability exchange, the by-demand clipboard, token flow control |
 | `display/` | surfaces, the `DRAW_*` set, `COPY_BITS`, six image types, video streams, and the framebuffer the encoder reads |
 | `cursor.rs` | five of SPICE's seven cursor types, composited into the framebuffer |
 | `inputs.rs` | scancodes and pointer messages, with `MOUSE_MOTION_ACK` flow control |
@@ -283,9 +283,33 @@ A server that opens a stream in anything else is told so with the
 `STREAM_REPORT` the protocol defines for it — `num_frames = 0` with
 `num_drops = 0xffffffff` — and falls back to draw commands.
 
-**M6 — the agent.** `MONITORS_CONFIG`, capability exchange, and the clipboard
-messages. `request_resize` returns `false` when there is no agent, which is
-the same best-effort contract the RFB backend's `ExtendedDesktopSize` has.
+**M6 — the agent.** `MONITORS_CONFIG`, capability exchange, and the clipboard.
+`request_resize` returns `false` when there is no agent, which is the same
+best-effort contract the RFB backend's `ExtendedDesktopSize` has, and every
+clipboard call on the session reads the same way.
+
+The clipboard was finished afterwards, and the two things that mattered were
+both found by pointing a real `spice-vdagent` at it rather than by reading:
+
+- **the capability gate.** `vdagentd`'s `send_capabilities` sets
+  `CLIPBOARD_BY_DEMAND` and never the bare `CLIPBOARD` bit, so a gate wanting
+  both — which is what the first draft had — refuses every guest in
+  existence. `spice-gtk` gates on the single bit too.
+- **`VD_AGENT_MAX_CLIPBOARD`.** Without it the 1 MiB ceiling on a
+  reassembled agent message is enforced only on arrival, and arriving past it
+  ends the main channel, because the reassembler cannot walk past a message
+  it refused to buffer. Declaring the ceiling moves the enforcement into the
+  guest, where an oversized selection is simply never sent. The guest's log
+  answers with `Set max clipboard: 1048572`.
+
+`CLIPBOARD_SELECTION` is deliberately **not** announced, and that is what
+keeps the framing simple: with it, every clipboard message grows a four-byte
+`VDAgentClipboardSelection` in front of its type, and `spice-vdagent` decides
+whether to write that prefix from the *client's* announcement rather than its
+own. Leaving it out keeps both directions unprefixed and the selection at
+X11's `CLIPBOARD`, which is the one a paste uses; `PRIMARY` is middle-click,
+which no GameStream client can ask for. Both real-server tests confirm the
+unprefixed framing in the direction they drive.
 
 **M7 — audio.** Opus packets are forwarded as `AudioFormat::Opus` rather than
 decoded, which is the repacketise-not-transcode path §7 of the protocol notes
@@ -295,11 +319,13 @@ question for the pipeline and is not yet answered.
 
 ### 2.4 How it is tested
 
-- **213 unit and mock tests** in the crate, plus the 88 in
+- **232 unit and mock tests** in the crate, plus the 88 in
   `solstice-spice-codec`.
 - **A mock server** (`mock.rs`, `tests/mock_server.rs`) that mints a real
   1024-bit RSA key and decrypts a real ticket, so the OAEP path is exercised
-  rather than stubbed. It covers the negative cases `docs/testing.md` §4.2
+  rather than stubbed. Its guest agent announces `vdagentd.c`'s capability
+  set rather than this client's, so the two can disagree — see §2.6 for the
+  bug that cost. It covers the negative cases `docs/testing.md` §4.2
   names: a wrong password, a link error, `NEED_SECURED`, a server with no
   display channel, a `SpiceDataHeader` whose `size` overruns, and both header
   framings.
@@ -337,17 +363,22 @@ Each of these is a decision, not an oversight.
 - **Text events.** A scancode channel cannot express a code point the US
   layout has no key for, so `InputEvent::Text` is dropped rather than
   synthesised into the wrong keystrokes.
-- **The clipboard has no sink.** The agent's clipboard messages are
-  implemented and a guest offer surfaces as a `MainOutcome`, but the backend
-  seam has nowhere to put it: GameStream has no clipboard channel. The
-  plumbing is there for when something wants it.
+- **The clipboard has no sink *in the seam*.** The exchange itself is
+  finished and validated (§2.6): `SpiceSession` can offer, request, send and
+  decline a payload, and a guest's own grabs, requests and releases arrive on
+  `subscribe_clipboard()`. What is deliberately absent is a route from there
+  to Moonlight, because GameStream has no clipboard channel to carry one —
+  so the API is SPICE's own rather than a method on
+  `solstice_backend::Session`, and `BackendEvent` stays `Copy` and
+  clipboard-free. Anything embedding `SpiceSession` can drive it; the
+  real-server tests are the first thing that does.
 
 ### 2.6 Validated against a real server
 
 **A real QEMU guest has answered it.** `crates/solstice-spice/tests/real_server.rs`
-runs ten tests against a live `spice-server` inside a booted guest, and they
-pass. This was `Xspice` first, which links the same library and covered the
-protocol well; the guest was what it took to reach everything *above* the
+runs thirteen tests against a live `spice-server` inside a booted guest, and
+they pass. This was `Xspice` first, which links the same library and covered
+the protocol well; the guest was what it took to reach everything *above* the
 protocol, because the packaged `Xspice` launcher cannot start a
 `spice-vdagent` at all. What it covers:
 
@@ -360,6 +391,7 @@ protocol, because the packaged `Xspice` launcher cannot start a
 | Input | pointer and keyboard reaching the guest, verified with `xev -root` as the oracle |
 | Mouse mode | client mode granted and in force **by a real `spice-vdagent`**; absolute positions land where they were sent |
 | The agent | `MONITORS_CONFIG` resize granted, applied by the guest, and the new geometry tracked back by the client (virtio-gpu; see `testing.md` §4.1) |
+| The clipboard | both directions through a real `spice-vdagent`: a guest `xclip` copy offered, requested and delivered byte for byte, and this client's offer requested by the guest, answered, pasted by `xclip -o`, then withdrawn so the paste stops finding an owner |
 
 Every test connects to a **black** screen, repaints it **while connected**,
 and asserts the pixels. That shape matters: a client that only ever sees the
@@ -386,6 +418,20 @@ which is exactly what a real peer is for.
 Both have regression tests in `tests/mock_server.rs`, written so the mock now
 reproduces the real server's behaviour rather than its own.
 
+Finishing the clipboard added a third, of exactly the same kind. The
+capability gate was written as "the guest announced `CLIPBOARD` **and**
+`CLIPBOARD_BY_DEMAND`", which is what the header's naming suggests. A real
+`vdagentd` sets only `BY_DEMAND`, so the gate refused every guest there is,
+and the first run against the guest said so immediately.
+
+The mock had agreed with it, and for the structural reason this file keeps
+warning about: it announced the guest's capabilities by calling *this
+client's* own `announce_capabilities`, so it could never disagree about one.
+It now announces `vdagentd.c`'s set instead — `BY_DEMAND` without the bare
+bit, and `CLIPBOARD_SELECTION`, which this client does not announce. With
+that change, reintroducing the bug fails seven mock tests rather than none,
+which is the position the mock is supposed to be in.
+
 #### Running them
 
 The guest is built once and cached; the tests skip with a printed note when
@@ -405,13 +451,9 @@ because `xsetroot -solid` does not survive the process that issued it.
 
 Smaller than it was. Each item says what would close it.
 
-- **The clipboard is not reachable.** `agent.rs` has `clipboard_grab`,
-  `clipboard_request`, `clipboard_data` and `clipboard_release`, and nothing
-  above them exposes any of it -- a session cannot offer, request or send a
-  payload. So this is not an untested feature, it is an unfinished one, and
-  what it needs is API rather than a test. (Resize and client-mode absolute
-  mouse, the other two agent items, are now validated against a real
-  `spice-vdagent`; see §2.6.)
+All three agent items are now closed: resize, client-mode absolute mouse and
+the clipboard are each validated against a real `spice-vdagent` (§2.6).
+
 - **The QXL draw-command mix is reachable but not asserted.**
   `DRAW_ROP3`, `DRAW_STROKE` and `DRAW_TEXT` had never been seen from any
   real server, because `Xspice` renders through the frame buffer and emits

@@ -181,6 +181,51 @@ resolution — the clean way to match Moonlight's requested mode),
 and file transfer. Clipboard payload types include `UTF8_TEXT`, `IMAGE_PNG`,
 and optionally BMP/TIFF/JPG (`vd_agent.h:281-292`).
 
+### 4.3 The clipboard exchange
+
+By demand, and symmetric. Whichever side's selection changed **grabs**,
+naming the types it could produce but sending none of them; the other side
+**requests** one type when it actually wants the bytes, and gets a
+`CLIPBOARD` back carrying `type` then the payload. A **release** withdraws an
+offer. The grab is not a transfer, which is the whole point: a desktop copies
+far more often than it pastes.
+
+```
+A: CLIPBOARD_GRAB   [ u32 type ]*      "I have these"
+B: CLIPBOARD_REQUEST[ u32 type ]       "give me that one"
+A: CLIPBOARD        [ u32 type ][ bytes ]
+A: CLIPBOARD_RELEASE[ ]                "never mind"
+```
+
+Three details decide whether an implementation works against a real
+`spice-vdagent`, and two of them are not deducible from the header. They were
+settled by running against one (`roadmap.md` §2.6):
+
+- **The capability is `CLIPBOARD_BY_DEMAND`, not `CLIPBOARD`.** The bare bit
+  names a superseded flow in which a grab carried the payload with it.
+  `vdagentd`'s `send_capabilities` sets only `BY_DEMAND`, and so does
+  `spice-gtk`, so gating on both refuses every guest there is.
+- **`CLIPBOARD_SELECTION` changes the framing of every message.** With it,
+  a four-byte `VDAgentClipboardSelection` — one selection byte and three
+  reserved — precedes the type, naming X11's `CLIPBOARD` or `PRIMARY`. The
+  asymmetry worth knowing: `spice-vdagent` decides whether to write that
+  prefix from the **client's** announcement, not its own, so a client that
+  does not announce it gets the unprefixed framing in both directions even
+  though `vdagentd` announces the capability itself. Solstice does not
+  announce it; `PRIMARY` is middle-click paste, which GameStream cannot ask
+  for.
+- **`VD_AGENT_MAX_CLIPBOARD` is how a ceiling is enforced.** A client with a
+  bound on reassembled agent messages has to declare it, because enforcing it
+  only on arrival means a large guest-side copy ends the main channel: the
+  reassembler cannot walk past a message it refused to buffer. The message is
+  `int32 max`, gated on the peer having the capability, and the guest logs
+  `Set max clipboard: <n>` when it lands.
+
+A request blocks the asking side until a `CLIPBOARD` answers it. "I have
+nothing" is a `CLIPBOARD` whose type is `VD_AGENT_CLIPBOARD_NONE` with no
+payload — saying it matters, because the alternative is a paste that hangs
+until the guest times out.
+
 ---
 
 ## 5. Display channel — the hard part
@@ -390,7 +435,8 @@ ceiling, which is not something a general-purpose client exposes.
 | §3 framing | both headers, sub-message lists, and the `SET_ACK` window |
 | §4 main channel | `MAIN_INIT`, `CHANNELS_LIST`, mouse mode, name and uuid; migration ignored |
 | §4.1 mouse modes | client mode requested at `MAIN_INIT`; relative fallback with the usual drift when there is no agent |
-| §4.2 agent | `MONITORS_CONFIG`, capability exchange, clipboard messages, token flow control |
+| §4.2 agent | `MONITORS_CONFIG`, capability exchange, token flow control |
+| §4.3 clipboard | the full by-demand exchange both ways, with `MAX_CLIPBOARD` declared; `CLIPBOARD_SELECTION` deliberately not announced, so the framing is unprefixed and the selection is X11's `CLIPBOARD` |
 | §5 display | surfaces, the `DRAW_*` set, `COPY_BITS`, clip regions, masks, brushes, raster operations, strokes and glyphs. `DRAW_COMPOSITE` is **not** implemented and its capability is not advertised |
 | §5.1 images | all of them: raw in eleven layouts, QUIC, LZ, GLZ, zlib-over-GLZ, JPEG, JPEG+alpha, LZ4 |
 | §5.2 streams | MJPEG only, by choice — a stream is decoded only to be re-encoded, so the cheapest correct decoder wins. Other codecs get the `STREAM_REPORT` the protocol defines for "cannot decode" |

@@ -39,6 +39,7 @@ use tokio::io::AsyncRead;
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
 
+use crate::agent::{clipboard_type, ClipboardType};
 use crate::channel::{self, ChannelReader, OutMessage};
 use crate::display::{self, DisplayChannel, DisplayEvent, DisplayLimits};
 use crate::error::{Result, SpiceError};
@@ -273,6 +274,59 @@ async fn link_channel(
     Ok((stream, mini))
 }
 
+/// Something the guest did with its clipboard.
+///
+/// SPICE's clipboard is a two-sided, by-demand exchange rather than a value
+/// that is pushed: whoever changes their selection *grabs*, naming the types
+/// they could produce, and the other side *requests* one of them when it
+/// actually wants the bytes. Both halves of that are here, so a consumer can
+/// drive the guest and be driven by it.
+///
+/// There is no sink for this in Solstice itself -- GameStream has no
+/// clipboard channel, which is why nothing above the backend seam subscribes
+/// (`docs/roadmap.md` §2.5). It is reachable by anything embedding
+/// [`SpiceSession`], and the real-server tests are the first such thing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ClipboardEvent {
+    /// The guest's clipboard changed; it can produce these types.
+    ///
+    /// Types this client will not name are filtered out, so an empty list
+    /// means the guest grabbed with nothing usable in it -- a `FILE_LIST`
+    /// grab, in practice.
+    Offered(Vec<ClipboardType>),
+    /// The guest withdrew its offer; nothing of it is available any more.
+    Released,
+    /// The guest wants this client's clipboard, in this type.
+    ///
+    /// **The guest's paste blocks until this is answered**, with either
+    /// [`SpiceSession::send_clipboard`] or
+    /// [`SpiceSession::decline_clipboard`]. A request for a type this client
+    /// cannot name is declined before it ever becomes an event.
+    Requested(ClipboardType),
+    /// A payload arrived, in answer to [`SpiceSession::request_clipboard`].
+    Data {
+        /// What it is.
+        kind: ClipboardType,
+        /// The bytes.
+        data: Vec<u8>,
+    },
+    /// A request will not be answered with data after all: the guest replied
+    /// `VD_AGENT_CLIPBOARD_NONE`, or with a type it never offered.
+    ///
+    /// Its own event rather than an error, because a consumer waiting on
+    /// [`ClipboardEvent::Data`] would otherwise wait forever.
+    Unavailable,
+}
+
+/// How many clipboard events to hold for a subscriber that has fallen behind.
+///
+/// Deliberately far smaller than the display channel's 256: an event here can
+/// carry [`crate::agent::MAX_CLIPBOARD_PAYLOAD`] bytes, and a ring of 256 of
+/// those is a quarter of a gigabyte held on behalf of a subscriber that is
+/// not reading.
+const CLIPBOARD_EVENT_QUEUE: usize = 8;
+
 /// The SPICE backend.
 pub struct SpiceBackend {
     config: SpiceConfig,
@@ -487,18 +541,21 @@ async fn connect_inner(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<S
     }
 
     let main = Arc::new(Mutex::new(main));
+    let (clipboard, _) = broadcast::channel(CLIPBOARD_EVENT_QUEUE);
     tokio::spawn(main_task(
         reader,
         main.clone(),
         main_out.clone(),
         input.clone(),
         events.clone(),
+        clipboard.clone(),
         connected.clone(),
     ));
 
     let session = SpiceSession {
         fb,
         events,
+        clipboard,
         main,
         main_out,
         inputs_out,
@@ -528,6 +585,7 @@ async fn main_task<R: AsyncRead + Unpin>(
     out: mpsc::Sender<OutMessage>,
     input: Arc<Mutex<InputState>>,
     events: broadcast::Sender<BackendEvent>,
+    clipboard: broadcast::Sender<ClipboardEvent>,
     connected: Arc<AtomicBool>,
 ) {
     loop {
@@ -551,8 +609,62 @@ async fn main_task<R: AsyncRead + Unpin>(
                     }
                 }
                 for outcome in outcomes {
-                    if let MainOutcome::MouseMode(mode) = outcome {
-                        input.lock().expect("input lock").set_mode(mode);
+                    match outcome {
+                        MainOutcome::MouseMode(mode) => {
+                            input.lock().expect("input lock").set_mode(mode);
+                        }
+                        MainOutcome::ClipboardOffered(types) => {
+                            // A type with no name here is not an error, it
+                            // is a type this client declines to claim --
+                            // `FILE_LIST`, overwhelmingly.
+                            let named = types
+                                .iter()
+                                .filter_map(|t| ClipboardType::from_wire(*t))
+                                .collect();
+                            let _ = clipboard.send(ClipboardEvent::Offered(named));
+                        }
+                        MainOutcome::ClipboardReleased => {
+                            let _ = clipboard.send(ClipboardEvent::Released);
+                        }
+                        MainOutcome::ClipboardRequested(kind) => {
+                            match ClipboardType::from_wire(kind) {
+                                Some(kind) => {
+                                    let _ = clipboard.send(ClipboardEvent::Requested(kind));
+                                }
+                                None => {
+                                    // The guest is blocked on an answer and no
+                                    // subscriber could produce one, so answer
+                                    // here rather than let it wait out its own
+                                    // timeout.
+                                    tracing::debug!(
+                                        kind,
+                                        "declining a clipboard request for a type this client \
+                                     does not name"
+                                    );
+                                    let messages = main
+                                        .lock()
+                                        .expect("main channel lock")
+                                        .agent
+                                        .clipboard_data(clipboard_type::NONE, &[])
+                                        .unwrap_or_default();
+                                    for message in messages {
+                                        if out.send(message).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        MainOutcome::ClipboardData { kind, data } => {
+                            let event = match ClipboardType::from_wire(kind) {
+                                Some(kind) => ClipboardEvent::Data { kind, data },
+                                None => ClipboardEvent::Unavailable,
+                            };
+                            let _ = clipboard.send(event);
+                        }
+                        MainOutcome::Init { .. }
+                        | MainOutcome::Channels(_)
+                        | MainOutcome::AgentConnected(_) => {}
                     }
                 }
             }
@@ -644,6 +756,7 @@ async fn playback_task<R: AsyncRead + Unpin>(
 pub struct SpiceSession {
     fb: FramebufferHandle,
     events: broadcast::Sender<BackendEvent>,
+    clipboard: broadcast::Sender<ClipboardEvent>,
     main: Arc<Mutex<MainChannel>>,
     main_out: mpsc::Sender<OutMessage>,
     inputs_out: mpsc::Sender<OutMessage>,
@@ -673,6 +786,131 @@ impl SpiceSession {
     /// resize request can be honoured.
     pub fn can_resize(&self) -> bool {
         self.main.lock().expect("main channel lock").can_resize()
+    }
+
+    /// Whether the guest agent will exchange clipboard messages.
+    ///
+    /// False until `spice-vdagent` has announced its capabilities, which
+    /// happens shortly *after* `connect` returns rather than during it, so a
+    /// caller that checks once and gives up will usually see `false`.
+    pub fn can_clipboard(&self) -> bool {
+        self.main.lock().expect("main channel lock").can_clipboard()
+    }
+
+    /// Subscribe to what the guest does with its clipboard.
+    ///
+    /// Subscribe *before* calling [`SpiceSession::request_clipboard`]: the
+    /// answer is an event, and a receiver created afterwards may miss it.
+    pub fn subscribe_clipboard(&self) -> broadcast::Receiver<ClipboardEvent> {
+        self.clipboard.subscribe()
+    }
+
+    /// Offer this client's clipboard to the guest, naming what it could
+    /// produce.
+    ///
+    /// Nothing is sent yet; the guest asks for one of the types when it
+    /// needs the bytes, which arrives as
+    /// [`ClipboardEvent::Requested`]. Best-effort in the same sense as
+    /// [`Session::request_resize`]: `Ok(false)` means there is no agent to
+    /// hear it.
+    pub async fn offer_clipboard(&self, types: &[ClipboardType]) -> solstice_backend::Result<bool> {
+        let wire: Vec<u32> = types.iter().map(|t| t.to_wire()).collect();
+        self.agent_send(|agent| agent.clipboard_grab(&wire)).await
+    }
+
+    /// Withdraw an offer made with [`SpiceSession::offer_clipboard`].
+    pub async fn release_clipboard(&self) -> solstice_backend::Result<bool> {
+        self.agent_send(|agent| agent.clipboard_release()).await
+    }
+
+    /// Ask the guest for its clipboard, in one of the types it offered.
+    ///
+    /// The payload comes back as [`ClipboardEvent::Data`], or
+    /// [`ClipboardEvent::Unavailable`] if the guest cannot produce it after
+    /// all.
+    pub async fn request_clipboard(&self, kind: ClipboardType) -> solstice_backend::Result<bool> {
+        self.agent_send(|agent| agent.clipboard_request(kind.to_wire()))
+            .await
+    }
+
+    /// Answer a [`ClipboardEvent::Requested`] with the bytes.
+    ///
+    /// Fails with [`BackendError::Limit`] past
+    /// [`crate::agent::MAX_CLIPBOARD_PAYLOAD`], which is the same ceiling
+    /// the guest was told about when the agent came up.
+    pub async fn send_clipboard(
+        &self,
+        kind: ClipboardType,
+        data: &[u8],
+    ) -> solstice_backend::Result<bool> {
+        self.send_clipboard_payload(kind.to_wire(), data).await
+    }
+
+    /// Answer a [`ClipboardEvent::Requested`] with "nothing".
+    ///
+    /// Worth doing rather than ignoring the request: the guest's paste is
+    /// blocked until something answers it.
+    pub async fn decline_clipboard(&self) -> solstice_backend::Result<bool> {
+        self.send_clipboard_payload(clipboard_type::NONE, &[]).await
+    }
+
+    /// `VD_AGENT_CLIPBOARD` with a raw type word.
+    ///
+    /// Raw rather than a [`ClipboardType`] because this is the one place
+    /// `NONE` is a legitimate value to send -- it is the protocol's "there
+    /// is nothing", not a payload type, so it has no variant.
+    async fn send_clipboard_payload(
+        &self,
+        kind: u32,
+        data: &[u8],
+    ) -> solstice_backend::Result<bool> {
+        let messages = {
+            let mut main = self.main.lock().expect("main channel lock");
+            // The ceiling is checked whether or not an agent is listening,
+            // and before the reachability question is answered: an
+            // oversized payload is the caller's mistake either way, and
+            // reporting it as a polite `Ok(false)` would hide it until a
+            // guest happened to be running.
+            let reachable = main.can_clipboard();
+            let messages = main.agent.clipboard_data(kind, data)?;
+            if !reachable {
+                return Ok(false);
+            }
+            messages
+        };
+        self.send_main(messages).await?;
+        Ok(true)
+    }
+
+    /// Run an agent call that is gated on the clipboard being reachable, and
+    /// send whatever it produced.
+    ///
+    /// An empty result from a reachable agent is not a refusal: it is out of
+    /// tokens, and the message is queued until `MAIN_AGENT_TOKEN` releases
+    /// it. `request_resize` reads the same way.
+    async fn agent_send(
+        &self,
+        build: impl FnOnce(&mut crate::agent::Agent) -> Vec<OutMessage>,
+    ) -> solstice_backend::Result<bool> {
+        let messages = {
+            let mut main = self.main.lock().expect("main channel lock");
+            if !main.can_clipboard() {
+                return Ok(false);
+            }
+            build(&mut main.agent)
+        };
+        self.send_main(messages).await?;
+        Ok(true)
+    }
+
+    async fn send_main(&self, messages: Vec<OutMessage>) -> solstice_backend::Result<()> {
+        for message in messages {
+            self.main_out
+                .send(message)
+                .await
+                .map_err(|_| BackendError::Disconnected)?;
+        }
+        Ok(())
     }
 }
 

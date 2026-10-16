@@ -255,7 +255,7 @@ src/
 ├── link.rs           # SpiceLinkHeader/Mess/Reply, caps, RSA-OAEP ticket
 ├── channel.rs        # mini/full headers, sub-messages, the SET_ACK window
 ├── main_channel.rs   # session setup, mouse mode, the vdagent tunnel
-├── agent.rs          # MONITORS_CONFIG, capabilities, clipboard, tokens
+├── agent.rs          # MONITORS_CONFIG, capabilities, by-demand clipboard, tokens
 ├── display/
 │   ├── mod.rs        # the owning task: surfaces → framebuffer, damage, cursor
 │   ├── types.rs      # the structures spice.proto describes

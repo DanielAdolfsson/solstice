@@ -454,6 +454,39 @@ fn push_tx_clone(
         .is_some_and(|sender| sender.send(message).is_ok())
 }
 
+/// The capability set a real `spice-vdagent` announces.
+///
+/// Deliberately **not** `crate::agent::announce_capabilities`, which is what
+/// this used to reuse. A mock that announces whatever the client announces
+/// agrees with every mistake the client makes about the protocol, which is
+/// the failure mode `docs/testing.md` §4.1 exists to avoid -- and it is not
+/// hypothetical here: the clipboard gate was first written to require
+/// `CLIPBOARD` as well as `CLIPBOARD_BY_DEMAND`, the mock happily announced
+/// both, and only a real guest said no. This is `vdagentd.c`'s
+/// `send_capabilities`, which notably sets `BY_DEMAND` and never the bare
+/// bit, and sets `CLIPBOARD_SELECTION` -- which this client does not, so the
+/// framing stays unprefixed in both directions.
+fn vdagentd_capabilities() -> Vec<u8> {
+    use crate::agent::cap;
+    let caps = Caps::from_bits(&[
+        cap::MOUSE_STATE,
+        cap::MONITORS_CONFIG,
+        cap::REPLY,
+        cap::CLIPBOARD_BY_DEMAND,
+        cap::CLIPBOARD_SELECTION,
+        cap::SPARSE_MONITORS_CONFIG,
+        cap::GUEST_LINEEND_LF,
+        cap::MAX_CLIPBOARD,
+    ]);
+    let mut w = Writer::new();
+    w.u32(0); // not requesting one back; the client announces unprompted
+    const END_CAP: usize = 19;
+    for index in 0..END_CAP.div_ceil(32) {
+        w.u32(caps.words().get(index).copied().unwrap_or(0));
+    }
+    w.finish()
+}
+
 /// What the mock answers a client message with.
 fn answer(config: &MockConfig, channel: u8, kind: u16, _body: &[u8]) -> Vec<OutMessage> {
     match (channel, kind) {
@@ -469,9 +502,9 @@ fn answer(config: &MockConfig, channel: u8, kind: u16, _body: &[u8]) -> Vec<OutM
             }
         }
         (channel_type::MAIN, crate::protocol::main_msgc::AGENT_START) if config.agent => {
-            // Announce the guest agent's capabilities so a resize can be
-            // tested.
-            let caps = crate::agent::announce_capabilities(false);
+            // Announce a guest agent's capabilities, so a resize and a
+            // clipboard can be tested.
+            let caps = vdagentd_capabilities();
             let mut w = Writer::new();
             w.u32(crate::agent::PROTOCOL)
                 .u32(crate::agent::msg::ANNOUNCE_CAPABILITIES)

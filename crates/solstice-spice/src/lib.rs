@@ -29,7 +29,7 @@
 //! | [`link`] | the per-channel handshake and the RSA-OAEP ticket |
 //! | [`channel`] | message framing, and the base messages every channel shares -- including the ack window, which is not optional |
 //! | [`main_channel`] | session setup, mouse mode, and the agent tunnel |
-//! | [`agent`] | `spice-vdagent`: resize, capabilities, clipboard |
+//! | [`agent`] | `spice-vdagent`: resize, capabilities, the clipboard exchange |
 //! | [`display`] | surfaces, draw commands, image decoding, video streams, and the framebuffer |
 //! | [`cursor`] | cursor shapes, composited by the display task |
 //! | [`inputs`] | scancodes and pointer messages, with motion flow control |
@@ -96,5 +96,8 @@ pub mod playback;
 pub mod protocol;
 pub mod wire;
 
-pub use backend::{connect, SpiceBackend, SpiceConfig, SpiceSecurity, SpiceSession};
+pub use agent::ClipboardType;
+pub use backend::{
+    connect, ClipboardEvent, SpiceBackend, SpiceConfig, SpiceSecurity, SpiceSession,
+};
 pub use error::{Result, SpiceError};
