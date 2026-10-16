@@ -23,6 +23,7 @@
 //! Regenerate with `tests/tools/capture-session.sh`.
 
 use std::io::Read;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -35,9 +36,11 @@ use solstice_gamestream::rtsp::{
 };
 use solstice_gamestream::stream::audio_tx::{AudioConfig, AudioPacketizer};
 use solstice_gamestream::stream::control::{ControlCodec, ControlMessage};
+use solstice_gamestream::stream::enet::{DisconnectReason, Event, Host, HostConfig};
 use solstice_gamestream::stream::video_tx::{VideoConfig, VideoPacketizer};
 use solstice_gamestream::wire::audio::audio_iv;
 use solstice_gamestream::wire::control::{control_iv, msg, EncryptedPacket, Origin};
+use solstice_gamestream::wire::enet::{self, Body, Header};
 use solstice_gamestream::wire::ping::Ping;
 use solstice_gamestream::wire::video::{EncPrefix, FrameType, VideoPacketHeader};
 
@@ -110,6 +113,10 @@ struct Control {
     connect_data: u32,
     client: Vec<ControlRecord>,
     host: Vec<ControlRecord>,
+    #[serde(with = "hex_list")]
+    client_datagrams: Vec<Vec<u8>>,
+    #[serde(with = "hex_list")]
+    host_datagrams: Vec<Vec<u8>>,
 }
 
 #[derive(Deserialize)]
@@ -497,6 +504,91 @@ fn the_real_clients_control_messages_decrypt_and_decode() {
         ),
         "{rest:?}"
     );
+}
+
+/// The acknowledgements in a run of ENet datagrams, as (channel, sequence).
+fn enet_acks(datagrams: &[Vec<u8>]) -> Vec<(u8, u16)> {
+    let mut out = Vec::new();
+    for d in datagrams {
+        let (_, body) = Header::parse(d).unwrap();
+        for c in enet::commands(body) {
+            let c = c.unwrap();
+            if let Body::Acknowledge {
+                received_reliable_sequence,
+                ..
+            } = c.body
+            {
+                out.push((c.header.channel, received_reliable_sequence));
+            }
+        }
+    }
+    out
+}
+
+/// The real client's side of the ENet conversation, fed datagram by datagram
+/// through the host that replaced the one it was captured against
+/// (`docs/roadmap.md` §7). Every packet it sent must come out, in order, and
+/// nothing may be refused.
+#[test]
+fn the_real_clients_enet_datagrams_replay_through_the_host() {
+    let v = load();
+    let from = "127.0.0.1:40000".parse().unwrap();
+
+    // The client acknowledges the verify by echoing the sent time of the
+    // datagram that carried it. Start the clock where the captured host's
+    // was, so ours echoes back as a sensible round trip.
+    let (captured_verify, _) = Header::parse(&v.control.host_datagrams[0]).unwrap();
+    let t0 = Instant::now();
+    let first = t0 + Duration::from_millis(captured_verify.sent_time.unwrap() as u64);
+    let mut host = Host::new(HostConfig::new(v.session.connect_data), t0);
+
+    let mut sent = Vec::new();
+    let mut payloads = Vec::new();
+    let mut events = Vec::new();
+    for (i, d) in v.control.client_datagrams.iter().enumerate() {
+        host.handle_datagram(first + Duration::from_millis(i as u64), from, d);
+        while let Some(t) = host.poll_transmit() {
+            assert_eq!(t.destination, from);
+            sent.push(t.payload);
+        }
+        while let Some(e) = host.poll_event() {
+            match e {
+                Event::Receive { channel, data } => {
+                    assert_eq!(
+                        channel, 0,
+                        "Moonlight folds every message onto channel 0 of 2"
+                    );
+                    payloads.push(data);
+                }
+                other => events.push(other),
+            }
+        }
+    }
+
+    assert_eq!(
+        host.stats(),
+        Default::default(),
+        "the real client tripped a refusal"
+    );
+    assert_eq!(
+        events,
+        [
+            Event::Connected { address: from },
+            Event::Disconnected {
+                reason: DisconnectReason::Remote(0)
+            }
+        ]
+    );
+    let messages: Vec<_> = v.control.client.iter().map(|r| r.wire.clone()).collect();
+    assert_eq!(payloads, messages);
+
+    // The verify is the one the client accepted from the old host, byte for
+    // byte -- the sent time included, since the clocks were lined up.
+    assert_eq!(sent[0], v.control.host_datagrams[0]);
+    // And every command the old host acknowledged, this one does, in the same
+    // order. (It also sent pings and a bandwidth limit of its own; this one
+    // sends neither, so the client's acknowledgements of those go unmatched.)
+    assert_eq!(enet_acks(&sent), enet_acks(&v.control.host_datagrams));
 }
 
 #[test]

@@ -57,6 +57,7 @@ solstice/
 │       ├── sdp_announce.rs
 │       ├── input_batch.rs
 │       ├── control_envelope.rs
+│       ├── enet_host.rs          # ▲ the ENet host, before and after the handshake
 │       └── rfb_rect.rs
 ├── tests/
 │   ├── guest/                    # the QEMU test guest: both backends, one image
@@ -64,6 +65,7 @@ solstice/
 │   ├── vectors/capture/          # a real Moonlight session, decrypted and frozen
 │   └── tools/
 │       ├── capture-session.sh    # captures one, unprivileged; see roadmap §4
+│       ├── control-loss.sh       # the real client with loss on the control port
 │       ├── gen_capture_vectors.py# decrypts it and checks it against the client
 │       ├── gen_fec_vectors.py    # runs the oracle, freezes the vectors
 │       ├── gen_spice_vectors.py  # the same, for the SPICE image codecs
@@ -81,6 +83,7 @@ directory with the crate in scope:
 |---|---|
 | FEC differential vectors | `crates/solstice-gamestream/tests/fec_vectors.rs` |
 | A captured real-Moonlight session, replayed | `crates/solstice-gamestream/tests/capture_vectors.rs` |
+| The ENet host vs. upstream ENet, over a lossy simulated network | `crates/solstice-gamestream/tests/enet_interop.rs` |
 | RFB client vs. the minimal mock server | `crates/solstice-vnc/tests/mock_server.rs` |
 | RFB client vs. QEMU's RFB server | `crates/solstice-vnc/tests/real_server.rs` |
 | SPICE client vs. a live `spice-server` | `crates/solstice-spice/tests/real_server.rs` |
@@ -118,7 +121,7 @@ src/
     ├── nvhttp.rs     # the two HTTP listeners
     ├── rtsp.rs       # TCP 48010, plaintext and GCM-wrapped
     ├── media.rs      # UDP peer binding and paced sending
-    └── control.rs    # the ENet host thread
+    └── control.rs    # the socket and thread around the ENet host
 ```
 
 ▲ `config.rs` uses plain `serde` + `toml` rather than `figment`: there is one
@@ -140,6 +143,7 @@ src/
 │   ├── video.rs          # NV_VIDEO_PACKET, video_short_frame_header_t, enc prefix
 │   ├── audio.rs          # AUDIO_FEC_HEADER
 │   ├── control.rs        # NVCTL_* headers, packet type tables
+│   ├── enet.rs           # ▲ ENet's datagram header and twelve commands
 │   ├── input.rs          # NV_*_PACKET, the 0x0206 batch decoder
 │   └── ping.rs           # SS_PING
 ├── crypto/
@@ -162,7 +166,8 @@ src/
 │   ├── mod.rs
 │   ├── video_tx.rs       # packetise, FEC, encrypt, pace
 │   ├── audio_tx.rs       # Opus → RTP, RS(4,2), AES-CBC
-│   ├── control.rs        # ENet host, GCM envelope, message dispatch
+│   ├── control.rs        # GCM envelope, replay window, message dispatch
+│   ├── enet.rs           # ▲ the ENet host: Moonlight's subset, sans-I/O
 │   └── fec.rs            # see §4 on the compatibility hazard
 └── session.rs            # ▲ in nvhttp/: launch sessions are minted there
 ```
@@ -383,17 +388,18 @@ which is what lets it be fuzzed and tested without a SPICE backend existing.
 | `aes-gcm` | 0.11 | control, RTSP, video encryption |
 | `cbc` | 0.2 | audio encryption |
 | `zeroize` | 1.9 | key material |
-| `rusty_enet` | 0.4 | ENet control channel |
 | `quick-xml` | 0.42 | NVHTTP XML responses |
 | `hyper` / `axum` | 1.12 / 0.8 | the HTTP listeners |
 | `socket2` | 0.6 | UDP socket options, DSCP, batched send |
 | `opus` | 0.4 | silence generation / transcode |
 
-> `rusty_enet` is a C-to-Rust transpilation of ENet 1.3.18. Its own README is
-> candid that it "couldn't be much further from ready for serious use". Since
-> it sits on the **pre-authentication** UDP path (`docs/security.md` §2.4),
-> audit it, fuzz it, and be prepared to implement the subset of ENet that
-> Moonlight actually uses.
+> ▲ There is no ENet crate. The plan was `rusty_enet`, a C-to-Rust
+> transpilation of ENet 1.3.18 whose own README says it "couldn't be much
+> further from ready for serious use", on the **pre-authentication** UDP path
+> (`docs/security.md` §2.4). It shipped, contained, until a real client had
+> shown which subset of ENet Moonlight uses; that subset is now
+> `stream/enet.rs`, and `rusty_enet` survives only as a dev-dependency, as the
+> independent ENet the host is tested against (`docs/roadmap.md` §7).
 
 ### `solstice-video`
 
@@ -582,7 +588,7 @@ with Solstice as the host. It still found two defects (`docs/roadmap.md` §4).
 | 2 | Encoder default | **OpenH264.** The lightest encoder to build — cc and nothing else. (It was chosen for its BSD-2 licence; that stopped mattering when the project became GPL-3.0-or-later, and the choice stands on build weight.) It emits profile_idc 100 (High), which settles the question flagged in §4. |
 | 3 | HEVC and AV1 | **H.264 only.** `ServerCodecModeSupport` advertises `SCM_H264`, and DESCRIBE omits the two markers a client reads as HEVC and AV1. |
 | 4 | Audio beyond Opus silence | **Still silence on RFB**, which has no audio. SPICE's playback channel is implemented and hands the pipeline real Opus packets — 10 ms stereo, measured against a real guest — but the supervisor still sends silence whatever the backend. Wiring it in means a transcode for Moonlight's default 5 ms, and repacketising only when the client asked for 10 ms (`docs/spice-protocol.md` §7). |
-| 5 | `rusty_enet` vs. reimplementing ENet | **Still open, but no longer unproven.** `rusty_enet` is in use, contained by a one-peer limit, a connect-data check and a GCM-authenticated message layer. A real `moonlight-common-c` peer now connects to it, carries input and disconnects cleanly (`real_moonlight.rs`). No audit has happened. |
+| 5 | `rusty_enet` vs. reimplementing ENet | **Reimplemented — the subset.** Once a real client had been captured, what Moonlight uses was a short list: connect, acknowledge, ping, reliable/unreliable/unsequenced sends, bandwidth limit, disconnect, and never a fragment. `stream/enet.rs` is that list, sans-I/O, bounded, and stricter than ENet before authentication. It is held against upstream ENet (via `rusty_enet`, now test-only) under simulated loss, against the captured session byte for byte, and against the real client with netem on the port (`docs/roadmap.md` §7). |
 | 6 | SPICE image decoders: port, FFI, or drop | **Port, and the backend above them is now written too.** `solstice-spice-codec` has QUIC, LZ and GLZ in pure Rust, verified against the real C encoders; `solstice-spice` has the channels, the rasteriser, the agent and the audio. `backend.kind = "spice"` builds a working backend, and a real QEMU guest has answered it — `docs/roadmap.md` §2.6. |
 
 Two more that the implementation raised:

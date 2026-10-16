@@ -137,6 +137,54 @@ daemon went on trusting the client it held in memory until it restarted. A
 revocation that does not take effect is worse than none, because the operator
 believes it has. It now goes through the daemon when one is running.
 
+### ENet was replaced, not audited
+
+`docs/security.md` §2.4 asked for an audit of `rusty_enet`, fuzzing, and a
+readiness to reimplement the ENet subset Moonlight uses. The audit never
+happened, and stopped being the cheaper option once a real client had been
+captured: what Moonlight sends is CONNECT, ACKNOWLEDGE, PING, reliable sends
+on channel 0, a BANDWIDTH_LIMIT and DISCONNECT, plus unsequenced sends toward
+a host that calls itself Sunshine, which this one does. It never fragments,
+because every control message is built in a 256-byte buffer
+(`sendMessageEnet`). Auditing 3,000 lines of transpiled C to vouch for that
+much is worse value than writing that much.
+
+`solstice-gamestream`'s `stream/enet.rs` is the subset, sans-I/O so the tests
+and the fuzzer can drive it without a socket. It keeps ENet's wire format and
+reliability semantics, and departs from ENet on purpose wherever ENet is
+generous before authentication:
+
+- **Nothing is answered before the connect data.** `rusty_enet` completed the
+  whole handshake with any peer and only then, on the connect event, let the
+  host check the connect data and disconnect it. The check now happens on the
+  `CONNECT` itself. A wrong value gets no reply and leaves no state, and the
+  one reply a right value earns is smaller than the `CONNECT`.
+- **The peer is bound to its address.** Upstream re-learns a peer's address
+  from any datagram that carries its ID and two-bit session. The check is
+  commented out in `protocol.c`.
+- **No fragments, no compression, no checksum.** A fragment ends its datagram
+  unacknowledged, and the client times out if it ever sends one.
+- **Bounded everywhere.** At most 32 commands are read per datagram, which is
+  ENet's own sender limit. The reorder buffer is capped at 256 commands and
+  64 KiB, and a command that would overflow it is left unacknowledged so the
+  sender resends it later. The host's own reliable sends are capped at 64 in
+  flight.
+- **Unreliable data that overtakes its reliable predecessor is dropped**
+  rather than held. Moonlight sends none on the generic channel.
+- **The host sends no pings and no bandwidth limits.** Liveness is ten
+  seconds of silence, which Moonlight's own 500 ms pings make unambiguous, or
+  a reliable command of ours unacknowledged for as long.
+
+The first real-client run passed, and so did the captured-session replay, in
+which our `VERIFY_CONNECT` came out byte for byte the one the client had
+accepted from `rusty_enet`. That is expected: the subset was read off that
+session. Only loss could tell the two apart, which is why loss gets its own
+tests (`docs/testing.md` §5.1).
+
+The connect-data check was also, until the probe ran, *unreachable*: the host
+minted a random value and never told the client, so the only peer it would
+ever have accepted was one that guessed. See `docs/roadmap.md` §3, defect 3.
+
 ### The fuzz targets found a bug on their first run
 
 `cargo fuzz run rfb_rect` panicked within seconds on
@@ -278,26 +326,6 @@ the *absence* of a byte-swap macro and flagged here as weak evidence. It is
 correct, and now rests on `InputStream.c:952` writing `LE16(keyCode)`
 explicitly.
 
-### `rusty_enet` has not been audited
-
-`docs/security.md` §2.4 asks for an audit, fuzzing, and a readiness to
-reimplement the ENet subset Moonlight uses. None of that has happened. What it
-has instead is containment: a peer limit of one, a refusal to accept a peer
-whose connect data does not match the launch session, and a message layer that
-authenticates every packet with AES-GCM before a byte reaches the input parser.
-That reduces the blast radius; it does not remove the pre-authentication state
-machine.
-
-It does now interoperate: a real `moonlight-common-c` peer connects, carries
-input and disconnects cleanly. That is worth something for the audit, which
-needs to know which ENet features a real client actually exercises — but it
-is evidence about the happy path only, and the advisory in question
-(GHSA-c428-87f8-rrv5) is about the unhappy one.
-
-The connect-data check was also, until the probe ran, *unreachable*: the host
-minted a random value and never told the client, so the only peer it would
-ever have accepted was one that guessed. See `docs/roadmap.md` §3, defect 3.
-
 ### Scaling is nearest-neighbour
 
 When the backend declines to resize, the frame is letterboxed with
@@ -307,9 +335,11 @@ not been compared against anything.
 
 ### The fuzz targets have no corpus and no CI job
 
-Nine targets exist and each runs clean for a minute to a few
+Ten targets exist and each runs clean for a minute to a few
 (`rtsp_message`, `sdp_announce`, `input_batch`, `control_envelope`,
-`rfb_rect`, `spice_quic`, `spice_lz`, `spice_draw`, `spice_message`). That is
+`enet_host`, `rfb_rect`, `spice_quic`, `spice_lz`, `spice_draw`,
+`spice_message`). `enet_host` has had the longest run, ten minutes seeded
+from the captured session (`docs/roadmap.md` §7). That is
 a smoke test, not the nightly tier `docs/testing.md` §6 describes. There is no
 seed corpus, no persistent corpus, and nothing runs them unattended.
 

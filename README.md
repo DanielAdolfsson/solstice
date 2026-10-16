@@ -156,8 +156,10 @@ pointed at a client before any desktop is involved.
   encryption.
 - **Audio**: Opus silence at the negotiated packet duration, RTP, AES-CBC, and
   the fixed RS(4,2) parity pair every four packets using Nvidia's matrix.
-- **The control channel**: ENet, the GCM envelope with a replay window, and the
-  `0x0206` input batch decoder.
+- **The control channel**: ENet -- the subset Moonlight uses, implemented here
+  rather than linked, with no fragment reassembly and nothing answered before
+  the launch's connect data is presented -- then the GCM envelope with a replay
+  window, and the `0x0206` input batch decoder.
 - **Input translation**: Windows VK → XT scancode as the primary path, X11
   keysym as the fallback, chosen per connection from what the peer supports.
 - **The VNC backend**: RFB 3.3–3.8, `None` / VNC Authentication / VeNCrypt with

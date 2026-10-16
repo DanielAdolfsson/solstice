@@ -480,6 +480,26 @@ Worth asserting at each loss level:
 The third case is the one that catches encoder-integration bugs: a forced
 keyframe must actually come out of the encoder on the next frame.
 
+### 5.1 Loss on the control channel
+
+This part exists. The ENet control channel is the host's own subset of ENet
+(`docs/roadmap.md` §7), so its retransmission and reordering paths are this
+project's to prove. Two tiers do it:
+
+- **In simulation, every push.**
+  `crates/solstice-gamestream/tests/enet_interop.rs` holds the host against
+  `rusty_enet` -- upstream ENet's C, transpiled, so a second implementation
+  rather than a second reading -- over a simulated network that loses,
+  duplicates and reorders, with simulated clocks on both ends. Hundreds of
+  messages each way at up to 30% loss, a client that vanishes, an idle
+  minute, and a client with the wrong connect data. It runs in well under a
+  second.
+- **Against the real client, by hand.** `tests/tools/control-loss.sh [pct]`
+  runs `real_moonlight.rs` in an unprivileged network namespace with netem on
+  the control port alone, both directions, and prints netem's drop count as
+  proof the loss happened. Video and audio are untouched, so a failure is the
+  control channel's. It has passed at 20%, 30% and 40%.
+
 ---
 
 ## 6. CI shape
@@ -498,7 +518,7 @@ on push:      T0 unit/property                      ~20 s
 nightly:      T4 image-compression × streaming-video × agent sweeps  ~10 min
               T4 loss injection sweep               ~10 min
               T4 encoding cost measurement          ~1 min
-              T5 cargo-fuzz on the nine parsers     ~2 h
+              T5 cargo-fuzz on the ten targets      ~2 h
 ```
 
 `mlc-probe` is the cheapest of these by a wide margin and the highest-yield
@@ -580,6 +600,7 @@ tests/
 │   └── capture/             # a real Moonlight session, decrypted and frozen (§2.4)
 └── tools/
     ├── capture-session.sh   # runs real_moonlight.rs under tcpdump, unprivileged
+    ├── control-loss.sh      # runs it with netem on the control port (§5.1)
     ├── gen_capture_vectors.py
     ├── gen_fec_vectors.py
     ├── gen_spice_vectors.py

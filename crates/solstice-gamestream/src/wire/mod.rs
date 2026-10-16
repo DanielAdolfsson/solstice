@@ -8,6 +8,7 @@
 
 pub mod audio;
 pub mod control;
+pub mod enet;
 pub mod input;
 pub mod ping;
 pub mod rtp;
