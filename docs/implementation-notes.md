@@ -348,11 +348,13 @@ VNC half still meets exactly one implementation, and it is now QEMU's rather
 than TigerVNC's. `docs/testing.md` §3.3 lists what that costs and when to
 revisit it.
 
-### No capture-derived golden vectors
+### Capture-derived golden vectors came last, and from our own host
 
 `docs/testing.md` §2.4 calls a captured Sunshine ↔ Moonlight session *"the
 highest-value artefact early on"* and says to capture it **before** writing the
 packetiser. That did not happen: the packetiser was written against the source
-reading and is verified against a client of our own. That is a real gap, and it
-is the one that would catch an endianness or field-offset error that both of
-our ends make consistently.
+reading and verified against a client of our own. The real client came later
+(`docs/roadmap.md` §3), and a frozen capture of it later still (§4). The
+capture has Solstice at the host end, so the client's half is ground truth and
+the host's half is a pin rather than an oracle. Even so, it found a frame
+numbering and a scroll layout that every earlier tier had accepted.

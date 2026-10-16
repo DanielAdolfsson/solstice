@@ -146,6 +146,16 @@ real video packet layouts to diff your packetiser against.
 
 Do this **before** writing the packetiser, not after.
 
+**What was built instead** (`docs/roadmap.md` §4): the same capture with
+Solstice at the host end rather than Sunshine. `tests/tools/capture-session.sh`
+runs `real_moonlight.rs` in an unprivileged network namespace with `tcpdump`
+on its loopback. `gen_capture_vectors.py` decrypts the capture independently
+and holds it against what the client recorded, then freezes it as
+`tests/vectors/capture/session.json.gz`. `capture_vectors.rs` replays it in
+CI. The client's half is ground truth and the host's half is pinned. A
+Sunshine capture would add a host-side oracle on top, and remains the
+differential use below.
+
 **Differential testing.** Feed the same recorded ANNOUNCE to both Sunshine and
 Solstice and compare the DESCRIBE/SETUP responses and the resulting packet
 header fields. Discrepancies in `fecInfo`, `multiFecBlocks`, `streamPacketIndex`
@@ -567,8 +577,10 @@ tests/
 ├── vectors/
 │   ├── fec/                 # nanors differential vectors (see the FEC work)
 │   ├── spice/               # QUIC/LZ/GLZ differential vectors
-│   └── capture/             # golden Sunshine↔Moonlight transcripts (§2.4, not yet)
+│   └── capture/             # a real Moonlight session, decrypted and frozen (§2.4)
 └── tools/
+    ├── capture-session.sh   # runs real_moonlight.rs under tcpdump, unprivileged
+    ├── gen_capture_vectors.py
     ├── gen_fec_vectors.py
     ├── gen_spice_vectors.py
     └── mlc-probe/           # the real Moonlight client, headless (§2.2)

@@ -61,7 +61,10 @@ solstice/
 ├── tests/
 │   ├── guest/                    # the QEMU test guest: both backends, one image
 │   ├── vectors/fec/              # nanors oracle (dump.c), its checker, frozen JSON
+│   ├── vectors/capture/          # a real Moonlight session, decrypted and frozen
 │   └── tools/
+│       ├── capture-session.sh    # captures one, unprivileged; see roadmap §4
+│       ├── gen_capture_vectors.py# decrypts it and checks it against the client
 │       ├── gen_fec_vectors.py    # runs the oracle, freezes the vectors
 │       ├── gen_spice_vectors.py  # the same, for the SPICE image codecs
 │       └── mlc-probe/            # the real Moonlight client, headless and asserting
@@ -77,6 +80,7 @@ directory with the crate in scope:
 | Test | Where |
 |---|---|
 | FEC differential vectors | `crates/solstice-gamestream/tests/fec_vectors.rs` |
+| A captured real-Moonlight session, replayed | `crates/solstice-gamestream/tests/capture_vectors.rs` |
 | RFB client vs. the minimal mock server | `crates/solstice-vnc/tests/mock_server.rs` |
 | RFB client vs. QEMU's RFB server | `crates/solstice-vnc/tests/real_server.rs` |
 | SPICE client vs. a live `spice-server` | `crates/solstice-spice/tests/real_server.rs` |
@@ -541,10 +545,10 @@ ca_file  = "/etc/solstice/vnc-ca.pem"
 
 | Layer | Planned | Built |
 |---|---|---|
-| `wire/` codecs | round-trip property tests; golden vectors from a captured session | round-trip tests ✓; **no captured session** (§8.7) |
+| `wire/` codecs | round-trip property tests; golden vectors from a captured session | ✓ — a real `moonlight-common-c` session, captured against this host and replayed (§8.7). The round-trip tests had agreed with a wrong scroll layout; the capture did not |
 | FEC | differential against a compiled `nanors` | ✓ — the oracle is built from `tests/vectors/fec/dump.c` and the output frozen as JSON |
 | Pairing | four-phase handshake against a mock client, with negative tests for every out-of-order and replayed transition | ✓ — each of the three CVEs has a named test |
-| RTSP | recorded Moonlight transcripts replayed | the full documented sequence is replayed against the state machine; the transcripts are ours, not captured |
+| RTSP | recorded Moonlight transcripts replayed | ✓ — the real client's encrypted transcript is replayed against the state machine, and every response must match byte for byte |
 | Packetiser | feed Annex-B, reassemble with a port of the client's depacketiser, assert byte equality | ✓ — including shard loss recovered from parity, which is the `FEC_VALIDATION_MODE` invariant run locally |
 | Backends | `Xvnc` and `Xspice` in CI, plus minimal mocks as the opposite pole | both poles ✓ for both backends. `real_server.rs` drives a live `Xspice` across every image codec, MJPEG streams and input; it found two bugs the mock could not (`docs/roadmap.md` §2.6). What `Xspice` cannot reach is a real `spice-vdagent` and a QXL guest driver — §2.7 |
 | Input | exhaustive VK → scancode table tests | ✓ — and VK → keysym, and both paths through the RFB encoder |
@@ -557,9 +561,10 @@ ca_file  = "/etc/solstice/vnc-ca.pem"
 the two-pole RFB approach (`Xvnc` plus a deliberately minimal mock), the Xspice
 flags that force each SPICE image codec, and loss injection with `tc netem`.
 
-The highest-value artefact early on is a **captured Sunshine ↔ Moonlight
-session** (pcap plus the client-generated `rikey`) to use as golden data.
-Capture it before writing the packetiser, not after.
+The highest-value artefact early on was meant to be a **captured Sunshine ↔
+Moonlight session** (pcap plus the client-generated `rikey`) to use as golden
+data, captured before the packetiser was written. It came last instead, and
+with Solstice as the host. It still found two defects (`docs/roadmap.md` §4).
 
 ---
 
@@ -582,12 +587,13 @@ Two more that the implementation raised:
 
 7. **A captured Sunshine ↔ Moonlight session.** `docs/testing.md` §2.4 calls it
    the highest-value artefact and says to capture it *before* writing the
-   packetiser. That did not happen. The gap it was meant to close — a field or
-   endianness error both of our ends make consistently — is now covered
-   instead by `tests/tools/mlc-probe/`, which drives the host with the real
-   `moonlight-common-c` and found eight such errors on its first run
-   (`docs/roadmap.md` §3). Frozen vectors would still be worth having, because
-   the probe needs a C toolchain and a network and CI has neither.
+   packetiser. That did not happen. The probe (`tests/tools/mlc-probe/`) found
+   eight consistent-at-both-ends errors first (`docs/roadmap.md` §3). Then a
+   session between the probe and this host was captured, decrypted and frozen
+   (`tests/vectors/capture/`). It runs in CI without a C toolchain, and found
+   two more: a frame 0 the client never decodes, and a scroll layout with a
+   phantom byte (`docs/roadmap.md` §4). Sunshine is still not at the host
+   end; what that would add is a host-side oracle, not conformance.
 8. **The management socket.** `solstice pair` runs in a different process from
    the daemon, so opening a pairing window needs IPC that does not exist. The
    window, lockout and source-address policy are implemented and tested; only

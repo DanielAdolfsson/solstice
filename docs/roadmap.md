@@ -26,24 +26,24 @@ because a mock written from the same research agrees with the same mistakes.
 §1, Tight, is now done too, and validated the same way: offered alone to
 QEMU's RFB server, it reproduces QEMU's own screendump pixel for pixel.
 
-What is left is ordinary work. §4 is the next one worth doing, and it is worth
-less than it was: the probe now covers what the captured vectors were meant to
-catch, so the case for them is regression-pinning in CI without a C toolchain
-rather than discovery.
+§4, the captured vectors, is done as well. It was expected to be
+regression-pinning rather than discovery, and found two more defects anyway,
+both in places the probe had passed over (§4).
+
+What is left is ordinary work.
 
 | | Item | Size | Blocked on |
 |---|---|---|---|
 | 1 | [Tight encoding](#1-tight-encoding-rfb) | **done** — lossless, advertised first, and exact against a real QEMU server; what is left is in §1 | nothing |
 | 2 | [SPICE backend](#2-spice-backend) | **implemented and validated against a real QEMU guest**, agent and clipboard included (§2.6); what is left is in §2.7 | nothing |
 | 3 | [Validate against real Moonlight](#3-validate-against-real-moonlight) | **done** — a real `moonlight-common-c` client streams from this host; the eight defects it found are in §3 | nothing |
-| 4 | [Captured golden vectors](#4-captured-sunshine--moonlight-vectors) | days | nothing |
+| 4 | [Captured golden vectors](#4-captured-sunshine--moonlight-vectors) | **done** — a real session, frozen and replayed in CI; the two defects it found are in §4 | nothing |
 | 5 | [`solstice pair` management socket](#5-solstice-pair-and-a-management-socket) | ~2 days | nothing |
 | 6 | [The still-frame encode cost](#6-the-still-frame-encode-cost) | ~2 days | nothing |
 | 7 | [ENet: audit or reimplement](#7-enet-audit-or-reimplement) | 1–3 weeks | nothing |
 | 8 | [Smaller items](#8-smaller-items) | varies | |
 
-§4 is next. With §3 done, the place where a wrong assumption made consistently
-at both ends still passes is CI, which has no `mlc-probe` in it.
+§5 is the next one with a clear finish line, and the one a user notices.
 
 ---
 
@@ -662,17 +662,94 @@ inspection rather than by a bug:
 
 ## 4. Captured Sunshine ↔ Moonlight vectors
 
-`docs/testing.md` §2.4 calls this *"the highest-value artefact early on"* and
-says to capture it **before** writing the packetiser. That did not happen. It
-is the gap that catches a field-offset or endianness error both of our ends
-make consistently. §3 now catches those too, and caught eight of them — but it
-needs a C toolchain, a network to fetch `moonlight-common-c`, and a minute to
-build. Frozen vectors are what put the same coverage in CI.
+**Done**, with the real client at one end and Solstice at the other rather
+than Sunshine (below). `tests/tools/capture-session.sh` runs the real-Moonlight
+test from §3 inside an unprivileged network namespace (`unshare -rn`) with
+`tcpdump` on its loopback, so no root is needed and nothing else on the
+machine gets into the capture. The test hands over the session keys, since the
+*client* generates `rikey`. `tests/tools/gen_capture_vectors.py` then decrypts
+everything offline: RTSP, the ENet control channel, video and audio. It uses
+its own pcap, TCP and ENet parsing and Python's `cryptography`, not the
+host's crates. Before it freezes anything it checks the result against the
+elementary streams `moonlight-common-c` itself recorded.
+`tests/vectors/capture/session.json.gz` is the output, and
+`crates/solstice-gamestream/tests/capture_vectors.rs` replays it with no
+network, no C toolchain and no probe.
 
-Since the *client* generates `rikey`, an instrumented probe can log the session
-key and decrypt the control stream and encrypted RTSP offline. Land the result
-in `tests/vectors/capture/` with the same freeze-it-as-JSON treatment the FEC
-vectors got, so CI needs neither a network nor Sunshine.
+The assertions split in two, and `tests/vectors/capture/README.md` says which
+is which:
+
+- **What the client sent is ground truth.** The RTSP requests and ANNOUNCE,
+  the pings, the ENet connect data and every control message came from the
+  reference client. Decoding them is checked against the protocol, so a
+  field-offset or endianness error the host makes fails here.
+- **What the host sent is pinned.** It is Solstice's own output, but output a
+  real client accepted, FEC-validated and recorded. The RTSP responses and
+  both packetisers must reproduce it byte for byte from the same inputs.
+
+### What it found
+
+Two defects. The probe had passed over both, because it judged *whether*
+things arrived rather than *what* arrived:
+
+1. **Frame 0 is never decoded.** `moonlight-common-c` starts its depacketiser
+   at `nextFrameNumber = 1` and silently drops any packet from an earlier
+   frame (`VideoDepacketizer.c:65`, `:772`). Solstice numbered from 0, so the
+   session's opening IDR was thrown away on every connect. The picture only
+   started because the client's own `REQUEST_IDR` produced a second keyframe.
+   Found when the reassembled frames did not line up with the client's
+   recording; the first IDR on the wire was not in it. The first frame is now
+   1 (`video_tx::FIRST_FRAME_INDEX`).
+2. **Every scroll was 256 times too large.** `NV_SCROLL_PACKET` is the header
+   followed by `scrollAmt1`, `scrollAmt2` and `zero3` (`Input.h:113-118`).
+   Solstice skipped a `zero1` byte that is not there, so a one-click scroll of
+   120 decoded as `0x7800` = 30720, and a scroll down as −30465. The encoder
+   wrote the same phantom byte, so the round-trip tests agreed with it. The
+   real-Moonlight test asserted only that *a* scroll arrived, and now asserts
+   it is 120.
+
+The rest of the capture matched the protocol. Several things looked wrong at
+first and turned out to be the client behaving as designed. Each is now an
+assertion with a source citation:
+
+- The ANNOUNCE's packet size is 32 bytes smaller than requested when video is
+  encrypted (`SdpGenerator.c:326`).
+- The advertised bitrate is 80% of the configured one, the rest being left
+  for FEC (`SdpGenerator.c:338`).
+- The client wiggles the mouse ±1 on connect (`Connection.c:535`).
+- It enables haptics, which Solstice drops and counts.
+- It sends the absolute-pointer reference size minus one
+  (`InputStream.c:458`).
+
+### Why Solstice and not Sunshine at the host end
+
+`docs/testing.md` §2.4 says to capture against Sunshine. That was weighed and
+not done. Sunshine wants a capturable display, an encoder and `uinput`, and
+pairing goes through its web API: in a container on a machine with no GPU and
+no `/dev/uinput`, that was judged likely to be days of uncertain work, and
+it was not attempted. Most of what a Sunshine
+capture would add is already here. The client half of the session is
+ground truth either way, and the host half has been accepted by the reference
+client. What a Sunshine capture would still add is a host-side oracle:
+whether Solstice's *choices*, such as FEC geometry, pacing and the order of
+SETUP responses, match Sunshine's where the client would tolerate either.
+That is differential testing (§2.4's second use), not conformance.
+
+### What is still not covered
+
+- **ENet framing is captured, not replayed.** The raw datagrams in both
+  directions are in the vectors (`control.client_datagrams`,
+  `host_datagrams`). Nothing replays them through `rusty_enet`, whose timers
+  and sent-time fields make a byte-exact replay meaningless. They are the
+  natural seed corpus for §7 and for the fuzz targets (§8).
+- **Pairing, `/serverinfo` and `/launch`** are TLS and are not decrypted. The
+  probe does not perform them either (§3).
+- **One geometry, one codec, no loss**, the same limits as §3: 640×480 H.264
+  from the colour-bar backend, on loopback.
+- **Regenerating changes every byte.** The keys and session values are minted
+  per run, so a new capture is a wholesale replacement of
+  `session.json.gz`, not a diff. Regenerate when the wire format changes on
+  purpose, and the replay test will say which packets moved.
 
 ---
 
@@ -738,15 +815,18 @@ pre-auth state machine with fragment reassembly and retransmission timers.
 `docs/security.md` §2.4 asks for an audit, fuzzing, and readiness to implement
 the subset Moonlight actually uses. §3 is done, so "the subset" is now a
 finite thing that can be read off a real session: `mlc-probe` establishes the
-peer, sends input and tears the connection down over it.
+peer, sends input and tears the connection down over it, and §4 has frozen
+one such session's ENet datagrams, both directions, in
+`tests/vectors/capture/`.
 
 ---
 
 ## 8. Smaller items
 
 - **Fuzzing in CI.** Five targets exist and run clean for a minute each; there
-  is no seed corpus, no persistent corpus, and no nightly job
-  (`docs/testing.md` §6 describes the tier).
+  is no seed corpus, no persistent corpus, and no nightly job. The captured
+  session (§4) has real input batches, control envelopes and RTSP messages to
+  seed three of them with (`docs/testing.md` §6 describes the tier).
 - **More RFB servers.** `docs/testing.md` §3.3 lists exactly what dropping
   `wayvnc`, `x11vnc`, TurboVNC and QEMU's `-vnc` costs. x11vnc is the
   interesting one: libvncserver implements QEMU extended key events in its

@@ -48,6 +48,16 @@ pub const MAX_RTP_HEADER_SIZE: usize = 16;
 pub const MAX_FEC_BLOCKS: usize = 4;
 /// Most shards one block may hold.
 pub const MAX_SHARDS_PER_BLOCK: usize = 255;
+/// The first frame of a session is frame **1**, not 0.
+///
+/// `moonlight-common-c` starts its depacketiser at `nextFrameNumber = 1` and
+/// drops, without a word, any packet from a frame numbered before that
+/// (`VideoDepacketizer.c:65`, `:772`). A frame 0 is therefore never decoded:
+/// numbered from zero, the session's opening IDR was thrown away on every
+/// connect, and the picture only started because the client's own IDR
+/// request produced a second one. Found by holding a packet capture against
+/// what the client recorded (`docs/roadmap.md` §4).
+pub const FIRST_FRAME_INDEX: u32 = 1;
 
 /// How a frame is being paced onto the wire.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,6 +106,7 @@ pub struct VideoPacketizer {
     crypto: Option<SessionCrypto>,
     /// Wider than 16 bits on purpose; the RTP field takes the low half.
     sequence: u32,
+    /// The index the next frame will carry. Starts at [`FIRST_FRAME_INDEX`].
     frame_index: u32,
     /// The deterministic GCM counter. Monotonic for the life of the session;
     /// `rikey` is fresh per `/launch`, so it never repeats under a key.
@@ -119,7 +130,7 @@ impl VideoPacketizer {
             config,
             crypto: key.map(SessionCrypto::new).filter(|_| config.encrypt),
             sequence: 0,
-            frame_index: 0,
+            frame_index: FIRST_FRAME_INDEX,
             iv_counter: 0,
         }
     }
@@ -134,7 +145,7 @@ impl VideoPacketizer {
         self.blocksize() - VIDEO_HEADER_LEN
     }
 
-    /// Frames emitted so far.
+    /// The index the next frame will carry.
     pub fn frame_index(&self) -> u32 {
         self.frame_index
     }
@@ -759,6 +770,7 @@ mod tests {
             .packetize(&access_unit(500), FrameType::Idr, 0, 0)
             .unwrap();
         let b = p.packetize(&access_unit(500), FrameType::P, 0, 0).unwrap();
+        assert_eq!(a.frame_index, FIRST_FRAME_INDEX);
         assert_eq!(a.frame_index + 1, b.frame_index);
         assert!(a.is_idr);
         assert!(!b.is_idr);
