@@ -73,6 +73,13 @@ Stdout carries one `PROBE <event> k=v …` line per event and a final
 log is the whole diagnosis. Exit status is 0 only if the connection
 established *and* the requested number of frames decoded.
 
+`hold=N` keeps the connection open for at least N seconds even after the
+frames have arrived. The still-screen test uses it to sit through a frozen
+picture. The summary's `maxgap` is the longest wait between decode units in
+milliseconds, and `poor` counts `CONN_STATUS_POOR` notifications. Every key
+frame is logged as a `frame` line, so one that arrives mid-session, which is
+what recovery looks like, is visible.
+
 Decode the recording to look at it:
 
 ```sh

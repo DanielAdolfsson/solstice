@@ -33,6 +33,10 @@ max_bitrate_kbps = 20000
 [video]
 encoder        = "openh264"
 fec_percentage = 20
+# Frames per second once the screen has been still for half a second. A repeat
+# frame is a few bytes but nearly a full encode of CPU; any change goes out at
+# the full rate regardless. Set to the stream's rate for a fixed-rate stream.
+idle_fps       = 5
 
 [audio]
 # The RFB backend has no audio, so this sends Opus silence. The SPICE backend

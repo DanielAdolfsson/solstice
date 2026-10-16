@@ -10,14 +10,19 @@
 //! H.264` for every frame. This measures the last two stages so they can be
 //! compared against `solstice-vnc`'s `encoding_bench`, which measures the
 //! first. Optimising the cheap stage is not optimising.
+//!
+//! The last two rows per resolution are per second of a still session rather
+//! than per frame: `frames/s` is how many frames the clock emitted, and
+//! `core %` is what they cost, at the stream's rate and at the keep-alive
+//! rate (`docs/roadmap.md` §6).
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use solstice_backend::{Framebuffer, Rect};
 use solstice_video::convert::{convert_full, convert_rect};
 use solstice_video::encoder::{EncoderConfig, VideoEncoder};
 use solstice_video::testsrc::TestPattern;
-use solstice_video::I420Frame;
+use solstice_video::{FrameClock, I420Frame};
 
 fn cpu_seconds() -> f64 {
     let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
@@ -125,8 +130,60 @@ fn what_the_encode_path_costs() {
             FRAMES,
             Some(still as f64 / FRAMES as f64),
         );
+
+        // What a still screen costs per second of session, with the frame
+        // clock deciding how many of those unchanged frames there are.
+        for idle_fps in [60, 5] {
+            let mut encodes = 0;
+            let cpu0 = cpu_seconds();
+            let t0 = Instant::now();
+            for_each_still_tick(idle_fps, SESSION, || {
+                encoder.encode(&frame, false).unwrap();
+                encodes += 1;
+            });
+            report_session(
+                &format!("{w}x{h} still screen, idle_fps {idle_fps}"),
+                t0,
+                cpu0,
+                encodes,
+            );
+        }
         println!();
     }
+}
+
+/// Simulated session length for the still-screen rows.
+const SESSION: Duration = Duration::from_secs(10);
+
+/// Run `f` for every frame a 60 fps clock emits over `session` of a screen
+/// that changed once, at the start. Virtual time: the clock is polled at its
+/// own deadlines, so this counts frames rather than waiting for them.
+fn for_each_still_tick(idle_fps: u32, session: Duration, mut f: impl FnMut()) {
+    let start = Instant::now();
+    let mut clock = FrameClock::new(60, start).with_idle_rate(idle_fps);
+    let mut now = start;
+    while now < start + session {
+        if clock.poll(now).is_some() {
+            f();
+        }
+        now += clock.time_until_next(now).max(Duration::from_micros(1));
+    }
+}
+
+fn report_session(name: &str, t0: Instant, cpu0: f64, encodes: usize) {
+    let wall = t0.elapsed().as_secs_f64();
+    let cpu = cpu_seconds() - cpu0;
+    // Encodes per second of session, and the share of a core they cost.
+    let rate = encodes as f64 / SESSION.as_secs_f64();
+    let core_pct = cpu / SESSION.as_secs_f64() * 100.0;
+    println!(
+        "{:<36} {:>10.3} {:>10.1} {:>12.1} {:>10}",
+        name,
+        wall / encodes as f64 * 1000.0,
+        rate,
+        core_pct,
+        ""
+    );
 }
 
 fn report(name: &str, t0: Instant, cpu0: f64, frames: usize, mean_bytes: Option<f64>) {

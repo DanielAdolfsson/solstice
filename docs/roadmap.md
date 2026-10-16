@@ -39,12 +39,13 @@ What is left is ordinary work.
 | 3 | [Validate against real Moonlight](#3-validate-against-real-moonlight) | **done** — a real `moonlight-common-c` client streams from this host; the eight defects it found are in §3 | nothing |
 | 4 | [Captured golden vectors](#4-captured-sunshine--moonlight-vectors) | **done** — a real session, frozen and replayed in CI; the two defects it found are in §4 | nothing |
 | 5 | [`solstice pair` management socket](#5-solstice-pair-and-a-management-socket) | **done** — `pair`, `status`, `list-clients` and `revoke` reach the running daemon; what is left is in §5 | nothing |
-| 6 | [The still-frame encode cost](#6-the-still-frame-encode-cost) | ~2 days | nothing |
+| 6 | [The still-frame encode cost](#6-the-still-frame-encode-cost) | **done** — a still screen drops to a keep-alive rate, about 12× cheaper, and a real `moonlight-common-c` sits through it; what is left is in §6 | nothing |
 | 7 | [ENet: audit or reimplement](#7-enet-audit-or-reimplement) | 1–3 weeks | nothing |
 | 8 | [Smaller items](#8-smaller-items) | varies | |
 
-§5, the management socket, is done. §6 is the next one with a clear finish
-line: it is the steady-state cost of every idle session.
+§6, the still-frame cost, is done too: an idle 1080p60 session went from 56%
+of a core to under 5%. §7 is the largest item left, and the only one on the
+pre-authentication path.
 
 ---
 
@@ -834,26 +835,121 @@ certificate, so a client re-pairing leaves the store looking unchanged.
 
 ## 6. The still-frame encode cost
 
-The benchmark in `docs/implementation-notes.md` §3 found this and it is the
-largest optimisation available: **9.5 ms and 57% of a core at 1080p60 to
-produce 13 bytes** for an unchanged frame. A desktop is mostly still and the
-synthetic frame clock emits these constantly, so it is the steady-state cost of
-an idle session.
+**Done.** On a still screen the frame clock drops from the stream's rate to
+`video.idle_fps` (default 5) once nothing has changed for half a second
+(`IDLE_AFTER`, `crates/solstice-video/src/clock.rs`). Damage or an IDR request
+pulls the next frame back to where the full rate would have put it, so a change
+never waits on the keep-alive.
 
-Worth trying, in order of likely payoff:
+The cost it removes: OpenH264 spent **9.5 ms and 57% of a core at 1080p60 to
+produce 13 bytes** for every unchanged frame, and the clock emitted sixty a
+second.
 
-- OpenH264 encoder settings — the build logs already warn that
-  `bEnableFrameSkip = 0` disables rate control and that scene-change detection
-  is off; neither was tuned with a measurement in hand.
-- Dropping to a lower tick rate while the screen is unchanged, within whatever
-  Moonlight's watchdog tolerates (`ML_ERROR_NO_VIDEO_TRAFFIC`,
-  `Limelight.h:419-424`) — the clock already knows a frame is a duplicate
-  (`Tick::is_duplicate`).
-- Caching an encoded still frame and re-sending it. **Verify this is legal**
-  before building it: the reference and frame numbering have to stay
-  consistent or the client's decoder drifts.
+### What the three candidates came to
 
-Measure with `encode_cost.rs`, which exists for this.
+The roadmap listed three things to try, in order of likely payoff. Only the
+second survived measurement.
+
+- **Encoder settings: no.** A sweep of the unchanged-frame cost at 1080p,
+  using the shipping configuration as the baseline:
+
+  | Change | ms/frame | Bytes |
+  |---|---|---|
+  | none (`ScreenContentRealTime`, bitrate RC, skip off) | 9.5 | 13 |
+  | `num_threads(1)` | 9.5 | 13 |
+  | scene-change detection on | 9.6 | 13 |
+  | frame skip on | 9.5 | 13 |
+  | rate control off | 7.1 | 13 |
+  | `CameraVideoRealTime` | 3.2 | 15 |
+  | camera, background detection and AQ off | 2.0 | 84 |
+
+  The two build-log warnings were not the cause. Frame skip and scene-change
+  detection change nothing. What costs is OpenH264 analysing every macroblock
+  of a frame it is about to code as all-skip. Camera mode is cheaper because it
+  drops the screen-content tools, which are why screen mode is chosen. Turning
+  rate control off means no bitrate control. None of these gets near zero.
+- **A lower tick rate while still: yes.** This is what shipped. The fear was
+  Moonlight's watchdog. Read from source, the watchdog does not apply here:
+  `ML_ERROR_NO_VIDEO_TRAFFIC` and `ML_ERROR_NO_VIDEO_FRAME` are checked only
+  until the first packet and the first whole frame (`VideoStream.c:146-176`).
+  After that the client has no video-silence timeout at all. Its
+  connection-quality statistic counts gaps in the *frame index*
+  (`ControlStream.c:471-514`), and the packetiser numbers frames contiguously
+  whatever the rate. So fewer frames is not loss.
+- **Re-sending a cached frame: not legal as it stands.** The 13-byte repeat is
+  a *reference* P-slice (NAL header `0x61`, `nal_ref_idc` 3). Consecutive
+  repeats differ in exactly the `frame_num` bits. Sending one twice gives two
+  consecutive reference frames the same `frame_num`, which H.264 §7.4.3
+  forbids. A legal version would be a hand-built *non-reference* all-skip
+  slice. That is feasible, since the PPS is CAVLC, but it is unnecessary once
+  the clock slows down.
+
+### Why the tail, and why 5
+
+Two things want the frames right after a change at full rate. A decoder that
+holds one frame before display shows a change only when the next frame
+arrives. And the client notices a lost frame only when a later frame index
+turns up. So the clock holds full rate for `IDLE_AFTER` (500 ms) after the
+last change before backing off. Typing or a blinking cursor stays inside the
+tail and never oscillates.
+
+5 fps is a judgement, not a measurement. `moonlight-common-c` would accept
+less. The keep-alive is for the app layers above it, which have not been
+tested (below). `idle_fps` at or above the stream rate restores a fixed-rate
+stream, so an operator can opt out without a rebuild.
+
+### How it is tested
+
+- **The clock** (`clock.rs`): back-off after the tail and never silence; damage
+  and IDR requests during the idle wait go out at the full-rate deadline; full
+  rate resumes after a change; an idle rate at or above the stream rate stays
+  fixed.
+- **The pipeline** (`pipeline.rs`,
+  `a_still_screen_backs_off_and_a_change_cuts_the_wait_short`): a session that
+  never changes gets the tail, then roughly the keep-alive rate. A damage event
+  mid-wait reaches the packet channel in well under a keep-alive interval.
+  Fails with the back-off disabled (112 frames where at most 8 are allowed).
+- **The real client** (`real_moonlight.rs`,
+  `the_reference_client_sits_through_a_still_screen_at_the_idle_rate`): colour
+  bars move for a second, freeze for twelve (longer than any timeout in
+  `moonlight-common-c`), then move again. The client must not terminate,
+  report a poor connection, or ask for a keyframe after start-up. Its longest
+  wait between decode units must look like a keep-alive (204 ms measured at
+  `idle_fps = 5`). The recording must show the frozen picture, then motion.
+  With the back-off disabled it fails on the gap (63 ms: "the host never
+  slowed down"). The probe gained `hold=N`, and `maxgap=` and `poor=` in its
+  summary, for this.
+
+### Measured
+
+`encode_cost.rs` now has a still-session row per resolution. It drives the real
+`FrameClock` over ten seconds of an unchanged screen and encodes every frame
+the clock emits:
+
+```
+stage                                  ms/frame   frames/s   core % @60
+1280x720 still screen, idle_fps 60        4.280       60.1         25.7
+1280x720 still screen, idle_fps 5         4.283        7.9          3.4
+1920x1080 still screen, idle_fps 60       9.407       60.1         56.5
+1920x1080 still screen, idle_fps 5        9.415        7.9          7.4
+```
+
+That includes the half-second tail. In steady state the 1080p figure is 5 ×
+9.4 ms, **4.7% of a core, down from 56%**.
+
+### What is left
+
+- **No Moonlight *application* has seen a slowed stream.** The probe is the
+  protocol core. moonlight-qt's frame pacer and the platform decoders above it
+  are the layers that could plausibly mind a 5 fps idle stream, and none has
+  been tried (the manual tier, `docs/testing.md` §8). If one does mind, raise
+  `idle_fps`. Do not remove the back-off.
+- **A changed frame still costs a whole-frame analysis.** Typing one character
+  at 1080p is a full encode of a frame that is 99.9% unchanged. Encoder-side
+  region-of-interest or skip hints would be the next lever. OpenH264 exposes
+  neither through the crate.
+- **The non-reference skip slice** above would make even the keep-alive frames
+  nearly free. It is not worth the bitstream-writing risk at 4.7% of a core.
 
 ---
 

@@ -148,7 +148,8 @@ pointed at a client before any desktop is involved.
   effect in the daemon at once, not at its next restart.
 - **RTSP**, plaintext and AES-GCM wrapped, with the ANNOUNCE attribute parser
   and server-side clamping of everything the client asks for.
-- **The video path**: synthetic frame clock, BGRA→I420 conversion (whole-frame,
+- **The video path**: a synthetic frame clock that slows to a keep-alive rate
+  on a still screen, BGRA→I420 conversion (whole-frame,
   per-damaged-rectangle, or letterboxed when the backend will not resize),
   OpenH264 encoding with keyframes on demand, the `NV_VIDEO_PACKET` packetiser,
   Reed–Solomon FEC that matches `nanors` byte-for-byte, and AES-GCM shard

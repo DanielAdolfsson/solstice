@@ -62,6 +62,10 @@ Two refinements worth building in early:
 - **Do not skip frames entirely.** Moonlight's watchdog fires
   `ML_ERROR_NO_VIDEO_TRAFFIC` / `ML_ERROR_NO_VIDEO_FRAME`
   (`Limelight.h:419-424`) if the stream goes quiet.
+  *(As it turned out, only before the first frame: both checks stop once one
+  has arrived (`VideoStream.c:146-176`). Solstice still never goes silent,
+  but slows to a keep-alive rate on a still screen, which cut an idle
+  session's encode cost by about 12× — `docs/roadmap.md` §6.)*
 
 ### 2.2 Resolution
 
