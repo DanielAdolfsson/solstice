@@ -28,8 +28,8 @@ channel links, the 2D rasteriser, all six image types, video streams, the
 guest agent and audio — and `tests/real_server.rs` drives it against a live
 a **real QEMU guest** — every image codec forced in turn, MJPEG streams,
 input verified against the guest's own event stream, and a real
-`spice-vdagent` granting and applying a resize. What has *not* been exercised
-is written up in
+`spice-vdagent` granting and applying a resize and carrying the clipboard
+both ways. What has *not* been exercised is written up in
 [docs/roadmap.md §2.7](docs/roadmap.md#27-what-is-still-unvalidated).
 
 See [Status](#status) for the full picture, including what is deliberately
@@ -44,7 +44,7 @@ source). No cmake, no nasm, no system libraries.
 
 ```sh
 cargo build --release
-cargo test --workspace        # 665 tests, about 30 s
+cargo test --workspace        # 687 tests, about 30 s
 cargo clippy --workspace --all-targets
 ```
 
@@ -152,8 +152,9 @@ pointed at a client before any desktop is involved.
   scaled blits, strokes and raster glyphs; every image type SPICE defines —
   raw in all eleven layouts, QUIC, LZ, GLZ, zlib-over-GLZ, JPEG, JPEG+alpha
   and LZ4; MJPEG video streams composited over the draw output; the cursor
-  channel; `spice-vdagent` for exact-resolution resize and absolute mouse;
-  and Opus audio passed through rather than transcoded.
+  channel; `spice-vdagent` for exact-resolution resize, absolute mouse and
+  the by-demand clipboard; and Opus audio passed through rather than
+  transcoded.
 
 ### Not implemented
 
@@ -161,12 +162,13 @@ Each of these is written up in [docs/roadmap.md](docs/roadmap.md) with a plan,
 the tests that would finish it, and what is already known to be hard. The
 summaries below are just the shape of it.
 
-- **The SPICE clipboard.** It is implemented in `agent.rs` and tested against
-  the mock, but nothing above it exposes it: there is no way for a session to
-  grab, request or send a clipboard payload, so it cannot be tested end to
-  end. That is missing API rather than a missing test. Resize and client-mode
-  absolute mouse *are* now validated against a real `spice-vdagent`.
-  [The list](docs/roadmap.md#27-what-is-still-unvalidated).
+- **A clipboard route to Moonlight.** The SPICE side is finished and runs
+  both directions against a real `spice-vdagent` — a `SpiceSession` offers,
+  requests, sends and declines, and the guest's own grabs and requests arrive
+  as events. What is missing is a sink: GameStream has no clipboard channel,
+  so nothing carries it to the client, and the API is therefore SPICE's own
+  rather than part of the backend seam.
+  [Why](docs/roadmap.md#25-what-is-deliberately-not-implemented).
 - **`DRAW_COMPOSITE`, GL scanout, and two cursor types** on the SPICE side.
   Each is a deliberate omission rather than a gap, and the capability is not
   advertised in any of the three cases, so a conforming server will not send

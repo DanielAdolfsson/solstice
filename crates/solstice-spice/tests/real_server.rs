@@ -35,6 +35,7 @@ use std::time::Duration;
 
 use solstice_backend::{BackendEvent, InputEvent, KeyEvent, Session};
 use solstice_spice::backend::{connect, SpiceConfig, SpiceSecurity, TcpDialer};
+use solstice_spice::{ClipboardEvent, ClipboardType};
 use solstice_test_guest::{Display, Guest, GuestConfig, Spice};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -205,7 +206,10 @@ async fn lz4_cannot_be_forced_from_the_command_line() {
     if solstice_test_guest::image_dir().join("vmlinuz").exists() {
         let rejected = std::process::Command::new("qemu-system-x86_64")
             .args(["-display", "none", "-monitor", "none", "-serial", "none"])
-            .args(["-spice", "port=5999,addr=127.0.0.1,disable-ticketing=on,image-compression=lz4"])
+            .args([
+                "-spice",
+                "port=5999,addr=127.0.0.1,disable-ticketing=on,image-compression=lz4",
+            ])
             .output();
         let Ok(out) = rejected else {
             eprintln!("skipping: qemu-system-x86_64 is not installed");
@@ -359,9 +363,8 @@ async fn input_reaches_a_real_guest() {
             Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
         })
         .collect();
-    let near = |(x, y): (i32, i32), (tx, ty): (i32, i32)| {
-        (x - tx).abs() <= 1 && (y - ty).abs() <= 1
-    };
+    let near =
+        |(x, y): (i32, i32), (tx, ty): (i32, i32)| (x - tx).abs() <= 1 && (y - ty).abs() <= 1;
     assert!(
         landed.iter().any(|&p| near(p, (600, 400))),
         "the pointer never arrived where it was sent; xev saw: {:?}",
@@ -419,7 +422,9 @@ async fn guest_eventually(guest: &Guest, script: &str, wanted: &str) -> Result<S
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    Err(format!("`{script}` never produced {wanted:?}; last saw: {last:?}"))
+    Err(format!(
+        "`{script}` never produced {wanted:?}; last saw: {last:?}"
+    ))
 }
 
 /// The same resize on QXL, which no client can do here.
@@ -518,5 +523,260 @@ async fn resize_test(display: Display) {
         "the guest resized but the client's geometry did not follow"
     );
 
+    session.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// The clipboard, against a real `spice-vdagent`.
+//
+// `docs/roadmap.md` §2.7 recorded this as unfinished rather than untested:
+// the agent could encode every clipboard message and nothing above it could
+// ask for one. These are what make it reachable, and they are the first
+// thing to point at a real agent -- a mock cannot say whether vdagent agrees
+// with this client about the capability gate, the framing, or whether a
+// selection word belongs in front of the type.
+// ---------------------------------------------------------------------------
+
+/// Wait for a clipboard event matching `want`, discarding the ones before it.
+///
+/// Discarding rather than asserting on the first: a real agent announces, and
+/// X's selection ownership changes, on their own schedule, so an unrelated
+/// grab arriving first is normal rather than a failure.
+async fn clipboard_event(
+    guest: &Guest,
+    events: &mut tokio::sync::broadcast::Receiver<ClipboardEvent>,
+    want: impl Fn(&ClipboardEvent) -> bool,
+) -> ClipboardEvent {
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    let mut seen = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, events.recv()).await {
+            Ok(Ok(event)) if want(&event) => return event,
+            Ok(Ok(event)) => seen.push(event),
+            Ok(Err(e)) => panic!("the clipboard channel ended: {e}; saw {seen:?}"),
+            // The guest's own logs, because every way this times out is a
+            // disagreement with the agent and the agent is the one keeping
+            // notes: a refused capability, a message it could not parse, or
+            // a selection it never took ownership of.
+            Err(_) => panic!(
+                "no matching clipboard event in {TIMEOUT:?}; saw {seen:?}\n\
+                 --- vdagent ---\n{}\n--- vdagentd ---\n{}",
+                guest
+                    .sh("tail -25 /var/log/vdagent.log")
+                    .unwrap_or_default(),
+                guest
+                    .sh("tail -25 /var/log/vdagentd.log")
+                    .unwrap_or_default(),
+            ),
+        }
+    }
+}
+
+/// A session whose guest agent has announced that it will do clipboards.
+///
+/// Like `can_resize`, this is false when `connect` returns and becomes true
+/// shortly afterwards: the agent attaches once a client does.
+async fn clipboard_session(guest: &Guest) -> solstice_spice::SpiceSession {
+    let session = session(guest.spice_port()).await;
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while tokio::time::Instant::now() < deadline && !session.can_clipboard() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        session.can_clipboard(),
+        "spice-vdagent is running, so it should have announced CLIPBOARD and \
+         CLIPBOARD_BY_DEMAND; the guest said: {}\n--- vdagent ---\n{}",
+        guest.sh("pgrep -a spice-vdagent").unwrap_or_default(),
+        guest
+            .sh("tail -20 /var/log/vdagent.log")
+            .unwrap_or_default(),
+    );
+    session
+}
+
+/// Guest to client: a copy inside the guest is offered, asked for, and
+/// arrives.
+#[tokio::test]
+async fn a_real_agent_hands_over_the_guests_clipboard() {
+    let Some(guest) = start(640, 480, "off", "off") else {
+        return;
+    };
+    let session = clipboard_session(&guest).await;
+    let mut events = session.subscribe_clipboard();
+
+    // `-loops 0` keeps xclip serving the selection rather than exiting after
+    // the first paste: vdagent reads it once to answer this client, and a
+    // re-run of the test should not depend on how many times it asked.
+    guest
+        .sh(
+            "printf 'solstice says hello' | nohup xclip -selection clipboard -loops 0 -i \
+             >/tmp/xclip.log 2>&1 & echo started",
+        )
+        .expect("setting the guest clipboard");
+
+    let offer = clipboard_event(
+        &guest,
+        &mut events,
+        |e| matches!(e, ClipboardEvent::Offered(types) if types.contains(&ClipboardType::Utf8Text)),
+    )
+    .await;
+    assert!(
+        matches!(&offer, ClipboardEvent::Offered(types) if types.contains(&ClipboardType::Utf8Text)),
+        "{offer:?}"
+    );
+
+    assert!(
+        session
+            .request_clipboard(ClipboardType::Utf8Text)
+            .await
+            .expect("the session should still be up"),
+        "a request was declined with the agent running"
+    );
+
+    let data = clipboard_event(&guest, &mut events, |e| {
+        matches!(e, ClipboardEvent::Data { .. } | ClipboardEvent::Unavailable)
+    })
+    .await;
+    match data {
+        ClipboardEvent::Data { kind, data } => {
+            assert_eq!(kind, ClipboardType::Utf8Text);
+            assert_eq!(
+                String::from_utf8_lossy(&data),
+                "solstice says hello",
+                "the payload is not what the guest copied"
+            );
+        }
+        other => panic!(
+            "the guest refused its own offer: {other:?}\n--- vdagent ---\n{}",
+            guest
+                .sh("tail -20 /var/log/vdagent.log")
+                .unwrap_or_default()
+        ),
+    }
+
+    session.close().await;
+}
+
+/// Client to guest: an offer, the guest's request for it, and the answer
+/// landing in a guest-side paste.
+///
+/// This is the half a mock cannot settle. The guest only asks once X tells
+/// `spice-vdagent` the selection changed owner, and it only pastes once the
+/// answer comes back through the same tunnel -- so a wrong capability gate, a
+/// wrong framing, or a missing reply all show up here as a paste that never
+/// completes.
+///
+/// Both ends retry, and both for the same reason: an offer and an X selection
+/// ownership change are not the same event. `xclip -o` run before
+/// `spice-vdagent` owns the selection exits immediately with "target not
+/// available" rather than waiting, so the guest asks in a loop -- and every
+/// one of those attempts is a real request this client has to answer, which
+/// is why the answering is a task rather than one call. A consumer that
+/// answered only the first request would hang the guest on the second.
+#[tokio::test]
+async fn a_real_agent_takes_the_clipboard_this_client_offers() {
+    let Some(guest) = start(640, 480, "off", "off") else {
+        return;
+    };
+    let session = Arc::new(clipboard_session(&guest).await);
+    let mut events = session.subscribe_clipboard();
+
+    let answered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let answering = tokio::spawn({
+        let session = session.clone();
+        let answered = answered.clone();
+        async move {
+            while let Ok(event) = events.recv().await {
+                if event != ClipboardEvent::Requested(ClipboardType::Utf8Text) {
+                    continue;
+                }
+                session
+                    .send_clipboard(ClipboardType::Utf8Text, b"solstice answers")
+                    .await
+                    .expect("the session should still be up");
+                answered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    });
+
+    assert!(
+        session
+            .offer_clipboard(&[ClipboardType::Utf8Text])
+            .await
+            .expect("the session should still be up"),
+        "an offer was declined with the agent running"
+    );
+
+    guest
+        .sh("nohup sh -c 'for _ in $(seq 1 60); do \
+                 xclip -selection clipboard -o >/tmp/paste.txt 2>/tmp/paste.err; \
+                 [ -s /tmp/paste.txt ] && break; sleep 0.5; \
+             done' >/dev/null 2>&1 & echo started")
+        .expect("starting the guest-side paste");
+
+    guest_eventually(&guest, "cat /tmp/paste.txt", "solstice answers")
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the guest never pasted what this client sent: {e}\n\
+                 answered {} request(s)\n--- xclip ---\n{}\n--- vdagent ---\n{}",
+                answered.load(std::sync::atomic::Ordering::Relaxed),
+                guest.sh("cat /tmp/paste.err").unwrap_or_default(),
+                guest
+                    .sh("tail -25 /var/log/vdagent.log")
+                    .unwrap_or_default(),
+            )
+        });
+    assert!(
+        answered.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+        "the guest pasted without ever asking this client for the bytes"
+    );
+
+    // And withdrawing the offer is heard: `spice-vdagent` gives up ownership
+    // of the X selection, so a guest-side paste stops finding one.
+    assert!(session
+        .release_clipboard()
+        .await
+        .expect("the session should still be up"));
+    guest_eventually(
+        &guest,
+        "rm -f /tmp/after.txt; xclip -selection clipboard -o >/tmp/after.txt 2>&1; \
+         cat /tmp/after.txt",
+        "target STRING not available",
+    )
+    .await
+    .expect("the agent kept serving a clipboard this client had withdrawn");
+
+    answering.abort();
+    session.close().await;
+}
+
+/// Without `spice-vdagent` there is no clipboard at all, and declining is
+/// the contract rather than a failure -- the same shape
+/// `a_resize_is_declined_without_the_agent` asserts.
+#[tokio::test]
+async fn the_clipboard_is_declined_without_the_agent() {
+    let Some(guest) = Guest::start(
+        GuestConfig::new()
+            .geometry(640, 480)
+            .spice(Spice::new().image_compression("off").without_agent()),
+    ) else {
+        return;
+    };
+    let session = session(guest.spice_port()).await;
+    assert!(!session.can_clipboard());
+    assert!(!session
+        .offer_clipboard(&[ClipboardType::Utf8Text])
+        .await
+        .unwrap());
+    assert!(!session
+        .request_clipboard(ClipboardType::Utf8Text)
+        .await
+        .unwrap());
+    assert!(!session
+        .send_clipboard(ClipboardType::Utf8Text, b"nobody is listening")
+        .await
+        .unwrap());
     session.close().await;
 }

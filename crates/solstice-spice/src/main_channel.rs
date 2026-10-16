@@ -33,6 +33,21 @@ pub enum MainOutcome {
     AgentConnected(bool),
     /// The guest offered the clipboard in these types.
     ClipboardOffered(Vec<u32>),
+    /// The guest withdrew its clipboard offer.
+    ClipboardReleased,
+    /// The guest wants this client's clipboard, in this type.
+    ///
+    /// The guest's paste blocks until a `CLIPBOARD` answers it, so this
+    /// outcome has to be acted on even when the answer is "nothing".
+    ClipboardRequested(u32),
+    /// A clipboard payload arrived, in answer to a request.
+    ClipboardData {
+        /// `VD_AGENT_CLIPBOARD_*`, or `NONE` when the guest had nothing to
+        /// give after all.
+        kind: u32,
+        /// The bytes after the type word.
+        data: Vec<u8>,
+    },
 }
 
 /// The most channels a `CHANNELS_LIST` may name.
@@ -254,8 +269,13 @@ impl MainChannel {
                         &agent::announce_capabilities(false),
                     ));
                 }
+                // Only once the guest's capabilities are known: the
+                // message is gated on the guest having `MAX_CLIPBOARD`, and
+                // before the announcement nothing is known about it.
+                send.extend(self.agent.max_clipboard());
                 tracing::info!(
                     can_resize = self.agent.can_resize(),
+                    can_clipboard = self.agent.can_clipboard(),
                     "spice guest agent announced its capabilities"
                 );
             }
@@ -267,6 +287,26 @@ impl MainChannel {
                 }
                 outcomes.push(MainOutcome::ClipboardOffered(types));
             }
+            agent::msg::CLIPBOARD_RELEASE => {
+                outcomes.push(MainOutcome::ClipboardReleased);
+            }
+            agent::msg::CLIPBOARD_REQUEST => match clipboard_kind(&message.body) {
+                Some(kind) => outcomes.push(MainOutcome::ClipboardRequested(kind)),
+                None => tracing::warn!(
+                    len = message.body.len(),
+                    "a clipboard request with no type in it"
+                ),
+            },
+            agent::msg::CLIPBOARD => match clipboard_kind(&message.body) {
+                Some(kind) => outcomes.push(MainOutcome::ClipboardData {
+                    kind,
+                    data: message.body[4..].to_vec(),
+                }),
+                None => tracing::warn!(
+                    len = message.body.len(),
+                    "a clipboard payload with no type in it"
+                ),
+            },
             agent::msg::REPLY => {
                 let mut r = Reader::new(&message.body);
                 let kind = r.u32()?;
@@ -308,6 +348,22 @@ impl MainChannel {
     pub fn can_resize(&self) -> bool {
         self.agent.can_resize()
     }
+
+    /// Whether clipboard messages would reach the guest.
+    pub fn can_clipboard(&self) -> bool {
+        self.agent.can_clipboard()
+    }
+}
+
+/// Read the type word off the front of a clipboard message.
+///
+/// A short body is dropped rather than failing the channel. Every other
+/// truncation in this file is fatal because the next byte would be read in
+/// the wrong place, but an agent message is already framed by its own
+/// `size`: a malformed one costs that message and nothing after it.
+fn clipboard_kind(body: &[u8]) -> Option<u32> {
+    let head = body.get(..4)?;
+    Some(u32::from_le_bytes(head.try_into().expect("four bytes")))
 }
 
 /// Build `MAIN_MOUSE_MODE_REQUEST`.
@@ -493,6 +549,108 @@ mod tests {
         assert!(outcomes.contains(&MainOutcome::ClipboardOffered(vec![
             agent::clipboard_type::UTF8_TEXT
         ])));
+    }
+
+    /// Wrap an agent message in the `AGENT_DATA` framing and feed it in.
+    fn feed_agent(
+        main: &mut MainChannel,
+        kind: u32,
+        body: &[u8],
+    ) -> (Vec<OutMessage>, Vec<MainOutcome>) {
+        let mut w = Writer::new();
+        w.u32(agent::PROTOCOL)
+            .u32(kind)
+            .u64(0)
+            .u32(body.len() as u32)
+            .bytes(body);
+        main.handle(main_msg::AGENT_DATA, &w.finish()).unwrap()
+    }
+
+    /// A main channel with an agent that has announced itself, which is what
+    /// every clipboard message is gated on.
+    fn main_with_clipboard() -> MainChannel {
+        let mut main = MainChannel::new();
+        main.handle(main_msg::INIT, &init_body(1, 0, 0)).unwrap();
+        feed_agent(
+            &mut main,
+            agent::msg::ANNOUNCE_CAPABILITIES,
+            &agent::announce_capabilities(false),
+        );
+        assert!(main.can_clipboard());
+        main
+    }
+
+    /// The guest is told the ceiling as soon as it says it can hear it --
+    /// without which an oversized selection arrives and ends the channel,
+    /// because the reassembler cannot walk past a message it refused to
+    /// buffer.
+    #[test]
+    fn the_capability_exchange_tells_the_guest_the_clipboard_ceiling() {
+        let mut main = MainChannel::new();
+        main.handle(main_msg::INIT, &init_body(1, 0, 0)).unwrap();
+        let (send, _) = feed_agent(
+            &mut main,
+            agent::msg::ANNOUNCE_CAPABILITIES,
+            &agent::announce_capabilities(false),
+        );
+        let declared = send
+            .iter()
+            .filter(|m| m.kind == main_msgc::AGENT_DATA)
+            .find(|m| {
+                u32::from_le_bytes(m.body[4..8].try_into().unwrap()) == agent::msg::MAX_CLIPBOARD
+            })
+            .expect("a MAX_CLIPBOARD should have gone out");
+        let at = agent::MESSAGE_HEADER;
+        assert_eq!(
+            i32::from_le_bytes(declared.body[at..at + 4].try_into().unwrap()),
+            agent::MAX_CLIPBOARD_PAYLOAD as i32
+        );
+    }
+
+    #[test]
+    fn a_clipboard_payload_from_the_guest_is_surfaced_with_its_type() {
+        let mut main = main_with_clipboard();
+        let mut body = Writer::new();
+        body.u32(agent::clipboard_type::UTF8_TEXT)
+            .bytes(b"from the guest");
+        let (_, outcomes) = feed_agent(&mut main, agent::msg::CLIPBOARD, &body.finish());
+        assert!(outcomes.contains(&MainOutcome::ClipboardData {
+            kind: agent::clipboard_type::UTF8_TEXT,
+            data: b"from the guest".to_vec(),
+        }));
+    }
+
+    #[test]
+    fn a_clipboard_request_and_a_release_from_the_guest_are_surfaced() {
+        let mut main = main_with_clipboard();
+        let mut body = Writer::new();
+        body.u32(agent::clipboard_type::IMAGE_PNG);
+        let (_, outcomes) = feed_agent(&mut main, agent::msg::CLIPBOARD_REQUEST, &body.finish());
+        assert!(outcomes.contains(&MainOutcome::ClipboardRequested(
+            agent::clipboard_type::IMAGE_PNG
+        )));
+
+        let (_, outcomes) = feed_agent(&mut main, agent::msg::CLIPBOARD_RELEASE, &[]);
+        assert!(outcomes.contains(&MainOutcome::ClipboardReleased));
+    }
+
+    /// Everything else in this file treats a truncation as fatal, because
+    /// the next byte would be read in the wrong place. An agent message is
+    /// framed by its own `size`, so a malformed one costs that message and
+    /// nothing after it -- and ending a desktop session over a bad clipboard
+    /// message would be the wrong trade.
+    #[test]
+    fn a_clipboard_message_with_no_type_is_dropped_rather_than_ending_the_channel() {
+        let mut main = main_with_clipboard();
+        for kind in [agent::msg::CLIPBOARD, agent::msg::CLIPBOARD_REQUEST] {
+            for body in [&b""[..], &b"ab"[..]] {
+                let (_, outcomes) = feed_agent(&mut main, kind, body);
+                assert!(outcomes.is_empty(), "{kind} with {} bytes", body.len());
+            }
+        }
+        // Still live: an ordinary message after them still works.
+        let (_, outcomes) = feed_agent(&mut main, agent::msg::CLIPBOARD_RELEASE, &[]);
+        assert!(outcomes.contains(&MainOutcome::ClipboardReleased));
     }
 
     #[test]

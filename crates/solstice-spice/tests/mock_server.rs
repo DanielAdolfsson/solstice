@@ -22,6 +22,8 @@ use solstice_spice::error::{Result, SpiceError};
 use solstice_spice::link::Transport;
 use solstice_spice::mock::{self, MockConfig, MockPush, MockServer, Recorded};
 use solstice_spice::protocol::{channel, display_msg, inputs_msgc, main_msgc};
+use solstice_spice::wire::Writer;
+use solstice_spice::{ClipboardEvent, ClipboardType};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -499,25 +501,22 @@ async fn a_resize_is_refused_without_a_guest_agent_and_accepted_with_one() {
     }
     assert!(session.request_resize(1920, 1080).await.unwrap());
 
-    let recorded = wait_for(&server, |recorded| {
-        recorded
-            .iter()
-            .filter(|r| r.channel == channel::MAIN && r.kind == main_msgc::AGENT_DATA)
-            .count()
-            >= 2
-    })
-    .await;
-    // The second AGENT_DATA is the monitors config; the first is the
-    // client's own capability announcement.
+    // By type rather than by position: the client's own capability
+    // announcement and its MAX_CLIPBOARD are AGENT_DATA too, and counting
+    // them would make this test depend on how many other messages the
+    // capability exchange happens to produce.
+    let is_monitors = |r: &Recorded| {
+        r.channel == channel::MAIN
+            && r.kind == main_msgc::AGENT_DATA
+            && r.body.len() >= 8
+            && u32::from_le_bytes(r.body[4..8].try_into().unwrap())
+                == solstice_spice::agent::msg::MONITORS_CONFIG
+    };
+    let recorded = wait_for(&server, |recorded| recorded.iter().any(is_monitors)).await;
     let monitors = recorded
         .iter()
-        .filter(|r| r.channel == channel::MAIN && r.kind == main_msgc::AGENT_DATA)
-        .find(|r| {
-            r.body.len() >= 8
-                && u32::from_le_bytes(r.body[4..8].try_into().unwrap())
-                    == solstice_spice::agent::msg::MONITORS_CONFIG
-        })
-        .expect("a monitors config should have gone out");
+        .find(|r| is_monitors(r))
+        .expect("checked by the wait");
     // 20 bytes of VDAgentMessage header, then VDAgentMonitorsConfig's
     // `num_of_monitors` and `flags`, then the first VDAgentMonConfig --
     // which is height before width.
@@ -656,4 +655,315 @@ async fn an_undecodable_stream_is_reported_and_the_session_survives() {
     })
     .await;
     assert_eq!(session.dimensions(), (64, 48));
+}
+
+// ---------------------------------------------------------------------------
+// The clipboard.
+//
+// `docs/roadmap.md` §2.7 called this unfinished rather than untested: the
+// agent could encode every clipboard message and nothing above it could ask
+// for one. These drive the session's half of the exchange and the mock
+// supplies the guest's.
+// ---------------------------------------------------------------------------
+
+/// Wrap a `VDAgentMessage` for the mock to push as `MAIN_AGENT_DATA`.
+///
+/// Small bodies only, which every clipboard message in these tests is: a
+/// payload past `VD_AGENT_MAX_DATA_SIZE` would have to be chunked, and the
+/// reassembler is covered by its own unit test.
+fn agent_push(kind: u32, body: &[u8]) -> MockPush {
+    let mut w = Writer::new();
+    w.u32(solstice_spice::agent::PROTOCOL)
+        .u32(kind)
+        .u64(0)
+        .u32(body.len() as u32)
+        .bytes(body);
+    MockPush {
+        channel: channel::MAIN,
+        message: OutMessage::new(solstice_spice::protocol::main_msg::AGENT_DATA, w.finish()),
+    }
+}
+
+fn clipboard_body(kind: u32, data: &[u8]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.u32(kind).bytes(data);
+    w.finish()
+}
+
+/// A session whose mock claims a guest agent, waited until its capabilities
+/// have landed.
+async fn clipboard_session() -> (solstice_spice::backend::SpiceSession, Arc<MockServer>) {
+    let (session, server) = session_with(MockConfig {
+        agent: true,
+        ..MockConfig::default()
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while !session.can_clipboard() {
+        if tokio::time::Instant::now() > deadline {
+            panic!("the agent never announced its clipboard capabilities");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    (session, server)
+}
+
+/// Every agent message the client sent, as `(type, body-after-the-header)`.
+fn agent_messages(recorded: &[Recorded]) -> Vec<(u32, Vec<u8>)> {
+    recorded
+        .iter()
+        .filter(|r| r.channel == channel::MAIN && r.kind == main_msgc::AGENT_DATA)
+        .filter(|r| r.body.len() >= solstice_spice::agent::MESSAGE_HEADER)
+        .map(|r| {
+            (
+                u32::from_le_bytes(r.body[4..8].try_into().expect("four bytes")),
+                r.body[solstice_spice::agent::MESSAGE_HEADER..].to_vec(),
+            )
+        })
+        .collect()
+}
+
+async fn next_clipboard_event(
+    events: &mut tokio::sync::broadcast::Receiver<ClipboardEvent>,
+) -> ClipboardEvent {
+    tokio::time::timeout(TIMEOUT, events.recv())
+        .await
+        .expect("no clipboard event arrived")
+        .expect("the clipboard channel closed")
+}
+
+#[tokio::test]
+async fn the_clipboard_is_unreachable_without_an_agent_and_reachable_with_one() {
+    let (session, _) = session_with(MockConfig::default()).await;
+    assert!(!session.can_clipboard());
+    // Declined rather than failed, which is the same best-effort contract
+    // `request_resize` has: there is no agent to hear any of it.
+    assert!(!session
+        .offer_clipboard(&[ClipboardType::Utf8Text])
+        .await
+        .unwrap());
+    assert!(!session
+        .request_clipboard(ClipboardType::Utf8Text)
+        .await
+        .unwrap());
+    assert!(!session
+        .send_clipboard(ClipboardType::Utf8Text, b"x")
+        .await
+        .unwrap());
+    assert!(!session.decline_clipboard().await.unwrap());
+    assert!(!session.release_clipboard().await.unwrap());
+
+    let (session, _) = clipboard_session().await;
+    assert!(session.can_clipboard());
+}
+
+#[tokio::test]
+async fn an_offer_reaches_the_guest_as_a_grab_naming_every_type() {
+    let (session, server) = clipboard_session().await;
+    assert!(session
+        .offer_clipboard(&[ClipboardType::Utf8Text, ClipboardType::Png])
+        .await
+        .unwrap());
+
+    let recorded = wait_for(&server, |recorded| {
+        agent_messages(recorded)
+            .iter()
+            .any(|(kind, _)| *kind == solstice_spice::agent::msg::CLIPBOARD_GRAB)
+    })
+    .await;
+    let (_, body) = agent_messages(&recorded)
+        .into_iter()
+        .find(|(kind, _)| *kind == solstice_spice::agent::msg::CLIPBOARD_GRAB)
+        .expect("checked by the wait");
+    assert_eq!(
+        body,
+        [
+            ClipboardType::Utf8Text.to_wire().to_le_bytes(),
+            ClipboardType::Png.to_wire().to_le_bytes()
+        ]
+        .concat()
+    );
+
+    assert!(session.release_clipboard().await.unwrap());
+    wait_for(&server, |recorded| {
+        agent_messages(recorded).iter().any(|(kind, body)| {
+            *kind == solstice_spice::agent::msg::CLIPBOARD_RELEASE && body.is_empty()
+        })
+    })
+    .await;
+}
+
+/// The whole by-demand exchange from the guest's side: it grabs, the session
+/// asks for one of the offered types, the payload comes back as an event.
+#[tokio::test]
+async fn a_guest_grab_can_be_requested_and_the_payload_arrives_as_an_event() {
+    let (session, server) = clipboard_session().await;
+    let mut events = session.subscribe_clipboard();
+
+    assert!(server.push(agent_push(
+        solstice_spice::agent::msg::CLIPBOARD_GRAB,
+        &ClipboardType::Utf8Text.to_wire().to_le_bytes(),
+    )));
+    assert_eq!(
+        next_clipboard_event(&mut events).await,
+        ClipboardEvent::Offered(vec![ClipboardType::Utf8Text])
+    );
+
+    assert!(session
+        .request_clipboard(ClipboardType::Utf8Text)
+        .await
+        .unwrap());
+    wait_for(&server, |recorded| {
+        agent_messages(recorded).iter().any(|(kind, body)| {
+            *kind == solstice_spice::agent::msg::CLIPBOARD_REQUEST
+                && body == &ClipboardType::Utf8Text.to_wire().to_le_bytes()
+        })
+    })
+    .await;
+
+    assert!(server.push(agent_push(
+        solstice_spice::agent::msg::CLIPBOARD,
+        &clipboard_body(ClipboardType::Utf8Text.to_wire(), b"from the guest"),
+    )));
+    assert_eq!(
+        next_clipboard_event(&mut events).await,
+        ClipboardEvent::Data {
+            kind: ClipboardType::Utf8Text,
+            data: b"from the guest".to_vec(),
+        }
+    );
+
+    assert!(server.push(agent_push(
+        solstice_spice::agent::msg::CLIPBOARD_RELEASE,
+        &[]
+    )));
+    assert_eq!(
+        next_clipboard_event(&mut events).await,
+        ClipboardEvent::Released
+    );
+}
+
+/// The other direction: the guest wants what this client offered, and the
+/// answer goes back as a `CLIPBOARD`.
+#[tokio::test]
+async fn a_guest_request_is_answered_with_the_payload_a_subscriber_supplies() {
+    let (session, server) = clipboard_session().await;
+    let mut events = session.subscribe_clipboard();
+    assert!(session
+        .offer_clipboard(&[ClipboardType::Utf8Text])
+        .await
+        .unwrap());
+
+    assert!(server.push(agent_push(
+        solstice_spice::agent::msg::CLIPBOARD_REQUEST,
+        &ClipboardType::Utf8Text.to_wire().to_le_bytes(),
+    )));
+    assert_eq!(
+        next_clipboard_event(&mut events).await,
+        ClipboardEvent::Requested(ClipboardType::Utf8Text)
+    );
+
+    assert!(session
+        .send_clipboard(ClipboardType::Utf8Text, b"from the client")
+        .await
+        .unwrap());
+    wait_for(&server, |recorded| {
+        agent_messages(recorded).iter().any(|(kind, body)| {
+            *kind == solstice_spice::agent::msg::CLIPBOARD
+                && body == &clipboard_body(ClipboardType::Utf8Text.to_wire(), b"from the client")
+        })
+    })
+    .await;
+}
+
+/// A guest asking for a type this client will not name is answered rather
+/// than ignored: its paste blocks until a `CLIPBOARD` arrives, and no
+/// subscriber could have produced one.
+#[tokio::test]
+async fn a_request_for_a_type_this_client_cannot_name_is_declined_without_a_subscriber() {
+    let (session, server) = clipboard_session().await;
+    let mut events = session.subscribe_clipboard();
+
+    assert!(server.push(agent_push(
+        solstice_spice::agent::msg::CLIPBOARD_REQUEST,
+        &solstice_spice::agent::clipboard_type::FILE_LIST.to_le_bytes(),
+    )));
+    wait_for(&server, |recorded| {
+        agent_messages(recorded).iter().any(|(kind, body)| {
+            *kind == solstice_spice::agent::msg::CLIPBOARD
+                && body == &clipboard_body(solstice_spice::agent::clipboard_type::NONE, b"")
+        })
+    })
+    .await;
+
+    // And no subscriber was ever asked to answer it.
+    assert!(
+        matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ),
+        "a type this client cannot name should not reach a subscriber"
+    );
+
+    // `decline_clipboard` is the same answer, available to a subscriber that
+    // has nothing for a type it *can* name.
+    assert!(session.decline_clipboard().await.unwrap());
+}
+
+/// `VD_AGENT_CLIPBOARD_NONE` is the guest saying its offer cannot be
+/// honoured after all. Its own event, because a consumer waiting for
+/// `Data` would otherwise wait forever.
+#[tokio::test]
+async fn a_payload_this_client_cannot_name_arrives_as_unavailable() {
+    let (session, server) = clipboard_session().await;
+    let mut events = session.subscribe_clipboard();
+
+    assert!(server.push(agent_push(
+        solstice_spice::agent::msg::CLIPBOARD,
+        &clipboard_body(solstice_spice::agent::clipboard_type::NONE, b""),
+    )));
+    assert_eq!(
+        next_clipboard_event(&mut events).await,
+        ClipboardEvent::Unavailable
+    );
+
+    // A grab offering only what this client declines to claim is an empty
+    // offer rather than a missing one, so a consumer can tell the two apart.
+    assert!(server.push(agent_push(
+        solstice_spice::agent::msg::CLIPBOARD_GRAB,
+        &solstice_spice::agent::clipboard_type::FILE_LIST.to_le_bytes(),
+    )));
+    assert_eq!(
+        next_clipboard_event(&mut events).await,
+        ClipboardEvent::Offered(Vec::new())
+    );
+}
+
+/// The ceiling the guest was told about, enforced on the way out too. A
+/// megabyte of tokens is not spent and the session survives to be used
+/// again.
+#[tokio::test]
+async fn an_oversized_payload_is_refused_without_costing_the_session() {
+    let (session, server) = clipboard_session().await;
+    let huge = vec![b'x'; solstice_spice::agent::MAX_CLIPBOARD_PAYLOAD as usize + 1];
+    let err = session
+        .send_clipboard(ClipboardType::Utf8Text, &huge)
+        .await
+        .expect_err("past the ceiling");
+    assert!(
+        matches!(err, solstice_backend::BackendError::Limit(_)),
+        "{err}"
+    );
+
+    assert!(session
+        .send_clipboard(ClipboardType::Utf8Text, b"ok")
+        .await
+        .unwrap());
+    wait_for(&server, |recorded| {
+        agent_messages(recorded).iter().any(|(kind, body)| {
+            *kind == solstice_spice::agent::msg::CLIPBOARD
+                && body == &clipboard_body(ClipboardType::Utf8Text.to_wire(), b"ok")
+        })
+    })
+    .await;
 }

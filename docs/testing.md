@@ -367,10 +367,16 @@ ones that are properties of *this harness* rather than of the backend.
 **QXL cannot resize.** See §4.1 — not a client limitation, and not worth
 chasing further, since virtio-gpu serves the agent tests properly.
 
-**The clipboard cannot be tested at all**, because it is not plumbed to the
-session: `agent.rs` has `clipboard_grab`/`request`/`data`/`release` and
-nothing above it exposes them. That is missing production API, not a missing
-test.
+**The clipboard needs the guest to retry, and the host to keep answering.**
+Not a gap any more — both directions run against a real `spice-vdagent` —
+but the shape is worth knowing before writing another one. An offer from
+this client and an X selection ownership change are not the same event, and
+`xclip -o` run before `spice-vdagent` owns the selection exits immediately
+with *"target STRING not available"* rather than waiting. So the guest pastes
+in a loop, and **every attempt is a real request the client must answer**:
+the test answers them from a task rather than with a single call, because a
+consumer that answered only the first would hang the guest on the second. A
+real consumer carries the same obligation.
 
 **The draw-command mix is reachable but not yet asserted.** The guest emits
 `DRAW_STROKE`, `DRAW_TEXT` and `DRAW_ROP3` on demand via `solstice-draw`, so
