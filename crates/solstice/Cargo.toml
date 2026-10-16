@@ -37,7 +37,6 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls-pki-types = "1"
 rustls-pemfile = "2.2"
-rusty_enet = "0.4"
 humantime-serde = "1"
 ipnet = { version = "2", features = ["serde"] }
 hex = "0.4"

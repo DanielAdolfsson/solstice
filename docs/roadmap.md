@@ -40,12 +40,14 @@ What is left is ordinary work.
 | 4 | [Captured golden vectors](#4-captured-sunshine--moonlight-vectors) | **done** — a real session, frozen and replayed in CI; the two defects it found are in §4 | nothing |
 | 5 | [`solstice pair` management socket](#5-solstice-pair-and-a-management-socket) | **done** — `pair`, `status`, `list-clients` and `revoke` reach the running daemon; what is left is in §5 | nothing |
 | 6 | [The still-frame encode cost](#6-the-still-frame-encode-cost) | **done** — a still screen drops to a keep-alive rate, about 12× cheaper, and a real `moonlight-common-c` sits through it; what is left is in §6 | nothing |
-| 7 | [ENet: audit or reimplement](#7-enet-audit-or-reimplement) | 1–3 weeks | nothing |
+| 7 | [ENet: audit or reimplement](#7-enet-audit-or-reimplement) | **done** — reimplemented: the subset Moonlight uses, stricter than ENet before authentication, and held against upstream ENet under loss, the captured session and the real client; what is left is in §7 | nothing |
 | 8 | [Smaller items](#8-smaller-items) | varies | |
 
 §6, the still-frame cost, is done too: an idle 1080p60 session went from 56%
-of a core to under 5%. §7 is the largest item left, and the only one on the
-pre-authentication path.
+of a core to under 5%. And §7, ENet, the last item on the pre-authentication
+path: `rusty_enet` is gone from the daemon, replaced by a few hundred lines of
+the subset Moonlight actually uses. What is left is §8 and the "what is left"
+lists under each item.
 
 ---
 
@@ -739,11 +741,12 @@ That is differential testing (§2.4's second use), not conformance.
 
 ### What is still not covered
 
-- **ENet framing is captured, not replayed.** The raw datagrams in both
-  directions are in the vectors (`control.client_datagrams`,
-  `host_datagrams`). Nothing replays them through `rusty_enet`, whose timers
-  and sent-time fields make a byte-exact replay meaningless. They are the
-  natural seed corpus for §7 and for the fuzz targets (§8).
+- **ENet framing is replayed, one way.** The client's datagrams go through
+  the ENet host that replaced `rusty_enet` (§7), which must deliver every
+  control message and acknowledge exactly what the old host did. The host's
+  side is not replayed byte for byte beyond the `VERIFY_CONNECT`: its later
+  datagrams carry the old host's pings and bandwidth limits, which the new one
+  does not send.
 - **Pairing, `/serverinfo` and `/launch`** are TLS and are not decrypted. The
   probe does not perform them either (§3).
 - **One geometry, one codec, no loss**, the same limits as §3: 640×480 H.264
@@ -955,32 +958,128 @@ That includes the half-second tail. In steady state the 1080p figure is 5 ×
 
 ## 7. ENet: audit or reimplement
 
-`rusty_enet` is a C-to-Rust transpilation whose own README says it *"couldn't
-be much further from ready for serious use"*, and it sits on the
-**pre-authentication** UDP path. GHSA-c428-87f8-rrv5 is an unauthenticated DoS
-via a short ENet control packet in exactly this position.
+**Done, by reimplementing.** `rusty_enet` was a C-to-Rust transpilation whose
+own README says it *"couldn't be much further from ready for serious use"*,
+and it sat on the **pre-authentication** UDP path, where GHSA-c428-87f8-rrv5
+is an unauthenticated DoS via a short ENet control packet. It is gone from the
+daemon. `crates/solstice-gamestream/src/stream/enet.rs` is the subset
+Moonlight uses, over the framing in `wire/enet.rs`, and
+`crates/solstice/src/net/control.rs` is now only the socket and thread around
+it. `rusty_enet` survives as a dev-dependency, as the independent ENet the new
+host is tested against.
 
-What contains it today (`crates/solstice/src/net/control.rs`): a one-peer
-limit, a refusal of any peer whose connect data does not match the launch
-session, and a message layer that authenticates with AES-GCM before a byte
-reaches the input parser. That reduces blast radius; it does not remove a
-pre-auth state machine with fragment reassembly and retransmission timers.
+### Why reimplement rather than audit
 
-`docs/security.md` §2.4 asks for an audit, fuzzing, and readiness to implement
-the subset Moonlight actually uses. §3 is done, so "the subset" is now a
-finite thing that can be read off a real session: `mlc-probe` establishes the
-peer, sends input and tears the connection down over it, and §4 has frozen
-one such session's ENet datagrams, both directions, in
-`tests/vectors/capture/`.
+§3 and §4 made "the subset" a finite thing to read off. Decoding the captured
+session shows everything a real client sends: `CONNECT`, `ACKNOWLEDGE`,
+`PING`, reliable sends on channel 0, one `BANDWIDTH_LIMIT`, and `DISCONNECT`.
+Its `ControlStream.c` adds unsequenced sends, made only toward a host whose
+`appversion` marks it as Sunshine, which this one's does. It never fragments:
+every control message is built in a 256-byte buffer (`sendMessageEnet`),
+against a 900-byte MTU. An audit would have had to vouch for 3,000 lines of
+transpiled C, most of which this host never needs. The rewrite is a few
+hundred lines and can be made strict where ENet is generous.
+
+### What it does differently from ENet, on purpose
+
+Wire-compatible, with the same reliability semantics, but before
+authentication it is a smaller target. `docs/implementation-notes.md` §2 has
+each point with its reasoning:
+
+- **Nothing is answered before the connect data.** `rusty_enet` completed the
+  handshake with *any* peer, and only then could the host check the connect
+  data and drop it. Now a `CONNECT` with the wrong value gets no reply and
+  creates no state. The one reply a right value earns is 48 bytes, against
+  the `CONNECT`'s 52, so the port does not amplify.
+- **One peer, bound to its address.** Upstream ENet re-learns a peer's
+  address from any datagram with its ID and two-bit session, because the check
+  is commented out in `protocol.c`.
+- **No fragment reassembly, compression or checksum.** Reassembly is the
+  largest piece of pre-authentication state in ENet, and it is simply absent.
+- **Hard caps** on commands per datagram (32, ENet's own sender limit), held
+  out-of-order data (256 commands, 64 KiB), and the host's unacknowledged sends
+  (64).
+- **The host sends no pings and no bandwidth limits.** A peer is gone after
+  ten seconds of silence, or ten seconds with a reliable command of ours
+  unacknowledged. That matches Moonlight's own timeout.
+
+### How it is tested
+
+- **Unit:** 7 framing tests in `wire/enet.rs`, including every truncation of
+  every command, and 25 in `stream/enet.rs`. Those cover the handshake and
+  each refusal, ordering, duplicates, the reorder bounds, fragments, foreign
+  addresses and stale sessions, the 32-command cap, retransmission and
+  timeouts, plus a seeded mangled-datagram property test that checks the
+  bounds hold.
+- **Against upstream ENet, under loss:** `tests/enet_interop.rs` runs
+  `rusty_enet` as the client over a simulated network with simulated clocks.
+  Hundreds of reliable, unreliable and unsequenced messages go each way over
+  networks that are clear, reordering, duplicating, 10% lossy and 30% lossy,
+  across several seeds. Every reliable message must arrive exactly once and
+  in order. The suite also covers a client that vanishes, an idle minute, and
+  wrong connect data. It runs in a fraction of a second. Two deliberate
+  breakages were checked against it to confirm it catches them: never
+  re-acknowledging a duplicate, and delivering out of order.
+- **Against the captured session:**
+  `the_real_clients_enet_datagrams_replay_through_the_host` feeds the real
+  client's 24 datagrams through the new host. All 23 control messages come
+  out, nothing is refused, and the acknowledgements match the old host's
+  exactly. The `VERIFY_CONNECT` is byte for byte the one the client accepted
+  from `rusty_enet`.
+- **Against the real client:** `real_moonlight.rs` passes unchanged. So does
+  `tests/tools/control-loss.sh`, the same test with netem dropping 20%, 30%
+  and 40% of datagrams on the control port alone. The test asserts that
+  input arrived, and netem's drop counter shows the loss happened.
+- **Fuzzing:** a new target, `fuzz/fuzz_targets/enet_host.rs`, drives every
+  input into both a fresh host and one already connected. It ran for ten
+  minutes, 25.9 million runs, seeded from the captured datagrams. It found nothing,
+  and memory stayed flat at 29 MB. `cargo fuzz` is not on the development
+  box, so it ran on stable with cargo-fuzz's own instrumentation flags:
+  `RUSTFLAGS="-Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=4
+  -Cllvm-args=-sanitizer-coverage-inline-8bit-counters
+  -Cllvm-args=-sanitizer-coverage-pc-table
+  -Cllvm-args=-sanitizer-coverage-trace-compares --cfg fuzzing
+  -Cdebug-assertions -Coverflow-checks" cargo build --release --bin enet_host
+  --target x86_64-unknown-linux-gnu` in `fuzz/`. No AddressSanitizer is
+  needed: the crate forbids `unsafe`.
+
+### What it found
+
+Nothing in the new code that a test had not caught first. That is the
+expected result, since the subset was read off the session it is tested
+against. The findings are about the old arrangement:
+
+- **The connect-data check came after the handshake.** It was containment
+  that only applied once ENet's whole state machine had run for the stranger.
+- **The old host never ended a session.** On teardown it stopped servicing
+  ENet and left the client to time out. The new host sends a `DISCONNECT`
+  (`the_host_ending_the_session_reaches_the_client`).
+
+### What is left
+
+- **No moonlight-qt.** The same limit as §3: the probe is the shared protocol
+  core, and an application has not connected.
+- **A fragmenting client would be cut off.** Not a real client today, by the
+  256-byte buffer above. If Moonlight ever builds a larger control message,
+  the client retransmits it unacknowledged until it times out. The `fragments`
+  counter in the host's stats is where that would show first.
+- **The host's own sends are untested against a real client.** `Host::send`
+  exists and is covered against upstream ENet, but nothing in the daemon sends
+  `TERMINATION`, rumble or HDR mode yet. Revocation ending a live stream (§5)
+  would be the first user.
+- **The control-loss script is manual.** It belongs in the nightly loss tier
+  (`docs/testing.md` §5) when there is one.
 
 ---
 
 ## 8. Smaller items
 
-- **Fuzzing in CI.** Five targets exist and run clean for a minute each; there
-  is no seed corpus, no persistent corpus, and no nightly job. The captured
-  session (§4) has real input batches, control envelopes and RTSP messages to
-  seed three of them with (`docs/testing.md` §6 describes the tier).
+- **Fuzzing in CI.** Ten targets exist and run clean for a minute each, and
+  `enet_host` for ten minutes (§7). There is no committed seed corpus, no
+  persistent corpus, and no nightly job. The captured session (§4) has real
+  input batches, control envelopes, RTSP messages and ENet datagrams to seed
+  four of them with (`docs/testing.md` §6 describes the tier). `cargo fuzz`
+  needs a nightly toolchain; §7 records how `enet_host` was run on stable.
 - **More RFB servers.** `docs/testing.md` §3.3 lists exactly what dropping
   `wayvnc`, `x11vnc`, TurboVNC and QEMU's `-vnc` costs. x11vnc is the
   interesting one: libvncserver implements QEMU extended key events in its

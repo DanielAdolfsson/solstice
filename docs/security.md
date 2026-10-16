@@ -189,6 +189,23 @@ Also consider reflection: any UDP service that answers an unauthenticated
 packet with a larger one is an amplifier. Keep pre-auth responses strictly
 smaller than the request, or absent.
 
+**What Solstice does.** It does not link an ENet library. Its ENet host is
+the subset Moonlight uses (`solstice-gamestream`, `stream/enet.rs`;
+`docs/roadmap.md` §7), and before authentication it is stricter than ENet:
+
+- The only command read from an unknown address is `CONNECT`, and one whose
+  connect data is not the launch's gets no reply and leaves no state. So the
+  full state machine is reachable only with a 32-bit value handed out over
+  the (encrypted) RTSP `SETUP`.
+- The one pre-authentication reply, `VERIFY_CONNECT`, is 48 bytes. The
+  `CONNECT` that earns it is 52.
+- One peer at a time, bound to the address it connected from.
+- No fragment reassembly at all, no compression, and hard caps on commands
+  per datagram, held out-of-order data and unacknowledged sends.
+
+Past the handshake, the GCM message layer (§3) still authenticates every
+packet before a byte of it is parsed as input.
+
 ---
 
 ## 3. Post-authentication attack surface
