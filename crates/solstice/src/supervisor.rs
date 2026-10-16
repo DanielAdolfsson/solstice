@@ -310,6 +310,7 @@ async fn run_stream(
         width: stream_config.width,
         height: stream_config.height,
         fps: stream_config.fps,
+        idle_fps: config.video.idle_fps,
         bitrate_kbps: stream_config.bitrate_kbps,
         slices_per_frame: stream_config.slices_per_frame,
         video: VideoConfig {

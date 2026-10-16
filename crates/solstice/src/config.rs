@@ -163,6 +163,11 @@ pub struct Video {
     /// FEC percentage. `0` is legal and useful for bisecting the packetiser,
     /// but is not the shipping configuration.
     pub fec_percentage: u32,
+    /// The keep-alive rate once the screen has been still for half a second.
+    /// An unchanged frame costs the encoder nearly as much as a changed one,
+    /// so this is most of an idle session's CPU (`docs/roadmap.md` §6). At or
+    /// above the stream's rate, the stream stays fixed-rate.
+    pub idle_fps: u32,
 }
 
 impl Default for Video {
@@ -170,6 +175,7 @@ impl Default for Video {
         Self {
             encoder: Encoder::OpenH264,
             fec_percentage: 20,
+            idle_fps: 5,
         }
     }
 }
@@ -348,6 +354,11 @@ impl Config {
         if self.limits.max_fps == 0 || self.limits.max_width == 0 || self.limits.max_height == 0 {
             return Err(ConfigError::Invalid("limits must be non-zero".into()));
         }
+        if self.video.idle_fps == 0 {
+            return Err(ConfigError::Invalid(
+                "video.idle_fps must be at least 1: a stream that goes silent looks dead".into(),
+            ));
+        }
         if self.video.fec_percentage > 200 {
             return Err(ConfigError::Invalid(
                 "video.fec_percentage above 200".into(),
@@ -499,6 +510,7 @@ password = "hunter2"
     fn absurd_limits_are_refused() {
         assert!(Config::parse("[limits]\nmax_sessions = 0\n").is_err());
         assert!(Config::parse("[limits]\nmax_fps = 0\n").is_err());
+        assert!(Config::parse("[video]\nidle_fps = 0\n").is_err());
         assert!(Config::parse("[video]\nfec_percentage = 500\n").is_err());
     }
 

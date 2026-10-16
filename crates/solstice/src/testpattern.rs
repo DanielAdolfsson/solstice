@@ -31,6 +31,8 @@ pub struct TestPatternBackend {
     /// an `Arc<dyn Backend>` and the session is created inside the stream
     /// task, so this is the only handle a test can keep.
     received: Arc<Mutex<Vec<InputEvent>>>,
+    /// Shared the same way, so a test can hold the picture still.
+    frozen: Arc<AtomicBool>,
 }
 
 impl TestPatternBackend {
@@ -41,7 +43,14 @@ impl TestPatternBackend {
             height,
             fps: fps.clamp(1, 240),
             received: Arc::new(Mutex::new(Vec::new())),
+            frozen: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Stop or restart the picture in every session of this backend. A frozen
+    /// pattern renders nothing and raises no damage: a desktop nobody touches.
+    pub fn set_frozen(&self, frozen: bool) {
+        self.frozen.store(frozen, Ordering::Relaxed);
     }
 
     /// Every input event any session of this backend has been handed.
@@ -57,11 +66,12 @@ impl Backend for TestPatternBackend {
     }
 
     async fn connect(&self) -> Result<Box<dyn Session>> {
-        Ok(Box::new(TestPatternSession::start_recording_into(
+        Ok(Box::new(TestPatternSession::start_with(
             self.width,
             self.height,
             self.fps,
             self.received.clone(),
+            self.frozen.clone(),
         )))
     }
 }
@@ -101,6 +111,22 @@ impl TestPatternSession {
         fps: u32,
         received: Arc<Mutex<Vec<InputEvent>>>,
     ) -> Self {
+        Self::start_with(
+            width,
+            height,
+            fps,
+            received,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    fn start_with(
+        width: u32,
+        height: u32,
+        fps: u32,
+        received: Arc<Mutex<Vec<InputEvent>>>,
+        frozen: Arc<AtomicBool>,
+    ) -> Self {
         let fb = FramebufferHandle::with_size(width, height);
         let (events, _) = broadcast::channel(64);
         let running = Arc::new(AtomicBool::new(true));
@@ -116,6 +142,9 @@ impl TestPatternSession {
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 while running.load(Ordering::Relaxed) {
                     ticker.tick().await;
+                    if frozen.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     pattern.render(&mut fb.write());
                     // An error here only means nobody is subscribed yet; keep
                     // rendering so the framebuffer is current when one arrives.
@@ -197,6 +226,36 @@ mod tests {
             .unwrap();
         let b = decode_barcode(&fb.read()).unwrap();
         assert!(b > a, "the frame counter must advance: {a} then {b}");
+        session.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_frozen_pattern_raises_no_damage_until_thawed() {
+        let backend = TestPatternBackend::new(320, 240, 60);
+        let session = backend.connect().await.unwrap();
+        let mut events = session.subscribe();
+        events.recv().await.unwrap();
+
+        backend.set_frozen(true);
+        // Drain anything rendered before the switch was seen.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while events.try_recv().is_ok() {}
+        let fb = session.framebuffer();
+        let held = decode_barcode(&fb.read()).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), events.recv())
+                .await
+                .is_err(),
+            "a frozen pattern raised damage"
+        );
+        assert_eq!(decode_barcode(&fb.read()), Some(held));
+
+        backend.set_frozen(false);
+        tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("a thawed pattern raises damage again")
+            .unwrap();
+        assert!(decode_barcode(&fb.read()).unwrap() > held);
         session.close().await;
     }
 

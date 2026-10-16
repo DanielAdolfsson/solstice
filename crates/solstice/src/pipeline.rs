@@ -8,9 +8,11 @@
 //! ```
 //!
 //! The clock is the part with no analogue on either side: RFB and SPICE have no
-//! frame rate, and Moonlight's watchdog fires if the stream goes quiet. So a
+//! frame rate, and Moonlight expects a stream that does not go quiet. So a
 //! frame goes out on every tick whether or not anything changed, and a repeat
-//! costs a handful of bytes because it predicts perfectly from its predecessor.
+//! costs a handful of bytes because it predicts perfectly from its predecessor
+//! -- but not a handful of CPU, which is why the clock slows to `idle_fps` once
+//! the screen has been still a while (`solstice_video::clock`).
 
 use std::time::{Duration, Instant};
 
@@ -31,6 +33,8 @@ pub struct PipelineConfig {
     pub height: u32,
     /// Stream framerate.
     pub fps: u32,
+    /// Keep-alive framerate while the screen is still.
+    pub idle_fps: u32,
     /// Target bitrate.
     pub bitrate_kbps: u32,
     /// Slices per frame.
@@ -61,7 +65,7 @@ pub async fn run(
     mut stop: tokio::sync::oneshot::Receiver<()>,
 ) -> PipelineExit {
     let mut packetizer = VideoPacketizer::new(config.video, key.as_ref());
-    let mut clock = FrameClock::new(config.fps, Instant::now());
+    let mut clock = FrameClock::new(config.fps, Instant::now()).with_idle_rate(config.idle_fps);
     let mut events = session.subscribe();
     let framebuffer = session.framebuffer();
 
@@ -201,6 +205,7 @@ mod tests {
             width: 320,
             height: 240,
             fps: 60,
+            idle_fps: 60,
             bitrate_kbps: 4000,
             slices_per_frame: 1,
             video: VideoConfig {
@@ -363,5 +368,113 @@ mod tests {
         }
         let _ = stop_tx.send(());
         assert!(saw_idr, "the IDR request never reached the encoder");
+    }
+
+    /// A session that never changes unless the test says so.
+    struct StillSession {
+        fb: solstice_backend::FramebufferHandle,
+        events: tokio::sync::broadcast::Sender<BackendEvent>,
+    }
+
+    #[async_trait::async_trait]
+    impl Session for StillSession {
+        fn dimensions(&self) -> (u32, u32) {
+            (320, 240)
+        }
+        async fn request_resize(&self, _: u32, _: u32) -> solstice_backend::Result<bool> {
+            Ok(false)
+        }
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<BackendEvent> {
+            self.events.subscribe()
+        }
+        fn framebuffer(&self) -> solstice_backend::FramebufferHandle {
+            self.fb.clone()
+        }
+        async fn send_input(
+            &self,
+            _: solstice_backend::InputEvent,
+        ) -> solstice_backend::Result<()> {
+            Ok(())
+        }
+        async fn close(&self) {}
+    }
+
+    /// Frames that arrive within `window`.
+    async fn count_frames(rx: &mut mpsc::Receiver<Vec<Vec<u8>>>, window: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + window;
+        let mut frames = 0;
+        while let Ok(Some(_)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            frames += 1;
+        }
+        frames
+    }
+
+    /// Roadmap §6: a still screen must stop costing a full-rate encode, keep
+    /// sending at the keep-alive rate, and still get a change out promptly.
+    #[tokio::test]
+    async fn a_still_screen_backs_off_and_a_change_cuts_the_wait_short() {
+        let (events, _) = tokio::sync::broadcast::channel(16);
+        let session = StillSession {
+            fb: solstice_backend::FramebufferHandle::with_size(320, 240),
+            events: events.clone(),
+        };
+        let config = PipelineConfig {
+            fps: 60,
+            idle_fps: 2,
+            ..pipeline_config()
+        };
+        let encoder = build_encoder(
+            crate::config::Encoder::Null,
+            EncoderConfig {
+                width: 320,
+                height: 240,
+                fps: 60,
+                bitrate_kbps: 4000,
+                slices_per_frame: 1,
+            },
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(256);
+        let (_idr_tx, idr_rx) = mpsc::channel(4);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let session = session;
+            run(&session, config, encoder, None, tx, idr_rx, stop_rx).await
+        });
+
+        // The half-second tail at full rate, then the keep-alive rate. Loose
+        // bounds: a loaded CI runner stretches the tail, but cannot turn 60 fps
+        // into 2.
+        let tail = count_frames(&mut rx, solstice_video::clock::IDLE_AFTER).await;
+        assert!(tail >= 10, "only {tail} frames in the full-rate tail");
+        let idle = count_frames(&mut rx, Duration::from_secs(2)).await;
+        assert!(
+            (2..=8).contains(&idle),
+            "{idle} frames in 2 s of a still screen at idle_fps = 2"
+        );
+
+        // A change mid-wait: the keep-alive is up to 500 ms away, the change
+        // must not wait for it.
+        let sent = tokio::time::Instant::now();
+        events
+            .send(BackendEvent::Damage(solstice_backend::Rect::whole(
+                320, 240,
+            )))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let waited = sent.elapsed();
+        assert!(
+            waited < Duration::from_millis(150),
+            "a change waited {waited:?} behind the keep-alive"
+        );
+        // And full rate resumes behind it.
+        let after = count_frames(&mut rx, Duration::from_millis(300)).await;
+        assert!(after >= 6, "only {after} frames in the tail after a change");
+
+        let _ = stop_tx.send(());
+        assert_eq!(handle.await.unwrap(), PipelineExit::Stopped);
     }
 }

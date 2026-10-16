@@ -15,10 +15,31 @@
 //!   deadline, so a stall does not turn into a burst of catch-up frames. The
 //!   remaining wait is up to one frame interval, which is the floor for a
 //!   fixed-rate stream (`docs/bridging-design.md` §5).
+//!
+//! "Never goes quiet" does not have to mean "full rate". An unchanged frame
+//! still costs the encoder a full analysis -- 9.5 ms at 1080p, more than half a
+//! core at 60 fps, to produce 13 bytes (`docs/implementation-notes.md` §3) --
+//! so once the screen has been still for [`IDLE_AFTER`] the clock drops to a
+//! keep-alive rate. That is safe for the client: `moonlight-common-c`'s two
+//! watchdogs only run until the first packet and the first whole frame
+//! (`VideoStream.c:146-176`), and its loss statistic counts gaps in the frame
+//! index, which the packetiser keeps contiguous whatever the rate
+//! (`ControlStream.c:471-514`). It is safe for latency because damage and IDR
+//! requests pull the deadline back to where full rate would have put it, so a
+//! change after a long still waits no longer than it would have anyway.
 
 use std::time::{Duration, Instant};
 
 use solstice_backend::Rect;
+
+/// How long the screen must have been still before the clock backs off.
+///
+/// Not zero, for two reasons. A decoder that holds one frame before display
+/// shows a change only when the next frame arrives, and the client notices a
+/// lost frame only when a later frame index does; both want the frames right
+/// after a change at full rate. And typing or a blinking cursor changes the
+/// screen every few hundred milliseconds, which this keeps from oscillating.
+pub const IDLE_AFTER: Duration = Duration::from_millis(500);
 
 /// What the clock says to do now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,34 +62,56 @@ impl Tick {
     }
 }
 
-/// A fixed-rate clock that damage can pull forward.
+/// A fixed-rate clock that damage can pull forward, and that slows to a
+/// keep-alive rate while nothing changes.
 #[derive(Debug)]
 pub struct FrameClock {
     interval: Duration,
+    idle_interval: Duration,
     origin: Instant,
     next_deadline: Instant,
+    /// When the last frame went out, which is what damage measures its
+    /// full-rate deadline from.
+    last_emitted: Option<Instant>,
+    /// When the last frame that was not a pure repeat went out.
+    last_change: Instant,
     pending_damage: Option<Rect>,
     idr_requested: bool,
     frame_number: u64,
 }
 
 impl FrameClock {
-    /// Build a clock running at `fps`.
+    /// Build a clock running at `fps`, with no keep-alive back-off.
     pub fn new(fps: u32, now: Instant) -> Self {
-        let interval = Duration::from_nanos(1_000_000_000 / fps.clamp(1, 1000) as u64);
+        let interval = interval_for(fps);
         Self {
             interval,
+            idle_interval: interval,
             origin: now,
             next_deadline: now,
+            last_emitted: None,
+            last_change: now,
             pending_damage: None,
             idr_requested: true, // the first frame must be a keyframe
             frame_number: 0,
         }
     }
 
+    /// Drop to `idle_fps` once the screen has been still for [`IDLE_AFTER`].
+    /// A rate at or above the full one leaves the clock fixed-rate.
+    pub fn with_idle_rate(mut self, idle_fps: u32) -> Self {
+        self.idle_interval = interval_for(idle_fps).max(self.interval);
+        self
+    }
+
     /// The frame interval.
     pub fn interval(&self) -> Duration {
         self.interval
+    }
+
+    /// The keep-alive interval used while the screen is still.
+    pub fn idle_interval(&self) -> Duration {
+        self.idle_interval
     }
 
     /// Record a damaged region. Regions accumulate into their bounding box
@@ -81,11 +124,21 @@ impl FrameClock {
             self.pending_damage
                 .map_or(rect, |existing| existing.union(&rect)),
         );
+        self.wake();
     }
 
     /// Ask for a keyframe. Honoured on the next emitted frame.
     pub fn request_idr(&mut self) {
         self.idr_requested = true;
+        self.wake();
+    }
+
+    /// Something needs sending: bring the deadline back to where full rate
+    /// would have put it, so a keep-alive wait never delays a change.
+    fn wake(&mut self) {
+        if let Some(last) = self.last_emitted {
+            self.next_deadline = self.next_deadline.min(last + self.interval);
+        }
     }
 
     /// Whether a keyframe is outstanding.
@@ -106,11 +159,21 @@ impl FrameClock {
             frame_number: self.frame_number,
         };
         self.frame_number += 1;
+        if !tick.is_duplicate() || tick.force_idr {
+            self.last_change = now;
+        }
+        let still = now.saturating_duration_since(self.last_change) >= IDLE_AFTER;
         // Schedule from `now` rather than from the old deadline: after a stall
         // (a slow encode, a backend hiccup) advancing the old deadline would
         // emit a burst of catch-up frames, which is exactly the burst the
         // pacing in the packetiser exists to avoid.
-        self.next_deadline = now + self.interval;
+        self.next_deadline = now
+            + if still {
+                self.idle_interval
+            } else {
+                self.interval
+            };
+        self.last_emitted = Some(now);
         Some(tick)
     }
 
@@ -124,6 +187,10 @@ impl FrameClock {
         let nanos = now.saturating_duration_since(self.origin).as_nanos();
         ((nanos * 90_000 / 1_000_000_000) & 0xFFFF_FFFF) as u32
     }
+}
+
+fn interval_for(fps: u32) -> Duration {
+    Duration::from_nanos(1_000_000_000 / fps.clamp(1, 1000) as u64)
 }
 
 #[cfg(test)]
@@ -290,6 +357,136 @@ mod tests {
             clock.time_until_next(start + Duration::from_secs(1)),
             Duration::ZERO
         );
+    }
+
+    /// Poll at every deadline from `start` until `until`, returning when each
+    /// frame went out.
+    fn run_still(clock: &mut FrameClock, start: Instant, until: Instant) -> Vec<Instant> {
+        let mut now = start;
+        let mut emitted = Vec::new();
+        while now < until {
+            if clock.poll(now).is_some() {
+                emitted.push(now);
+            }
+            now += clock.time_until_next(now).max(Duration::from_micros(1));
+        }
+        emitted
+    }
+
+    #[test]
+    fn a_still_screen_drops_to_the_idle_rate_after_the_tail() {
+        let start = Instant::now();
+        let mut clock = FrameClock::new(60, start).with_idle_rate(5);
+        let emitted = run_still(&mut clock, start, start + Duration::from_secs(3));
+
+        let gaps: Vec<Duration> = emitted.windows(2).map(|w| w[1] - w[0]).collect();
+        // Full rate until the screen has been still for IDLE_AFTER...
+        let full = emitted
+            .iter()
+            .take_while(|&&t| t - start < IDLE_AFTER)
+            .count();
+        assert!(
+            gaps[..full - 1].iter().all(|&g| g == clock.interval()),
+            "{gaps:?}"
+        );
+        // ...then the keep-alive rate, and never silence.
+        let idle = &gaps[full..];
+        assert!(!idle.is_empty());
+        assert!(
+            idle.iter().all(|&g| g == Duration::from_millis(200)),
+            "{idle:?}"
+        );
+        // Three seconds is 180 frames at full rate; backing off leaves the
+        // half-second tail plus five a second.
+        assert!(emitted.len() < 45, "{} frames in 3 s", emitted.len());
+    }
+
+    /// The latency guarantee: a change during a keep-alive wait goes out at
+    /// the full-rate deadline, not the keep-alive one.
+    #[test]
+    fn damage_during_the_idle_wait_is_not_delayed_by_it() {
+        let start = Instant::now();
+        let mut clock = FrameClock::new(60, start).with_idle_rate(1);
+        let emitted = run_still(&mut clock, start, start + Duration::from_secs(2));
+        let last = *emitted.last().unwrap();
+        assert_eq!(clock.time_until_next(last), Duration::from_secs(1));
+
+        // Damage arrives a moment after a keep-alive went out: it waits only
+        // until a full-rate interval has passed since that frame.
+        clock.damage(RECT);
+        assert_eq!(clock.time_until_next(last), clock.interval());
+        assert!(clock.poll(last + clock.interval() / 2).is_none());
+        let tick = clock
+            .poll(last + clock.interval())
+            .expect("the change is due");
+        assert_eq!(tick.damage, Some(RECT));
+    }
+
+    /// Damage that arrives after a full interval has already passed is due at
+    /// once, not one interval later.
+    #[test]
+    fn damage_late_in_the_idle_wait_is_due_immediately() {
+        let start = Instant::now();
+        let mut clock = FrameClock::new(60, start).with_idle_rate(1);
+        let emitted = run_still(&mut clock, start, start + Duration::from_secs(2));
+        let arrived = *emitted.last().unwrap() + Duration::from_millis(500);
+        clock.damage(RECT);
+        assert_eq!(clock.time_until_next(arrived), Duration::ZERO);
+        assert!(clock.poll(arrived).is_some());
+    }
+
+    #[test]
+    fn an_idr_request_during_the_idle_wait_is_not_delayed_by_it() {
+        let start = Instant::now();
+        let mut clock = FrameClock::new(60, start).with_idle_rate(1);
+        let emitted = run_still(&mut clock, start, start + Duration::from_secs(2));
+        let last = *emitted.last().unwrap();
+        clock.request_idr();
+        let tick = clock
+            .poll(last + clock.interval())
+            .expect("the keyframe is due");
+        assert!(tick.force_idr);
+        assert!(tick.is_duplicate(), "an IDR request is not damage");
+    }
+
+    /// After a change the clock returns to full rate for the whole tail, so
+    /// the frame after the change follows it promptly.
+    #[test]
+    fn a_change_restores_full_rate_for_the_tail() {
+        let start = Instant::now();
+        let mut clock = FrameClock::new(60, start).with_idle_rate(1);
+        let emitted = run_still(&mut clock, start, start + Duration::from_secs(2));
+        let last = *emitted.last().unwrap();
+
+        clock.damage(RECT);
+        let changed = last + clock.interval();
+        clock.poll(changed).unwrap();
+        let after = run_still(
+            &mut clock,
+            changed + Duration::from_micros(1),
+            changed + IDLE_AFTER,
+        );
+        assert!(!after.is_empty());
+        assert!(
+            after.windows(2).all(|w| w[1] - w[0] == clock.interval()),
+            "{after:?}"
+        );
+        assert_eq!(after[0] - changed, clock.interval());
+    }
+
+    #[test]
+    fn an_idle_rate_at_or_above_full_rate_keeps_the_clock_fixed() {
+        let start = Instant::now();
+        for idle in [60, 120, 1000] {
+            let mut clock = FrameClock::new(60, start).with_idle_rate(idle);
+            assert_eq!(clock.idle_interval(), clock.interval());
+            let emitted = run_still(&mut clock, start, start + Duration::from_secs(2));
+            assert!(emitted.windows(2).all(|w| w[1] - w[0] == clock.interval()));
+        }
+        // And without one at all.
+        let mut clock = FrameClock::new(60, start);
+        let emitted = run_still(&mut clock, start, start + Duration::from_secs(2));
+        assert!(emitted.windows(2).all(|w| w[1] - w[0] == clock.interval()));
     }
 
     #[test]

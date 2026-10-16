@@ -42,6 +42,9 @@ static struct {
     unsigned long long bytes;    /* total elementary stream bytes         */
     unsigned int audio_samples;  /* Opus packets handed to the renderer   */
     unsigned int last_frame;     /* most recent frame number              */
+    uint64_t last_frame_ms;      /* when it arrived                       */
+    uint64_t max_gap_ms;         /* longest wait between decode units     */
+    unsigned int poor_reports;   /* CONN_STATUS_POOR notifications        */
     bool saw_sps, saw_pps;       /* codec configuration NALUs seen        */
     int video_format;            /* what setup() was told to decode       */
     int video_width, video_height, video_rate;
@@ -95,7 +98,14 @@ static void dr_cleanup(void) { emit("video-cleanup"); }
  */
 static int dr_submit(PDECODE_UNIT du) {
     PLENTRY entry;
+    uint64_t now = now_ms();
 
+    /* The longest silence the client sat through. A host that slows its
+       frame clock on a still screen should show it here and nowhere else. */
+    if (probe.frames > 0 && now - probe.last_frame_ms > probe.max_gap_ms) {
+        probe.max_gap_ms = now - probe.last_frame_ms;
+    }
+    probe.last_frame_ms = now;
     probe.frames++;
     probe.last_frame = (unsigned int)du->frameNumber;
     probe.bytes += (unsigned long long)du->fullLength;
@@ -108,8 +118,9 @@ static int dr_submit(PDECODE_UNIT du) {
         if (entry->bufferType == BUFFER_TYPE_PPS) probe.saw_pps = true;
     }
 
-    /* One line per frame is too much for a 60fps stream; sample it. */
-    if (probe.frames <= 4 || probe.frames % 30 == 0) {
+    /* One line per frame is too much for a 60fps stream; sample it, but
+       never skip a key frame -- when one arrives is the evidence of recovery. */
+    if (probe.frames <= 4 || probe.frames % 30 == 0 || du->frameType == FRAME_TYPE_IDR) {
         emit("frame n=%u number=%d type=%s length=%d",
              probe.frames, du->frameNumber,
              du->frameType == FRAME_TYPE_IDR ? "idr" : "p", du->fullLength);
@@ -175,6 +186,9 @@ static void cl_log(const char* format, ...) {
 }
 
 static void cl_connection_status(int status) {
+    if (status == CONN_STATUS_POOR) {
+        probe.poor_reports++;
+    }
     emit("status %s", status == CONN_STATUS_POOR ? "poor" : "okay");
 }
 
@@ -223,6 +237,7 @@ static void usage(void) {
         "  packetsize=N       video packet size (default 1024)\n"
         "  frames=N           stop once N decode units have arrived (default 60)\n"
         "  timeout=N          give up after N seconds (default 30)\n"
+        "  hold=N             and stay connected at least N seconds (default 0)\n"
         "  video=PATH         write the H.264 elementary stream here\n"
         "  audio=PATH         write the Opus stream here\n"
         "  input=0|1          send input events once connected (default 1)\n",
@@ -242,8 +257,8 @@ int main(int argc, char** argv) {
     const char* video_path;
     const char* audio_path;
     unsigned char rikey[16];
-    int want_frames, timeout_s, send_input;
-    uint64_t deadline;
+    int want_frames, timeout_s, hold_s, send_input;
+    uint64_t deadline, hold_until;
     int rc;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -258,6 +273,7 @@ int main(int argc, char** argv) {
 
     want_frames = arg_int(argc, argv, "frames", 60);
     timeout_s = arg_int(argc, argv, "timeout", 30);
+    hold_s = arg_int(argc, argv, "hold", 0);
     send_input = arg_int(argc, argv, "input", 1);
     video_path = arg_value(argc, argv, "video", NULL);
     audio_path = arg_value(argc, argv, "audio", NULL);
@@ -337,7 +353,9 @@ int main(int argc, char** argv) {
     }
 
     deadline = now_ms() + (uint64_t)timeout_s * 1000;
-    while (probe.frames < (unsigned int)want_frames && !probe.was_terminated) {
+    hold_until = now_ms() + (uint64_t)hold_s * 1000;
+    while ((probe.frames < (unsigned int)want_frames || now_ms() < hold_until) &&
+           !probe.was_terminated) {
         struct timespec nap = { 0, 20 * 1000 * 1000 };
         if (now_ms() >= deadline) {
             emit("timeout frames=%u", probe.frames);
@@ -371,10 +389,12 @@ int main(int argc, char** argv) {
     emit("stopping");
     LiStopConnection();
 
-    emit("summary frames=%u idr=%u bytes=%llu audio=%u sps=%d pps=%d last=%u terminated=%d",
+    emit("summary frames=%u idr=%u bytes=%llu audio=%u sps=%d pps=%d last=%u terminated=%d "
+         "maxgap=%" PRIu64 " poor=%u",
          probe.frames, probe.idr_frames, probe.bytes, probe.audio_samples,
          (int)probe.saw_sps, (int)probe.saw_pps, probe.last_frame,
-         probe.was_terminated ? probe.terminated : 0);
+         probe.was_terminated ? probe.terminated : 0,
+         probe.max_gap_ms, probe.poor_reports);
 
     /*
      * The bar for success. A client that connected but decoded nothing is the

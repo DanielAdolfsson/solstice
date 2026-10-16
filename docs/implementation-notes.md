@@ -171,6 +171,17 @@ regression test now lives beside the mock-based ones
 (`a_repeated_size_announcement_is_not_a_resize`). What this cost to find, with
 the real server available, was one `tracing::debug!` on the rectangle header.
 
+### Moonlight has no watchdog on a quiet stream
+
+`docs/bridging-design.md` §2.1 says not to skip frames, because Moonlight's
+watchdog fires `ML_ERROR_NO_VIDEO_TRAFFIC` / `ML_ERROR_NO_VIDEO_FRAME` if the
+stream goes quiet. It does not, once the stream has started: both checks run
+only until the first packet and the first whole frame (`VideoStream.c:146-176`).
+The belief cost 57% of a core on every idle 1080p session, because the clock
+ran at full rate to satisfy it. The clock now slows to a keep-alive rate on a
+still screen, and a real `moonlight-common-c` sits through twelve seconds of
+it without complaint (`docs/roadmap.md` §6).
+
 ---
 
 ## 3. Measured
@@ -223,11 +234,14 @@ damage rectangle is 0.1 ms against 3.2 ms for a whole 1080p frame, a 30x
 difference, and it is the common case on a desktop. `docs/bridging-design.md`
 §5 called this out and it is the one place the advice paid directly.
 
-**An unchanged frame is not cheap, and it should be.** 9.5 ms and 57% of a core
-at 1080p60 to produce 13 bytes. The synthetic frame clock emits these
-constantly -- a desktop is mostly still -- so this is the largest single
-optimisation available, and it is in the encoder's configuration rather than
-anywhere in this codebase. Worth investigating before anything else.
+**An unchanged frame is not cheap, and it cannot be made cheap.** 9.5 ms and
+57% of a core at 1080p60 to produce 13 bytes. This was expected to be in the
+encoder's configuration. It is not: no setting gets an unchanged frame under
+2 ms without giving up screen-content coding or rate control
+(`docs/roadmap.md` §6 has the sweep). What changed instead is how many are
+encoded. On a still screen the clock drops to `video.idle_fps`, and the
+benchmark's still-session rows show 1080p falling from 56% of a core to 7.4%
+over ten seconds, 4.7% in steady state.
 
 ---
 
