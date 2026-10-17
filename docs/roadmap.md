@@ -1422,9 +1422,11 @@ solstice endpoint list
 The last three reach a running daemon over the management socket (§5). The
 app list changes at once.
 
-- **Zero is valid.** The daemon pairs, `/applist` is an empty successful
-  list rather than an error, `status` says `endpoints: none`, and a warning
-  is logged at startup. Pair first, add desktops later. The default config
+- **Zero is valid.** The daemon pairs, `/applist` holds one placeholder,
+  "No desktops on this host", `status` says `endpoints: none`, and a warning
+  is logged at startup. The placeholder is there because moonlight-qt
+  ignores an empty list (below), and launching it is refused with the
+  reason. Pair first, add desktops later. The default config
   has no endpoints. The colour bars are now one more endpoint kind,
   `kind = "testpattern"`.
 - **The app id is a hash of the name**, in `2..=i32::MAX`. Moonlight saves
@@ -1501,16 +1503,47 @@ builds one backend per endpoint. Nothing is dialled until a stream starts.
   `Host::end_sessions_of_app` ending only that app's sessions and signalling
   the watch: unit tests.
 
+### Against a real client
+
+moonlight-qt on the LAN, 2026-10-17, against the test guest over SPICE
+and over VNC, with endpoints added and removed while it watched:
+
+- **Several apps, live.** Three endpoints listed, each launched, switching
+  between them in seconds. An endpoint removed while it was streaming
+  closed the client's stream cleanly, with no error, and its tile went.
+- **moonlight-qt ignores an empty `/applist`.** It treats an empty list as
+  a failed fetch and keeps its cache (`PcMonitorThread::updateAppList` in
+  `app/backend/computermanager.cpp`, unchanged since at least 2018). So
+  removing the last endpoint left its tiles in place, and launching one
+  failed. GameStream hosts essentially always have an app, which is
+  presumably why nobody has reported it. Hence the placeholder: a
+  non-empty list replaces the cache, and launching it, or any tile cached
+  from before, is refused with "This host has no desktops to offer yet".
+- **How soon an added endpoint appears.** moonlight-qt fetches `/applist`
+  every 10th poll, about 45 s, once it holds a list it accepted. It fetches
+  on every poll, about 5 s, while its list is empty or its last fetch
+  "failed", which includes an empty one. Additions showed up in 5 s and in
+  38 s on those two rates.
+- **Refusals reached the client as Qt error numbers**, e.g. "203" for
+  "No such app": the host sent its outcome as the HTTP status. Fixed
+  separately (§3).
+- **A stale host entry in the client looks like a host bug.** The client
+  had once paired with something else at the same address. The result was
+  a failed first pairing (the old certificate still pinned), a phantom app
+  from the old entry's cache, and a 30 s "Quitting…" on every switch: its
+  `/cancel` went to the old entry, never reached this host, and waited out
+  `QUIT_TIMEOUT_MS`. Deleting and re-adding the host cleared all three.
+  Worth checking first when a report looks like any of them.
+
 ### What is left
 
-- **A removed endpoint's stream, ended against the real client.** The path
-  is revocation's, and `revoking_the_client_ends_its_running_stream` holds
-  that against `moonlight-common-c`. Nothing yet removes an endpoint under
-  a running real-client stream specifically.
-- **How often Moonlight re-fetches `/applist`.** Sunshine's apps appear
-  without a reconnect, so clients do re-fetch, but nobody has measured how
-  often moonlight-qt does. That decides how soon an added endpoint shows up.
-- **An empty app list in a real client.** `moonlight-common-c` never looks
-  at it. moonlight-qt and the Android client should be checked for how they
-  show a host with no apps.
-
+- **A disconnect ends the session; in Sunshine it does not.** moonlight-qt's
+  Ctrl+Alt+Shift+Q leaves the app running for a later resume, and Sunshine
+  keeps it. Solstice ends the launch record when the stream stops, so
+  `currentgame` is 0 straight away and there is never anything to resume.
+  This was harmless in practice: the client asks to quit only an app it
+  believes is still running. Keeping the session, and with it the backend
+  connection, for a resume is a design question, not a bug.
+- **Android, iOS and tvOS** have not been shown an empty list or a
+  placeholder. The placeholder is harmless to a client that accepts empty
+  lists. One that hides empty hosts would now show the host.

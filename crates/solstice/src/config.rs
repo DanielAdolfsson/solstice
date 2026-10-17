@@ -3,7 +3,7 @@
 //! The defaults are the deployment `docs/security.md` recommends: bound to
 //! loopback, pairing closed, encryption mandatory, one session, and ceilings on
 //! everything the client can ask for. And no endpoints: a daemon with nothing
-//! to offer still pairs, and Moonlight sees an empty app list.
+//! to offer still pairs, and Moonlight sees a placeholder saying so.
 
 use std::net::IpAddr;
 use std::path::PathBuf;

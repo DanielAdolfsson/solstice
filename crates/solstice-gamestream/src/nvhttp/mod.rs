@@ -558,17 +558,44 @@ mod tests {
         assert!(desktop < build, "{xml}");
     }
 
-    /// No apps is an empty list, not an error: a failed fetch reads to the
-    /// client as a broken host.
+    /// No apps is one placeholder, not an empty list: moonlight-qt ignores an
+    /// empty list and keeps showing its cache. Launching it, or a cached tile,
+    /// is refused with the reason.
     #[test]
-    fn applist_with_no_apps_is_an_empty_success() {
+    fn with_no_apps_the_list_is_a_placeholder_that_explains_itself() {
         let (h, der) = paired_host();
         h.set_apps(Vec::new());
         let req = request("/applist");
-        let r = handle(&h, &ctx(&req, true, Some(&der)));
-        assert_eq!(r.outcome, 200);
-        let xml = body(&r);
-        assert!(xml.contains("<root status_code=\"200\"></root>"), "{xml}");
+        let xml = body(&handle(&h, &ctx(&req, true, Some(&der))));
+        assert!(xml.contains("status_code=\"200\""), "{xml}");
+        assert_eq!(xml.matches("<App>").count(), 1, "{xml}");
+        assert!(
+            xml.contains(&format!(
+                "<AppTitle>{}</AppTitle><ID>{}</ID>",
+                applist::PLACEHOLDER_TITLE,
+                applist::PLACEHOLDER_APP_ID
+            )),
+            "{xml}"
+        );
+
+        for app in [applist::PLACEHOLDER_APP_ID, 1] {
+            let req = request(&format!(
+                "/launch?rikey=000102030405060708090a0b0c0d0e0f&rikeyid=1&localAudioPlayMode=0&appid={app}"
+            ));
+            let xml = body(&handle(&h, &ctx(&req, true, Some(&der))));
+            assert!(xml.contains("status_code=\"404\""), "{xml}");
+            assert!(xml.contains("has no desktops"), "{xml}");
+        }
+        assert!(h.sessions.lock().unwrap().is_empty());
+
+        // And it goes as soon as there is something real.
+        h.set_apps(vec![App {
+            id: 1,
+            title: "Desktop".into(),
+        }]);
+        let req = request("/applist");
+        let xml = body(&handle(&h, &ctx(&req, true, Some(&der))));
+        assert!(!xml.contains(applist::PLACEHOLDER_TITLE), "{xml}");
     }
 
     #[test]
