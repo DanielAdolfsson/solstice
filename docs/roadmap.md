@@ -1307,12 +1307,23 @@ against. The findings are about the old arrangement:
     position is the one the client sends, which is exact for an absolute
     pointer, but a guest that accelerates relative motion moves further.
     Nothing reads the guest's position back.
-- **The letterbox scaler is nearest-neighbour.** `convert_scaled` takes one
-  source pixel per output pixel, which drops a third of the rows of a 1080p
-  desktop streamed at 720p -- text loses strokes. It is also slow: a
-  4K-to-1080p conversion plus the encode overran the 16.7 ms budget at 60 fps.
-  Only reached when the backend will not resize, which both backends now
-  normally do; an area-averaging downscale is the fix.
+- **The letterbox scaler averages now; the budget is the encoder's.**
+  `convert_scaled` was nearest-neighbour and dropped a third of the rows of a
+  1080p desktop streamed at 720p. It is now an exact area average, so every
+  source pixel counts, and scaling up stays nearest-neighbour. Doing four
+  times the reads, it costs what nearest-neighbour did, because the vertical
+  pass vectorises and the bands run on up to four threads. Release build,
+  i5-13500, before and after:
+
+  | Source → stream | Nearest | Area average |
+  |---|---|---|
+  | 3840×2160 → 1920×1080 | 5.2 ms | 5.4 ms |
+  | 2560×1440 → 1920×1080 | 6.8 ms | 5.0 ms |
+  | 1920×1080 → 1280×720 | 2.3 ms | 2.2 ms |
+
+  So a 4K source letterboxed at 1080p60 that overran 16.7 ms still will.
+  The encode is the larger share, and only reached when the backend will
+  not resize, which both backends now normally do.
 - **Fuzzing: seeded and scripted, run by hand.** Five targets now start
   from real traffic. `tests/tools/gen_fuzz_seeds.py` cuts
   `fuzz/seeds/<target>/` out of the captured session (§4): the RTSP requests,

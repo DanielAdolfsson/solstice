@@ -332,12 +332,14 @@ the *absence* of a byte-swap macro and flagged here as weak evidence. It is
 correct, and now rests on `InputStream.c:952` writing `LE16(keyCode)`
 explicitly.
 
-### Scaling is nearest-neighbour
+### Scaling down averages; scaling up does not
 
-When the backend declines to resize, the frame is letterboxed with
-nearest-neighbour sampling. For a text-heavy desktop that is a defensible
-default — a smoothing filter costs CPU to make text less legible — but it has
-not been compared against anything.
+When the backend declines to resize, the frame is letterboxed. Scaling down,
+each output pixel is the exact area-weighted average of the source it covers:
+nearest-neighbour, the first version, dropped whole rows and with them strokes
+of text. Scaling up is still nearest-neighbour, because for a text-heavy
+desktop a smoothing filter costs CPU to make text less legible. Neither has
+been compared against anything by eye on a real client.
 
 ### The fuzz targets are seeded, and run by hand
 

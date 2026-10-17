@@ -104,8 +104,16 @@ pub fn convert_full(src: &Framebuffer, dst: &mut I420Frame) -> bool {
 /// Moonlight requests a resolution and the backend has its own idea. Asking the
 /// backend to resize is the better answer and is tried first, but it needs
 /// cooperation that may not be there -- so this is the fallback
-/// (`docs/bridging-design.md` §2.2). Nearest-neighbour: a desktop is text and
-/// sharp edges, where a smoothing filter costs CPU to make the result less
+/// (`docs/bridging-design.md` §2.2).
+///
+/// Each output pixel is the area-weighted average of the source it covers, so
+/// a downscale gives every source pixel the same total weight: nearest-
+/// neighbour, which this replaced, dropped a third of the rows of a 1080p
+/// desktop streamed at 720p, and with them strokes of text. The weights are
+/// exact integers -- an output pixel spans `src` units of a grid on which a
+/// source pixel is `out` units wide -- so a flat colour stays exactly flat.
+/// Scaling up, each output pixel takes the nearest source pixel instead: a
+/// desktop is text and sharp edges, where blending costs CPU to make it less
 /// legible.
 ///
 /// Returns the rectangle of `dst` the image was placed in, so the caller can
@@ -120,9 +128,13 @@ pub fn convert_scaled(src: &Framebuffer, dst: &mut I420Frame) -> Rect {
     let out_h = ((scale_num / sw) & !1).clamp(2, dh);
     let off_x = ((dw - out_w) / 2) & !1;
     let off_y = ((dh - out_h) / 2) & !1;
+    let placed = Rect {
+        x: off_x,
+        y: off_y,
+        width: out_w,
+        height: out_h,
+    };
 
-    let stride = src.stride();
-    let data = src.data();
     let y_stride = dst.y_stride();
     let uv_stride = dst.uv_stride();
     let (y_plane, u_plane, v_plane) = dst.planes_mut();
@@ -131,35 +143,307 @@ pub fn convert_scaled(src: &Framebuffer, dst: &mut I420Frame) -> Rect {
     y_plane.fill(16);
     u_plane.fill(128);
     v_plane.fill(128);
+    if src.width() == 0 || src.height() == 0 {
+        return placed;
+    }
 
-    for dy in (0..out_h).step_by(2) {
-        for dx in (0..out_w).step_by(2) {
-            let mut sum = [0i32; 3];
-            for (ey, ex) in [(0u32, 0u32), (0, 1), (1, 0), (1, 1)] {
-                let ox = (dx + ex).min(out_w - 1);
-                let oy = (dy + ey).min(out_h - 1);
-                let sx = (ox as u64 * sw as u64 / out_w as u64).min(sw as u64 - 1) as usize;
-                let sy = (oy as u64 * sh as u64 / out_h as u64).min(sh as u64 - 1) as usize;
-                let off = sy * stride + sx * 4;
-                let (b, g, r) = (data[off] as i32, data[off + 1] as i32, data[off + 2] as i32);
-                let px = (off_x + ox) as usize;
-                let py = (off_y + oy) as usize;
-                y_plane[py * y_stride + px] = luma(r, g, b);
+    let (columns, rows) = (Taps::new(sw, out_w), Taps::new(sh, out_h));
+    let scaler = Scaler {
+        src,
+        average: Divide::by(columns.norm as u64 * rows.norm as u64),
+        columns,
+        rows,
+        off_x: off_x as usize,
+    };
+
+    // Bands of output rows, one per thread: the encoder waits on this, and
+    // the other cores are idle while it does. Even heights, so each band owns
+    // whole chroma rows. A small frame is not worth the threads.
+    let threads = if out_w as usize * out_h as usize >= 640 * 480 {
+        std::thread::available_parallelism().map_or(1, |n| n.get().min(MAX_THREADS))
+    } else {
+        1
+    };
+    let band = (out_h as usize).div_ceil(threads).next_multiple_of(2);
+    let y_bands = y_plane[off_y as usize * y_stride..].chunks_mut(band * y_stride);
+    let u_bands = u_plane[off_y as usize / 2 * uv_stride..].chunks_mut(band / 2 * uv_stride);
+    let v_bands = v_plane[off_y as usize / 2 * uv_stride..].chunks_mut(band / 2 * uv_stride);
+    let jobs = y_bands
+        .zip(u_bands)
+        .zip(v_bands)
+        .enumerate()
+        .map(|(i, ((y, u), v))| {
+            let first = i * band;
+            let rows = first..(first + band).min(out_h as usize);
+            (
+                rows,
+                Planes {
+                    y,
+                    u,
+                    v,
+                    y_stride,
+                    uv_stride,
+                },
+            )
+        });
+    std::thread::scope(|scope| {
+        let scaler = &scaler;
+        let mut jobs = jobs.filter(|(rows, _)| !rows.is_empty());
+        // The first band on this thread, the rest on their own.
+        let here = jobs.next();
+        for (rows, planes) in jobs {
+            scope.spawn(move || scaler.band(rows, planes));
+        }
+        if let Some((rows, planes)) = here {
+            scaler.band(rows, planes);
+        }
+    });
+    placed
+}
+
+/// The most threads one scaled conversion uses.
+const MAX_THREADS: usize = 4;
+
+/// One band of the destination's planes, starting at the band's first row.
+struct Planes<'a> {
+    y: &'a mut [u8],
+    u: &'a mut [u8],
+    v: &'a mut [u8],
+    y_stride: usize,
+    uv_stride: usize,
+}
+
+/// What every band of one scaled conversion shares.
+struct Scaler<'a> {
+    src: &'a Framebuffer,
+    columns: Taps,
+    rows: Taps,
+    average: Divide,
+    /// Where the image starts in each destination row.
+    off_x: usize,
+}
+
+impl Scaler<'_> {
+    /// Scale output rows `rows` -- an even start -- into `planes`, whose first
+    /// row is output row `rows.start`.
+    fn band(&self, rows: std::ops::Range<usize>, planes: Planes<'_>) {
+        let Planes {
+            y: y_plane,
+            u: u_plane,
+            v: v_plane,
+            y_stride,
+            uv_stride,
+        } = planes;
+        let w = self.columns.spans.len();
+        // Two output rows of averaged RGB at a time: one 4:2:0 chroma row.
+        let mut pair = [vec![[0i32; 3]; w], vec![[0i32; 3]; w]];
+        // The vertical sums fit `u16` for every common ratio once the weights
+        // are reduced, and `u16` vectorises twice as wide.
+        let mut narrow = Vec::new();
+        let mut wide = Vec::new();
+        let narrow_fits = self.rows.norm as u64 * 255 <= u16::MAX as u64;
+
+        for dy in rows.clone().step_by(2) {
+            for (half, out) in pair.iter_mut().enumerate() {
+                if narrow_fits {
+                    combine_rows::<u16>(self.src, &self.rows, dy + half, &mut narrow);
+                    filter_row(&narrow, &self.columns, self.average, out);
+                } else {
+                    combine_rows::<u32>(self.src, &self.rows, dy + half, &mut wide);
+                    filter_row(&wide, &self.columns, self.average, out);
+                }
+            }
+            let py = dy - rows.start;
+            for dx in (0..w).step_by(2) {
+                let px = self.off_x + dx;
+                let mut sum = [0i32; 3];
+                for (ey, row) in pair.iter().enumerate() {
+                    for ex in 0..2 {
+                        let [r, g, b] = row[dx + ex];
+                        y_plane[(py + ey) * y_stride + px + ex] = luma(r, g, b);
+                        sum[0] += r;
+                        sum[1] += g;
+                        sum[2] += b;
+                    }
+                }
+                let (r, g, b) = (sum[0] / 4, sum[1] / 4, sum[2] / 4);
+                let c = (py / 2) * uv_stride + px / 2;
+                u_plane[c] = chroma_u(r, g, b);
+                v_plane[c] = chroma_v(r, g, b);
+            }
+        }
+    }
+}
+
+/// Which source pixels each output position takes, and with what weight, in
+/// one dimension.
+///
+/// Scaling down, output `o` covers `[o * src, (o + 1) * src)` on a grid where
+/// source pixel `i` is `[i * out, (i + 1) * out)`. The weight of each source
+/// pixel is the overlap: `out` for one wholly inside, less for the partly
+/// covered pixel at either end, and `src` in all. Scaling up, it is the one
+/// nearest pixel at weight 1.
+#[derive(Debug)]
+struct Taps {
+    /// Per output position: the source range, and the weights of its first
+    /// and last pixel. Pixels between them weigh `inner`.
+    spans: Vec<(usize, usize, u32, u32)>,
+    inner: u32,
+    /// What each position's weights sum to.
+    norm: u32,
+}
+
+impl Taps {
+    fn new(src: u32, out: u32) -> Self {
+        let (s, o) = (src as u64, out as u64);
+        if out > src {
+            let spans = (0..o)
+                .map(|i| {
+                    let x = ((2 * i + 1) * s / (2 * o)).min(s - 1) as usize;
+                    (x, x + 1, 1, 1)
+                })
+                .collect();
+            return Self {
+                spans,
+                inner: 1,
+                norm: 1,
+            };
+        }
+        // Every boundary on the grid is a multiple of gcd(src, out), so every
+        // weight is too. Dividing it out keeps the sums small: 2160 to 1080
+        // weighs 1 and 1 out of 2, not 1080 and 1080 out of 2160.
+        let g = gcd(s, o);
+        let spans = (0..o)
+            .map(|i| {
+                let (from, to) = (i * s, (i + 1) * s);
+                let start = from / o;
+                let end = to.div_ceil(o);
+                let first = ((((start + 1) * o).min(to) - from) / g) as u32;
+                let last = ((to - (end - 1) * o) / g) as u32;
+                (start as usize, end as usize, first, last)
+            })
+            .collect();
+        Self {
+            spans,
+            inner: (o / g) as u32,
+            norm: (s / g) as u32,
+        }
+    }
+
+    /// The source pixels output `i` takes, with their weights.
+    fn of(&self, i: usize) -> impl Iterator<Item = (usize, u32)> + '_ {
+        let (start, end, first, last) = self.spans[i];
+        (start..end).map(move |x| {
+            let w = if x == start {
+                first
+            } else if x == end - 1 {
+                last
+            } else {
+                self.inner
+            };
+            (x, w)
+        })
+    }
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// Combine output row `i`'s source rows into `combined`, weighted: BGRA, each
+/// channel at most `rows.norm * 255`.
+///
+/// Vertically first, over whole rows of bytes in memory order, so the loop
+/// vectorises; the horizontal pass then runs once per output row rather than
+/// once per source row.
+fn combine_rows<T>(src: &Framebuffer, rows: &Taps, i: usize, combined: &mut Vec<T>)
+where
+    T: Copy + From<u8> + TryFrom<u32> + std::ops::Mul<Output = T> + std::ops::Add<Output = T>,
+{
+    let stride = src.stride();
+    let weight = |w: u32| T::try_from(w).ok().expect("weights fit the accumulator");
+    let mut taps = rows.of(i);
+    let (sy, wy) = taps.next().expect("every output row takes a source row");
+    let wy = weight(wy);
+    combined.clear();
+    combined.extend(
+        src.data()[sy * stride..(sy + 1) * stride]
+            .iter()
+            .map(|&b| wy * T::from(b)),
+    );
+    for (sy, wy) in taps {
+        let wy = weight(wy);
+        let row = &src.data()[sy * stride..(sy + 1) * stride];
+        for (sum, &byte) in combined.iter_mut().zip(row) {
+            *sum = *sum + wy * T::from(byte);
+        }
+    }
+}
+
+/// Average one vertically combined row horizontally into `out`, as RGB.
+fn filter_row<T: Copy + Into<u64>>(
+    combined: &[T],
+    columns: &Taps,
+    average: Divide,
+    out: &mut [[i32; 3]],
+) {
+    for (o, &(x0, x1, first, last)) in out.iter_mut().zip(&columns.spans) {
+        let span = &combined[x0 * 4..x1 * 4];
+        // BGRA: blue first. The sums can pass `u32` for a large source.
+        let weigh = |w: u32, px: &[T]| {
+            let w = w as u64;
+            [w * px[2].into(), w * px[1].into(), w * px[0].into()]
+        };
+        let mut sum = weigh(first, &span[..4]);
+        if span.len() > 4 {
+            let (middle, end) = span[4..].split_at(span.len() - 8);
+            for px in middle.chunks_exact(4) {
+                let [r, g, b] = weigh(columns.inner, px);
                 sum[0] += r;
                 sum[1] += g;
                 sum[2] += b;
             }
-            let (r, g, b) = (sum[0] / 4, sum[1] / 4, sum[2] / 4);
-            let c = ((off_y + dy) as usize / 2) * uv_stride + (off_x + dx) as usize / 2;
-            u_plane[c] = chroma_u(r, g, b);
-            v_plane[c] = chroma_v(r, g, b);
+            let [r, g, b] = weigh(last, end);
+            sum[0] += r;
+            sum[1] += g;
+            sum[2] += b;
+        }
+        *o = sum.map(|c| average.rounded(c) as i32);
+    }
+}
+
+/// Rounded division by a constant, as a multiply and a shift: three divisions
+/// per output pixel cost more than the rest of the scaling put together.
+///
+/// The dividend is at most `255 * divisor`, so the product stays under 2^64.
+/// The reciprocal is rounded up, which overshoots a quotient by less than
+/// `dividend / 2^56`; that never reaches the next integer while
+/// `dividend * divisor < 2^56`, which holds for a 4K source and anything
+/// smaller. Larger, a sum lying within that margin of a rounding boundary can
+/// come out one higher. A flat colour, half a divisor from either boundary, is
+/// exact at any size.
+#[derive(Clone, Copy, Debug)]
+struct Divide {
+    half: u64,
+    reciprocal: u64,
+}
+
+impl Divide {
+    const SHIFT: u32 = 56;
+
+    fn by(divisor: u64) -> Self {
+        Self {
+            half: divisor / 2,
+            reciprocal: (1u64 << Self::SHIFT).div_ceil(divisor),
         }
     }
-    Rect {
-        x: off_x,
-        y: off_y,
-        width: out_w,
-        height: out_h,
+
+    #[inline]
+    fn rounded(self, n: u64) -> u64 {
+        ((n + self.half) * self.reciprocal) >> Self::SHIFT
     }
 }
 
@@ -357,7 +641,143 @@ mod tests {
         convert_full(&src, &mut a);
         let placed = convert_scaled(&src, &mut b);
         assert_eq!(placed, Rect::whole(64, 64));
-        assert_eq!(a.sample(10, 10), b.sample(10, 10));
+        assert_eq!(a, b);
+    }
+
+    /// One-pixel black and white columns, halved: every output pixel is the
+    /// mid-grey average. Nearest-neighbour gave all one or all the other.
+    #[test]
+    fn a_downscale_averages_what_it_covers() {
+        let mut src = Framebuffer::new(64, 64);
+        for x in (0..64).step_by(2) {
+            src.fill(
+                Rect {
+                    x,
+                    y: 0,
+                    width: 1,
+                    height: 64,
+                },
+                [255, 255, 255, 255],
+            );
+        }
+        let mut dst = I420Frame::new(32, 32);
+        convert_scaled(&src, &mut dst);
+        let mid = luma(128, 128, 128);
+        for x in 0..32 {
+            assert_eq!(dst.sample(x, 7).unwrap().0, mid, "column {x}");
+        }
+    }
+
+    /// 1080 to 720 is a ratio of 1.5, at which nearest-neighbour skipped every
+    /// third source row. A one-pixel line on each of those rows vanished
+    /// entirely; averaged, every one of them still contributes its share.
+    #[test]
+    fn a_downscale_drops_no_rows() {
+        let mut src = Framebuffer::new(90, 90);
+        for y in (2..90).step_by(3) {
+            src.fill(
+                Rect {
+                    x: 0,
+                    y,
+                    width: 90,
+                    height: 1,
+                },
+                [255, 255, 255, 255],
+            );
+        }
+        let mut dst = I420Frame::new(60, 60);
+        let placed = convert_scaled(&src, &mut dst);
+        assert_eq!(placed, Rect::whole(60, 60));
+
+        // Brightness above black, summed down one column, is conserved up to
+        // the area ratio: 30 white rows of 90 make a third of the column.
+        let lit: u32 = (0..60)
+            .map(|y| (dst.sample(30, y).unwrap().0 - 16) as u32)
+            .sum();
+        let expect = 60 * (235 - 16) / 3;
+        assert!(
+            lit.abs_diff(expect) * 20 < expect,
+            "{lit} lit against {expect}: rows were dropped"
+        );
+    }
+
+    /// Scaling up repeats pixels rather than blending them: a hard edge stays
+    /// hard.
+    #[test]
+    fn an_upscale_keeps_edges_hard() {
+        let mut src = Framebuffer::new(8, 8);
+        src.fill(
+            Rect {
+                x: 4,
+                y: 0,
+                width: 4,
+                height: 8,
+            },
+            [255, 255, 255, 255],
+        );
+        let mut dst = I420Frame::new(32, 32);
+        convert_scaled(&src, &mut dst);
+        let lumas: Vec<u8> = (0..32).map(|x| dst.sample(x, 16).unwrap().0).collect();
+        assert!(lumas[..16].iter().all(|&y| y == 16), "{lumas:?}");
+        assert!(lumas[16..].iter().all(|&y| y == 235), "{lumas:?}");
+    }
+
+    /// Large enough to be split into bands across threads: every luma sample,
+    /// seams included, must equal a direct 2x2 box average of noise.
+    #[test]
+    fn a_banded_downscale_matches_a_direct_average_everywhere() {
+        let (sw, sh) = (1280u32, 960u32);
+        let mut src = Framebuffer::new(sw, sh);
+        let mut seed = 0x2545_f491_u32;
+        for px in src.data_mut().chunks_exact_mut(4) {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            px[..3].copy_from_slice(&seed.to_le_bytes()[1..]);
+        }
+        let mut dst = I420Frame::new(sw / 2, sh / 2);
+        assert_eq!(convert_scaled(&src, &mut dst), Rect::whole(sw / 2, sh / 2));
+
+        for y in 0..sh / 2 {
+            for x in 0..sw / 2 {
+                let mut sum = [0u32; 3];
+                for (ex, ey) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let p = src.pixel(2 * x + ex, 2 * y + ey).unwrap();
+                    for c in 0..3 {
+                        sum[c] += p[2 - c] as u32;
+                    }
+                }
+                let [r, g, b] = sum.map(|c| ((c + 2) / 4) as i32);
+                assert_eq!(
+                    dst.sample(x as usize, y as usize).unwrap().0,
+                    luma(r, g, b),
+                    "({x}, {y})"
+                );
+            }
+        }
+    }
+
+    /// Every source pixel's weights, summed over the outputs it feeds, come
+    /// to the same total, and each output's weights to `norm`.
+    #[test]
+    fn scaling_down_weighs_every_source_pixel_equally() {
+        for (src, out) in [(1080u32, 720u32), (3840, 1920), (1000, 7), (5, 5), (7, 6)] {
+            let taps = Taps::new(src, out);
+            let mut per_source = vec![0u64; src as usize];
+            for i in 0..out as usize {
+                let total: u32 = taps
+                    .of(i)
+                    .map(|(x, w)| {
+                        per_source[x] += w as u64;
+                        w
+                    })
+                    .sum();
+                assert_eq!(total, taps.norm, "{src}->{out}, output {i}");
+            }
+            let inner = taps.inner as u64;
+            assert!(per_source.iter().all(|&w| w == inner), "{src}->{out}");
+        }
+        // Scaling up, each output takes one pixel, in range.
+        let up = Taps::new(4, 9);
+        assert!((0..9).all(|i| up.of(i).count() == 1 && up.of(i).all(|(x, _)| x < 4)));
     }
 
     #[test]
