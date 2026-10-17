@@ -342,8 +342,10 @@ the failure looks like a slow guest. `real_server.rs` is multi-threaded *and*
 wraps `Guest` so every blocking call goes through `block_in_place`, because a
 blocked worker could otherwise still hold the client's next task in its LIFO
 slot. Its module comment has the mechanism. The GLZ soak still stalls
-intermittently with both in place, for a reason not yet found
-(`roadmap.md` §2.7).
+intermittently under TCG with both in place. That is the guest's QXL driver
+waiting for memory the device has not released, not the client
+(`roadmap.md` §2.7). When a guest command times out,
+`Guest::stall_report` says where X is blocked.
 
 ### 4.1 Which display device, and why it matters
 
@@ -567,6 +569,10 @@ Three practical constraints:
   "exposes" means *openable*: a node the user cannot open (not in the `kvm`
   group) used to make `-accel kvm` fail and surface as a QMP timeout. The
   harness now opens the device to decide, and falls back to TCG.
+  `SOLSTICE_GUEST_ACCEL=tcg` forces TCG on a host with KVM. The two are not
+  interchangeable for every test: a guest that is slow relative to the
+  client changes which races can happen, and the GLZ soak's stall
+  reproduces only under TCG (`roadmap.md` §2.7).
 - **QXL needs QEMU's SPICE module** (`qemu-system-modules-spice` on Debian).
   Without it `-vga qxl` refuses to start, so the RFB tier asks for virtio-gpu
   instead: QEMU's VNC server reads the same console surface either way.

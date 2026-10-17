@@ -64,8 +64,9 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// task in its LIFO slot, which other workers do not steal, and the client
 /// would then freeze as it does on one thread (see the module comment).
 /// `block_in_place` hands the worker's queue to another thread before
-/// blocking, which closes that possibility. It did not close every stall the
-/// GLZ soak has seen; `docs/roadmap.md` §2.7 has the one still open.
+/// blocking, which closes that possibility. The GLZ soak still stalls under
+/// TCG, and that one is the guest's QXL driver rather than the client:
+/// `docs/roadmap.md` §2.7, and [`Guest::stall_report`] for how it was found.
 struct Guest(solstice_test_guest::Guest);
 
 impl Guest {
@@ -91,6 +92,10 @@ impl Guest {
 
     fn screendump(&self) -> solstice_test_guest::Result<solstice_test_guest::Ppm> {
         tokio::task::block_in_place(|| self.0.screendump())
+    }
+
+    fn stall_report(&self) -> String {
+        tokio::task::block_in_place(|| self.0.stall_report())
     }
 }
 
@@ -121,6 +126,15 @@ fn config(port: u16) -> SpiceConfig {
 }
 
 async fn session(port: u16) -> solstice_spice::SpiceSession {
+    // Warnings on by default: the client reports a display error by logging
+    // it and closing the display, and without a subscriber that looked like a
+    // server that had simply gone quiet (`docs/roadmap.md` §2.7).
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
+        )
+        .with_test_writer()
+        .try_init();
     let dialer = Arc::new(TcpDialer::new(config(port)));
     tokio::time::timeout(TIMEOUT, connect(dialer, config(port)))
         .await
@@ -262,7 +276,13 @@ async fn incremental_repaint_test(compression: &str) {
     // is sent before the server has heard anything from this client and so
     // says nothing about the codec being forced.
     let before = session.image_counts();
-    guest.draw("text", &[]).expect("drawing text");
+    guest.draw("text", &[]).unwrap_or_else(|e| {
+        panic!(
+            "{}: {e}\nin the guest:\n{}",
+            "drawing text",
+            guest.stall_report()
+        )
+    });
     guest.draw("rop3", &["16"]).expect("drawing a stipple");
     wait_for_screendump(&session, &guest, TIMEOUT)
         .await
@@ -1147,7 +1167,16 @@ async fn glz_soak_keeps_the_screen_exact_across_thousands_of_images() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(400);
-    let Some(guest) = start(640, 480, "glz", "off") else {
+    // Twice QEMU's default QXL RAM. With the default, the guest kernel's
+    // QXL driver runs out under TCG and blocks waiting for the device to
+    // release memory, which stalls the soak for reasons that have nothing to
+    // do with GLZ (`docs/roadmap.md` §2.7).
+    let Some(guest) = Guest::start(
+        GuestConfig::new()
+            .geometry(640, 480)
+            .qxl_ram_mb(128)
+            .spice(Spice::new().image_compression("glz").streaming_video("off")),
+    ) else {
         return;
     };
     guest.fill("000000").expect("painting the guest black");
@@ -1161,15 +1190,27 @@ async fn glz_soak_keeps_the_screen_exact_across_thousands_of_images() {
         // repaints neither repeat nor share a palette, then glyphs and
         // lines over it so the images are not all flat.
         let mixed = (round as u32).wrapping_mul(0x9E37_79B9) >> 8;
-        guest
-            .fill(&format!("{mixed:06x}"))
-            .expect("painting the guest");
+        guest.fill(&format!("{mixed:06x}")).unwrap_or_else(|e| {
+            panic!(
+                "{}: {e}\nin the guest:\n{}",
+                "painting the guest",
+                guest.stall_report()
+            )
+        });
         guest
             .draw("text", &[&format!("glz soak round {round}")])
-            .expect("drawing text");
+            .unwrap_or_else(|e| {
+                panic!("drawing text: {e}\nin the guest:\n{}", guest.stall_report())
+            });
         guest
             .draw("stroke", &[&(8 + round % 56).to_string()])
-            .expect("drawing lines");
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{}: {e}\nin the guest:\n{}",
+                    "drawing lines",
+                    guest.stall_report()
+                )
+            });
         if round % 20 == 19 || round + 1 == rounds {
             wait_for_screendump(&session, &guest, TIMEOUT)
                 .await
