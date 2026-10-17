@@ -116,7 +116,7 @@ fn parse_probe_output(stdout: &str) -> ProbeReport {
 /// What `/launch` hands a Moonlight port to pass to `LiStartConnection`.
 struct Launched {
     /// The paired client, for the tests that revoke it.
-    client: HostIdentity,
+    client: Arc<HostIdentity>,
     session_url: String,
     rikey: [u8; 16],
     rikey_id: i32,
@@ -128,8 +128,23 @@ struct Launched {
 async fn pair_and_launch(ports: Ports) -> Launched {
     let client_identity = HostIdentity::generate("mlc-probe").unwrap();
     pair(ports, &client_identity).await;
+    launch(ports, Arc::new(client_identity)).await
+}
 
+/// Launch as a client that has already paired. The pairing window closes
+/// once a client has paired, so a test streaming more than once pairs once.
+async fn launch(ports: Ports, client_identity: Arc<HostIdentity>) -> Launched {
     let https = https_client(&client_identity);
+    // A stream that has only just ended may still hold the one session slot
+    // for a moment, and `/launch` says so with a 503 until it lets go.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !https_get(&https, ports, "/serverinfo")
+        .await
+        .contains("<currentgame>0</currentgame>")
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     let serverinfo = https_get(&https, ports, "/serverinfo").await;
     assert!(
         serverinfo.contains("<PairStatus>1</PairStatus>"),
@@ -743,6 +758,422 @@ async fn revoking_the_client_ends_its_running_stream() {
     );
 
     let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+/// One audio configuration a Moonlight client can ask for, and the decoder
+/// it should end up building from this host's DESCRIBE.
+#[cfg(feature = "audio")]
+struct AudioCase {
+    name: &'static str,
+    channels: u32,
+    slow_decoder: bool,
+    bitrate: u32,
+    /// `audio-setup` as the probe reports it.
+    streams: &'static str,
+    coupled: &'static str,
+    samples: &'static str,
+    mapping: &'static str,
+}
+
+/// `docs/roadmap.md` §2.7: backend audio, through the whole host, decoded by
+/// the reference client's own idea of the stream.
+///
+/// The backend plays a 440 Hz tone as raw stereo PCM. For each layout
+/// Moonlight can negotiate, the probe reports the decoder `moonlight-common-c`
+/// configured from DESCRIBE and writes out every packet it handed that
+/// decoder, after its own reordering, FEC recovery and decryption. Here they
+/// are decoded with exactly that configuration. The tone must be in the front
+/// pair and nowhere else, and every packet must be the duration the client
+/// sized its buffer for.
+///
+/// Before this, DESCRIBE said `surround-params=NONE`: a 5.1 client fell back
+/// to a layout of its own, and a 7.1 client could not connect at all.
+#[cfg(feature = "audio")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_reference_client_hears_the_backends_tone_in_every_layout() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
+        )
+        .try_init();
+    let probe = probe_path();
+    if !probe.is_file() {
+        eprintln!(
+            "skipping: no mlc-probe at {} -- build it with tests/tools/mlc-probe/build.sh",
+            probe.display()
+        );
+        return;
+    }
+
+    const TONE: f64 = 440.0;
+    const PORTS: Ports = Ports::from_base(49589);
+    let mut config = Config::default();
+    config.server.port = PORTS.http;
+    config.backend.kind = BackendKind::TestPattern;
+    config.video.encoder = Encoder::OpenH264;
+    config.limits.max_width = WIDTH;
+    config.limits.max_height = HEIGHT;
+    config.limits.max_fps = FPS;
+    config.limits.max_bitrate_kbps = 20_000;
+
+    let backend = Arc::new(TestPatternBackend::new(WIDTH, HEIGHT, FPS).with_tone(TONE));
+    let (_host, state_dir) = start_daemon_with(config, "mlc-audio", backend);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Moonlight decides quality itself: 15 Mbit/s and up, and not a slow
+    // decoder, asks for the high-quality surround layout and 5 ms packets
+    // (`SdpGenerator.c`).
+    let cases = [
+        AudioCase {
+            name: "stereo, 5 ms",
+            channels: 2,
+            slow_decoder: false,
+            bitrate: 10_000,
+            streams: "1",
+            coupled: "1",
+            samples: "240",
+            mapping: "01",
+        },
+        AudioCase {
+            name: "stereo, 10 ms for a slow decoder",
+            channels: 2,
+            slow_decoder: true,
+            bitrate: 10_000,
+            streams: "1",
+            coupled: "1",
+            samples: "480",
+            mapping: "01",
+        },
+        AudioCase {
+            name: "5.1",
+            channels: 6,
+            slow_decoder: false,
+            bitrate: 10_000,
+            streams: "4",
+            coupled: "2",
+            samples: "240",
+            mapping: "012345",
+        },
+        AudioCase {
+            name: "5.1, high quality",
+            channels: 6,
+            slow_decoder: false,
+            bitrate: 20_000,
+            streams: "6",
+            coupled: "0",
+            samples: "240",
+            mapping: "012345",
+        },
+        AudioCase {
+            name: "7.1",
+            channels: 8,
+            slow_decoder: false,
+            bitrate: 10_000,
+            streams: "5",
+            coupled: "3",
+            samples: "240",
+            mapping: "01234567",
+        },
+        AudioCase {
+            name: "7.1, high quality",
+            channels: 8,
+            slow_decoder: false,
+            bitrate: 20_000,
+            streams: "8",
+            coupled: "0",
+            samples: "240",
+            mapping: "01234567",
+        },
+    ];
+
+    let client = Arc::new(HostIdentity::generate("mlc-probe").unwrap());
+    pair(PORTS, &client).await;
+    for case in &cases {
+        // A stream at a time: the daemon serves them one after another on the
+        // same ports, as it would a client reconnecting with new settings.
+        let launched = launch(PORTS, client.clone()).await;
+        stream_and_hear(&probe, launched, case, &state_dir, TONE).await;
+    }
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+/// The whole audio path, with nothing of ours at either end: a QEMU guest
+/// plays a tone through `spice-server`, the daemon bridges it, and the
+/// reference client receives it (`docs/roadmap.md` §2.7).
+///
+/// Two durations, because they take the two paths. `spice-server` sends
+/// 10 ms Opus, so a client with a slow decoder, which asks for 10 ms, gets
+/// the server's packets untouched; the default 5 ms client gets them decoded
+/// and re-encoded. The packet sizes tell the two apart: the bridge encodes at
+/// a constant rate, so its packets are one size, and the server's are not
+/// that size.
+///
+/// Needs the `spice` feature, the probe and the guest image:
+///
+/// ```sh
+/// cargo test -p solstice --features spice --test real_moonlight -- spice
+/// ```
+#[cfg(feature = "spice")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_reference_client_hears_a_real_spice_guest() {
+    use std::collections::BTreeSet;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
+        )
+        .try_init();
+    let probe = probe_path();
+    if !probe.is_file() {
+        eprintln!(
+            "skipping: no mlc-probe at {} -- build it with tests/tools/mlc-probe/build.sh",
+            probe.display()
+        );
+        return;
+    }
+    let Some(guest) = solstice_test_guest::Guest::start(
+        solstice_test_guest::GuestConfig::new()
+            .geometry(WIDTH, HEIGHT)
+            .spice(solstice_test_guest::Spice::new().audio()),
+    ) else {
+        return;
+    };
+
+    // 480 Hz is exactly 100 samples at 48 kHz, so one period repeats into a
+    // continuous tone with no seam.
+    const TONE: f64 = 480.0;
+    const PORTS: Ports = Ports::from_base(49789);
+    let mut config = Config::default();
+    config.server.port = PORTS.http;
+    config.backend.kind = BackendKind::Spice;
+    config.backend.spice.host = "127.0.0.1".into();
+    config.backend.spice.port = guest.spice_port();
+    // Loopback, which is the only place plaintext SPICE is permitted.
+    config.backend.spice.security = solstice::config::SpiceSecurityKind::Plain;
+    config.backend.spice.audio = true;
+    config.video.encoder = Encoder::OpenH264;
+    config.limits.max_width = WIDTH;
+    config.limits.max_height = HEIGHT;
+    config.limits.max_fps = FPS;
+
+    let backend = solstice::backend_factory::build(&config).unwrap();
+    let (_host, state_dir) = start_daemon_with(config, "mlc-spice-audio", backend);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // `speaker-test -c 2` takes the channels in turn, so each would carry the
+    // tone half the time. Instead: one period of a stereo sine, written with
+    // `printf` octal escapes, repeated to a second, and looped into `aplay`
+    // until killed.
+    let period: String = solstice_audio::tone::Sine::new(TONE, 2)
+        .take(100)
+        .iter()
+        .flat_map(|s| s.to_le_bytes())
+        .map(|b| format!("\\{b:03o}"))
+        .collect();
+    guest
+        .sh(&format!(
+            "printf '{period}' >/tmp/period.raw && \
+             for i in $(seq 480); do cat /tmp/period.raw; done >/tmp/tone.raw && \
+             (nohup sh -c 'while :; do cat /tmp/tone.raw; done | \
+                 aplay -q -t raw -f S16_LE -r 48000 -c 2' >/tmp/aplay.log 2>&1 &) && \
+             echo started"
+        ))
+        .expect("starting the tone");
+
+    let client = Arc::new(HostIdentity::generate("mlc-probe").unwrap());
+    pair(PORTS, &client).await;
+    let mut sizes = Vec::new();
+    for case in [
+        AudioCase {
+            name: "spice, 10 ms: passed through",
+            channels: 2,
+            slow_decoder: true,
+            bitrate: 10_000,
+            streams: "1",
+            coupled: "1",
+            samples: "480",
+            mapping: "01",
+        },
+        AudioCase {
+            name: "spice, 5 ms: re-encoded",
+            channels: 2,
+            slow_decoder: false,
+            bitrate: 10_000,
+            streams: "1",
+            coupled: "1",
+            samples: "240",
+            mapping: "01",
+        },
+    ] {
+        let launched = launch(PORTS, client.clone()).await;
+        let packets = stream_and_hear(&probe, launched, &case, &state_dir, TONE).await;
+        let distinct: BTreeSet<usize> = packets.iter().map(Vec::len).collect();
+        sizes.push(distinct);
+    }
+    let _ = guest.sh("pkill aplay");
+    eprintln!("packet sizes, passed through: {:?}", sizes[0]);
+    eprintln!("packet sizes, re-encoded: {:?}", sizes[1]);
+    // The bridge encodes stereo at a constant 96 kbit/s, so every packet it
+    // makes is 96000 / 8 bytes a second long: 60 bytes at 5 ms, 120 at 10.
+    let cbr = |ms: usize| BTreeSet::from([96_000 / 8 * ms / 1000]);
+    assert_eq!(
+        sizes[1],
+        cbr(5),
+        "5 ms packets should all come out of the bridge's encoder"
+    );
+    assert_ne!(
+        sizes[0],
+        cbr(10),
+        "10 ms packets should be the server's own, not the bridge's"
+    );
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+/// Stream once with the probe configured for `case`, then decode every packet
+/// it handed its decoder, with the decoder it built, and require `tone` in
+/// the front pair and silence everywhere else. Returns the packets.
+#[cfg(feature = "audio")]
+async fn stream_and_hear(
+    probe: &std::path::Path,
+    launched: Launched,
+    case: &AudioCase,
+    state_dir: &std::path::Path,
+    tone: f64,
+) -> Vec<Vec<u8>> {
+    let packets_path = state_dir.join("audio-packets.bin");
+    let _ = std::fs::remove_file(&packets_path);
+    let output = tokio::task::spawn_blocking({
+        let probe = probe.to_path_buf();
+        let packets_path = packets_path.clone();
+        let channels = case.channels;
+        let slow = case.slow_decoder;
+        let bitrate = case.bitrate;
+        move || {
+            probe_command(&probe, &launched)
+                .arg("frames=1")
+                .arg("hold=3")
+                .arg("timeout=30")
+                .arg("input=0")
+                .arg(format!("bitrate={bitrate}"))
+                .arg(format!("audiochannels={channels}"))
+                .arg(format!("slowopus={}", u8::from(slow)))
+                .arg(format!("audiopackets={}", packets_path.display()))
+                .output()
+                .expect("failed to run mlc-probe")
+        }
+    })
+    .await
+    .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let report = parse_probe_output(&stdout);
+    if !report.result_ok || std::env::var("MLC_DEBUG").is_ok() {
+        eprintln!("--- mlc-probe stdout ({}) ---\n{stdout}", case.name);
+        eprintln!(
+            "--- mlc-probe stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(
+        report.stages_failed.is_empty() && report.result_ok,
+        "{}: the reference client failed: {:?} {:?}",
+        case.name,
+        report.stages_failed,
+        report.summary
+    );
+
+    // --- the decoder the client built from DESCRIBE --------------------
+    let setup = &report.audio_setup;
+    let get = |key: &str| setup.get(key).map(String::as_str);
+    let expected_channels = case.channels.to_string();
+    assert_eq!(
+        (
+            get("channels"),
+            get("streams"),
+            get("coupled"),
+            get("mapping"),
+            get("samples")
+        ),
+        (
+            Some(expected_channels.as_str()),
+            Some(case.streams),
+            Some(case.coupled),
+            Some(case.mapping),
+            Some(case.samples)
+        ),
+        "{}: the client configured an unexpected decoder",
+        case.name
+    );
+
+    // --- decode every packet exactly as that decoder would -------------
+    let digit = |s: &str| s.parse::<u8>().unwrap();
+    let mut mapping = [0u8; 8];
+    for (m, d) in mapping.iter_mut().zip(case.mapping.bytes()) {
+        *m = d - b'0';
+    }
+    let layout = solstice_audio::codec::Layout {
+        channels: case.channels as u8,
+        streams: digit(case.streams),
+        coupled_streams: digit(case.coupled),
+        mapping,
+    };
+    let mut decoder = solstice_audio::MultistreamDecoder::new(&layout).unwrap();
+    let samples_per_packet: usize = case.samples.parse().unwrap();
+    let channels = case.channels as usize;
+    let dump = std::fs::read(&packets_path).expect("the probe wrote no packets");
+    let mut pcm = Vec::new();
+    let mut kept = Vec::new();
+    let mut packets = 0usize;
+    let mut rest = dump.as_slice();
+    while rest.len() >= 4 {
+        let len = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+        let packet = &rest[4..4 + len];
+        rest = &rest[4 + len..];
+        let decoded = decoder
+            .decode(packet)
+            .unwrap_or_else(|e| panic!("{}: packet {packets} did not decode: {e}", case.name));
+        assert_eq!(
+            decoded.len(),
+            samples_per_packet * channels,
+            "{}: packet {packets} is not the duration the client asked for",
+            case.name
+        );
+        pcm.extend(decoded);
+        kept.push(packet.to_vec());
+        packets += 1;
+    }
+    assert!(rest.is_empty(), "{}: a truncated packet dump", case.name);
+    // Three seconds held: well over a hundred packets at either duration.
+    assert!(
+        packets * samples_per_packet >= 48_000,
+        "{}: only {packets} packets reached the decoder",
+        case.name
+    );
+
+    // The tone starts once the prebuffer fills; the last second is
+    // well past that.
+    let tail = &pcm[pcm.len() - 48_000 * channels..];
+    for ch in 0..channels {
+        let signal = solstice_audio::tone::channel(tail, channels, ch);
+        if ch < 2 {
+            let purity = solstice_audio::tone::purity(&signal, tone);
+            assert!(
+                purity > 0.9,
+                "{}: channel {ch} should carry the tone, purity {purity:.3}",
+                case.name
+            );
+        } else {
+            let level = solstice_audio::tone::rms(&signal);
+            assert!(
+                level < 100.0,
+                "{}: channel {ch} should be silent, RMS {level:.1}",
+                case.name
+            );
+        }
+    }
+    eprintln!("{}: {packets} packets, tone in the front pair", case.name);
+    kept
 }
 
 fn longest_run(values: &[u32]) -> (u32, usize) {

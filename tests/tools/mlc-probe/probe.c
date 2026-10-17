@@ -49,6 +49,7 @@ static struct {
     int video_format;            /* what setup() was told to decode       */
     int video_width, video_height, video_rate;
     int audio_channels, audio_rate, audio_frame_samples;
+    FILE* audio_packets;   /* length-prefixed Opus packets, if asked for   */
     bool started;                /* connectionStarted fired               */
     int terminated;              /* connectionTerminated errorCode, or 1  */
     bool was_terminated;
@@ -130,13 +131,21 @@ static int dr_submit(PDECODE_UNIT du) {
 
 static int ar_init(int audioConfiguration, const POPUS_MULTISTREAM_CONFIGURATION opusConfig,
                    void* context, int arFlags) {
+    char mapping[AUDIO_CONFIGURATION_MAX_CHANNEL_COUNT + 1];
+    int i;
     (void)audioConfiguration; (void)context; (void)arFlags;
     probe.audio_channels = opusConfig->channelCount;
     probe.audio_rate = opusConfig->sampleRate;
     probe.audio_frame_samples = opusConfig->samplesPerFrame;
-    emit("audio-setup channels=%d rate=%d streams=%d coupled=%d samples=%d",
+    /* The decoder the client would build, mapping included: what the host's
+       DESCRIBE made of it is the thing under test for surround. */
+    for (i = 0; i < opusConfig->channelCount && i < AUDIO_CONFIGURATION_MAX_CHANNEL_COUNT; i++) {
+        mapping[i] = (char)('0' + opusConfig->mapping[i]);
+    }
+    mapping[i] = '\0';
+    emit("audio-setup channels=%d rate=%d streams=%d coupled=%d samples=%d mapping=%s",
          opusConfig->channelCount, opusConfig->sampleRate, opusConfig->streams,
-         opusConfig->coupledStreams, opusConfig->samplesPerFrame);
+         opusConfig->coupledStreams, opusConfig->samplesPerFrame, mapping);
     return 0;
 }
 
@@ -145,8 +154,18 @@ static void ar_stop(void) { emit("audio-stop"); }
 static void ar_cleanup(void) { emit("audio-cleanup"); }
 
 static void ar_sample(char* data, int length) {
-    (void)data;
     probe.audio_samples++;
+    /* The recorder's file is the packets back to back, which cannot be split
+       again. This keeps the boundaries, so the far side can decode each one
+       with the decoder ar_init describes. */
+    if (probe.audio_packets != NULL && length >= 0) {
+        unsigned char prefix[4] = {
+            (unsigned char)length, (unsigned char)(length >> 8),
+            (unsigned char)(length >> 16), (unsigned char)(length >> 24),
+        };
+        fwrite(prefix, 1, sizeof(prefix), probe.audio_packets);
+        fwrite(data, 1, (size_t)length, probe.audio_packets);
+    }
     if (probe.audio_samples <= 2 || probe.audio_samples % 100 == 0) {
         emit("audio n=%u length=%d", probe.audio_samples, length);
     }
@@ -194,15 +213,18 @@ static void cl_connection_status(int status) {
 
 /* ------------------------------------------------------------ argument -- */
 
+/* The last occurrence wins, so a test can override one of the harness's
+   defaults by appending to its command line. */
 static const char* arg_value(int argc, char** argv, const char* name, const char* fallback) {
     int i;
     size_t len = strlen(name);
+    const char* found = fallback;
     for (i = 1; i < argc; i++) {
         if (strncmp(argv[i], name, len) == 0 && argv[i][len] == '=') {
-            return argv[i] + len + 1;
+            found = argv[i] + len + 1;
         }
     }
-    return fallback;
+    return found;
 }
 
 static int arg_int(int argc, char** argv, const char* name, int fallback) {
@@ -240,6 +262,9 @@ static void usage(void) {
         "  hold=N             and stay connected at least N seconds (default 0)\n"
         "  video=PATH         write the H.264 elementary stream here\n"
         "  audio=PATH         write the Opus stream here\n"
+        "  audiopackets=PATH  write each Opus packet, behind a 32-bit LE length\n"
+        "  audiochannels=N    2, 6 or 8 (default 2)\n"
+        "  slowopus=0|1       declare a slow Opus decoder: asks for 10 ms packets\n"
         "  input=0|1          send input events once connected (default 1)\n",
         stderr);
 }
@@ -256,6 +281,7 @@ int main(int argc, char** argv) {
     const char* rtsp_url;
     const char* video_path;
     const char* audio_path;
+    const char* audio_packets_path;
     unsigned char rikey[16];
     int want_frames, timeout_s, hold_s, send_input;
     uint64_t deadline, hold_until;
@@ -277,6 +303,14 @@ int main(int argc, char** argv) {
     send_input = arg_int(argc, argv, "input", 1);
     video_path = arg_value(argc, argv, "video", NULL);
     audio_path = arg_value(argc, argv, "audio", NULL);
+    audio_packets_path = arg_value(argc, argv, "audiopackets", NULL);
+    if (audio_packets_path != NULL) {
+        probe.audio_packets = fopen(audio_packets_path, "wb");
+        if (probe.audio_packets == NULL) {
+            perror(audio_packets_path);
+            return 2;
+        }
+    }
 
     LiInitializeStreamConfiguration(&stream);
     stream.width = arg_int(argc, argv, "width", 1280);
@@ -287,7 +321,11 @@ int main(int argc, char** argv) {
     /* LOCAL rather than AUTO: AUTO would cap packetSize for a non-RFC1918
        address, which would silently change what the host is being asked for. */
     stream.streamingRemotely = STREAM_CFG_LOCAL;
-    stream.audioConfiguration = AUDIO_CONFIGURATION_STEREO;
+    switch (arg_int(argc, argv, "audiochannels", 2)) {
+    case 6: stream.audioConfiguration = AUDIO_CONFIGURATION_51_SURROUND; break;
+    case 8: stream.audioConfiguration = AUDIO_CONFIGURATION_71_SURROUND; break;
+    default: stream.audioConfiguration = AUDIO_CONFIGURATION_STEREO; break;
+    }
     stream.supportedVideoFormats = VIDEO_FORMAT_H264;
     stream.colorSpace = COLORSPACE_REC_601;
     stream.colorRange = COLOR_RANGE_LIMITED;
@@ -330,6 +368,9 @@ int main(int argc, char** argv) {
     audio.cleanup = ar_cleanup;
     audio.decodeAndPlaySample = ar_sample;
     audio.capabilities = CAPABILITY_DIRECT_SUBMIT;
+    if (arg_int(argc, argv, "slowopus", 0)) {
+        audio.capabilities |= CAPABILITY_SLOW_OPUS_DECODER;
+    }
 
     LiInitializeConnectionCallbacks(&listener);
     listener.stageStarting = cl_stage_starting;
@@ -388,6 +429,9 @@ int main(int argc, char** argv) {
 
     emit("stopping");
     LiStopConnection();
+    if (probe.audio_packets != NULL) {
+        fclose(probe.audio_packets);
+    }
 
     emit("summary frames=%u idr=%u bytes=%llu audio=%u sps=%d pps=%d last=%u terminated=%d "
          "maxgap=%" PRIu64 " poor=%u",

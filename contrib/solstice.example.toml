@@ -39,8 +39,9 @@ fec_percentage = 20
 idle_fps       = 5
 
 [audio]
-# The RFB backend has no audio, so this sends Opus silence. The SPICE backend
-# does have audio, and it is Opus too.
+# The backend's audio where it has any, silence otherwise. The RFB backend has
+# none. The SPICE backend's is Opus, passed through when the client asked for
+# 10 ms stereo and re-encoded to the client's layout otherwise.
 enabled = true
 
 [backend]
@@ -69,6 +70,5 @@ security = "tls"
 # with --disable-ticketing needs none.
 # password = "..."
 # ca_file  = "/etc/solstice/spice-ca.pem"
-# Open the playback channel. SPICE's audio is Opus, which is also what
-# GameStream carries.
+# Open the playback channel: guest audio to the client. Off means silence.
 audio    = true

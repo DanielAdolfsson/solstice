@@ -55,7 +55,21 @@ the FEC geometry, the input path and the audio channel.
 ## Running it by hand
 
 Useful when iterating on the host: start a daemon, pair, launch, then point the
-probe at the session. The arguments are `name=value`, in any order.
+probe at the session. The arguments are `name=value`, in any order; when one
+is given twice the last wins, so a test can override a harness default by
+appending.
+
+The audio options, for `the_reference_client_hears_*`:
+
+| Option | Effect |
+|---|---|
+| `audiochannels=2\|6\|8` | ask for stereo, 5.1 or 7.1 |
+| `slowopus=1` | declare `CAPABILITY_SLOW_OPUS_DECODER`, which asks for 10 ms packets |
+| `audiopackets=PATH` | write every Opus packet handed to the decoder behind a 32-bit little-endian length |
+
+`audio-setup` in the output carries the decoder the client built from
+DESCRIBE: channels, streams, coupled streams, samples per packet and the
+mapping.
 
 ```sh
 ~/.cache/solstice/mlc/mlc-probe \

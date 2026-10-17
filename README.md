@@ -39,12 +39,15 @@ absent.
 
 ## Build and test
 
-Needs a stable Rust toolchain and a C compiler (OpenH264 is built from vendored
-source). No cmake, no nasm, no system libraries.
+Needs a stable Rust toolchain, a C compiler and CMake: OpenH264 and libopus
+are built from vendored source, libopus with CMake. No nasm, no system
+libraries. `--no-default-features --features vnc,openh264` builds without
+CMake, and without the Opus codec: every stream then carries canned stereo
+silence.
 
 ```sh
 cargo build --release
-cargo test --workspace        # 687 tests, about 30 s
+cargo test --workspace        # 844 tests
 cargo clippy --workspace --all-targets
 ```
 
@@ -155,8 +158,12 @@ pointed at a client before any desktop is involved.
   OpenH264 encoding with keyframes on demand, the `NV_VIDEO_PACKET` packetiser,
   Reed–Solomon FEC that matches `nanors` byte-for-byte, and AES-GCM shard
   encryption.
-- **Audio**: Opus silence at the negotiated packet duration, RTP, AES-CBC, and
-  the fixed RS(4,2) parity pair every four packets using Nvidia's matrix.
+- **Audio**: the backend's Opus passed through when the client asked for what
+  the backend sends, and otherwise decoded and re-encoded with libopus into the
+  client's own layout and packet duration — stereo, 5.1 or 7.1, normal or high
+  quality — behind a small jitter buffer, with encoded silence when there is
+  nothing to play. Then RTP, AES-CBC, and the fixed RS(4,2) parity pair every
+  four packets using Nvidia's matrix.
 - **The control channel**: ENet -- the subset Moonlight uses, implemented here
   rather than linked, with no fragment reassembly and nothing answered before
   the launch's connect data is presented -- then the GCM envelope with a replay
@@ -174,8 +181,8 @@ pointed at a client before any desktop is involved.
   raw in all eleven layouts, QUIC, LZ, GLZ, zlib-over-GLZ, JPEG, JPEG+alpha
   and LZ4; MJPEG video streams composited over the draw output; the cursor
   channel; `spice-vdagent` for exact-resolution resize, absolute mouse and
-  the by-demand clipboard; and Opus audio passed through rather than
-  transcoded.
+  the by-demand clipboard; and guest audio, heard by the real Moonlight
+  client both passed through and re-encoded.
 
 ### Not implemented
 

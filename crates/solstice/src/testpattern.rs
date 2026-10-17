@@ -7,18 +7,23 @@
 //! picture (`docs/bridging-design.md` §7).
 //!
 //! It is also what the end-to-end tests run against, since the barcode in the
-//! pattern makes every frame individually identifiable.
+//! pattern makes every frame individually identifiable. For the same reason it
+//! can play a tone ([`TestPatternBackend::with_tone`]): bars and tone, so the
+//! audio path has a signal whose pitch survives a lossy codec and can be
+//! checked at the far end.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use solstice_backend::{
-    Backend, BackendEvent, FramebufferHandle, InputEvent, Rect, Result, Session,
+    AudioFormat, AudioFrame, Backend, BackendEvent, FramebufferHandle, InputEvent, Rect, Result,
+    Session,
 };
 use solstice_video::testsrc::TestPattern;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 /// Backend that renders colour bars.
 #[derive(Debug)]
@@ -33,6 +38,8 @@ pub struct TestPatternBackend {
     received: Arc<Mutex<Vec<InputEvent>>>,
     /// Shared the same way, so a test can hold the picture still.
     frozen: Arc<AtomicBool>,
+    /// A tone to play, in Hz.
+    tone: Option<f64>,
 }
 
 impl TestPatternBackend {
@@ -44,7 +51,17 @@ impl TestPatternBackend {
             fps: fps.clamp(1, 240),
             received: Arc::new(Mutex::new(Vec::new())),
             frozen: Arc::new(AtomicBool::new(false)),
+            tone: None,
         }
+    }
+
+    /// Play a sine of `hz` in every session: 48 kHz stereo PCM, 10 ms at a
+    /// time, which is the shape of SPICE's raw mode. Off by default, because
+    /// the pattern is also what an operator sees first, and a test tone is
+    /// not something to inflict on them unasked.
+    pub fn with_tone(mut self, hz: f64) -> Self {
+        self.tone = Some(hz);
+        self
     }
 
     /// Stop or restart the picture in every session of this backend. A frozen
@@ -72,6 +89,7 @@ impl Backend for TestPatternBackend {
             self.fps,
             self.received.clone(),
             self.frozen.clone(),
+            self.tone,
         )))
     }
 }
@@ -87,6 +105,7 @@ pub struct TestPatternSession {
     /// and dropping it silently would make input bugs invisible in exactly the
     /// configuration used to debug everything else.
     received: Arc<Mutex<Vec<InputEvent>>>,
+    audio: Mutex<Option<mpsc::Receiver<AudioFrame>>>,
 }
 
 impl std::fmt::Debug for TestPatternSession {
@@ -117,6 +136,7 @@ impl TestPatternSession {
             fps,
             received,
             Arc::new(AtomicBool::new(false)),
+            None,
         )
     }
 
@@ -126,6 +146,7 @@ impl TestPatternSession {
         fps: u32,
         received: Arc<Mutex<Vec<InputEvent>>>,
         frozen: Arc<AtomicBool>,
+        tone: Option<f64>,
     ) -> Self {
         let fb = FramebufferHandle::with_size(width, height);
         let (events, _) = broadcast::channel(64);
@@ -154,6 +175,12 @@ impl TestPatternSession {
             });
         }
 
+        let audio = tone.map(|hz| {
+            let (frames, rx) = mpsc::channel(64);
+            tokio::spawn(play_tone(hz, frames, running.clone()));
+            rx
+        });
+
         Self {
             fb,
             events,
@@ -161,6 +188,7 @@ impl TestPatternSession {
             height,
             running,
             received,
+            audio: Mutex::new(audio),
         }
     }
 
@@ -196,8 +224,48 @@ impl Session for TestPatternSession {
         Ok(())
     }
 
+    fn take_audio(&self) -> Option<mpsc::Receiver<AudioFrame>> {
+        self.audio.lock().expect("audio lock").take()
+    }
+
     async fn close(&self) {
         self.running.store(false, Ordering::Relaxed);
+    }
+}
+
+/// A sine, 10 ms of interleaved stereo every 10 ms, until the session stops
+/// or nobody is listening.
+async fn play_tone(hz: f64, frames: mpsc::Sender<AudioFrame>, running: Arc<AtomicBool>) {
+    const RATE: f64 = 48_000.0;
+    const SAMPLES: usize = 480;
+    let step = std::f64::consts::TAU * hz / RATE;
+    let mut phase = 0.0f64;
+    let mut ticker = tokio::time::interval(Duration::from_millis(10));
+    // Burst: a sound card keeps real time however late it is serviced, and a
+    // tone that fell behind on a busy runtime would look like a fault in the
+    // audio path it is there to test.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+    while running.load(Ordering::Relaxed) {
+        ticker.tick().await;
+        let mut data = Vec::with_capacity(SAMPLES * 4);
+        for _ in 0..SAMPLES {
+            let v = (phase.sin() * i16::MAX as f64 / 2.0) as i16;
+            data.extend_from_slice(&v.to_ne_bytes());
+            data.extend_from_slice(&v.to_ne_bytes());
+            phase = (phase + step) % std::f64::consts::TAU;
+        }
+        let frame = AudioFrame {
+            format: AudioFormat::Pcm16 {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+            data: Bytes::from(data),
+        };
+        // Full is a consumer that has not started yet; closed is one that has
+        // gone.
+        if let Err(mpsc::error::TrySendError::Closed(_)) = frames.try_send(frame) {
+            break;
+        }
     }
 }
 
@@ -226,6 +294,33 @@ mod tests {
             .unwrap();
         let b = decode_barcode(&fb.read()).unwrap();
         assert!(b > a, "the frame counter must advance: {a} then {b}");
+        session.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_tone_is_offered_once_and_only_when_asked_for() {
+        let silent = TestPatternBackend::new(64, 64, 30).connect().await.unwrap();
+        assert!(silent.take_audio().is_none());
+
+        let session = TestPatternBackend::new(64, 64, 30)
+            .with_tone(440.0)
+            .connect()
+            .await
+            .unwrap();
+        let mut audio = session.take_audio().expect("a tone was asked for");
+        assert!(session.take_audio().is_none(), "the stream is taken once");
+        let frame = tokio::time::timeout(Duration::from_secs(2), audio.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            frame.format,
+            AudioFormat::Pcm16 {
+                sample_rate: 48_000,
+                channels: 2
+            }
+        );
+        assert_eq!(frame.data.len(), 480 * 2 * 2);
         session.close().await;
     }
 
