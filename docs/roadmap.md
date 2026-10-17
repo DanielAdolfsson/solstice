@@ -524,7 +524,8 @@ the clipboard are each validated against a real `spice-vdagent` (§2.6).
   unit-tested only. A Windows guest with the QXL display driver is the source
   to try next. It is not known for certain to emit them either, so check
   with the counts before building on it.
-- **The GLZ soak exists, and nothing runs it on a schedule.**
+- **The GLZ soak exists, and is run by hand.** Nothing schedules it, by
+  decision (`docs/testing.md` §6).
   `glz_soak_keeps_the_screen_exact_across_thousands_of_images` repaints with
   changing content and compares the screen with QEMU's screendump every
   twenty rounds. It has run clean for 3,000 rounds: 36,000 GLZ images and
@@ -1285,18 +1286,27 @@ against. The findings are about the old arrangement:
   client's data until its half of the handshake completes, which under that
   much loss takes several retransmissions. One baseline run also hit the
   audio FEC defect §5 fixed. 20% and 30% pass.
-- **The control-loss script is manual.** It belongs in the nightly loss tier
-  (`docs/testing.md` §5) when there is one.
+- **The control-loss script is manual**, like the rest of the loss tier
+  (`docs/testing.md` §5, §6).
 
 ---
 
 ## 8. Smaller items
 
-- **A cursor for the VNC backend.** Moonlight draws no host cursor, and the
-  RFB backend neither asks for the Cursor pseudo-encoding (-239) nor draws one,
-  so a VNC desktop streams with no pointer at all. The SPICE backend already
-  composites one (`crates/solstice-spice/src/cursor.rs`); RFB needs the same,
-  drawn at the position Moonlight last sent.
+- **The VNC cursor is drawn; three things are left.** The RFB backend lists
+  the Cursor pseudo-encoding (−239) and composites the shape at the position
+  Moonlight last sent (`crates/solstice-vnc/src/cursor.rs`), tested against
+  the mock. Left:
+  - **No real server has sent it to this client yet.** QEMU sends −239 for a
+    guest with a hardware cursor (virtio-gpu), so the guest tier is the
+    place to check, before trusting it.
+  - **Cursor With Alpha (−314)** is not listed, so shapes are 1-bit masked:
+    no soft edges or drop shadows. QEMU and TigerVNC send it to a client
+    that asks; its layout should be checked against a real server.
+  - **In relative mode the drawn pointer can drift** from the guest's. The
+    position is the one the client sends, which is exact for an absolute
+    pointer, but a guest that accelerates relative motion moves further.
+    Nothing reads the guest's position back.
 - **The letterbox scaler averages now; the budget is the encoder's.**
   `convert_scaled` was nearest-neighbour and dropped a third of the rows of a
   1080p desktop streamed at 720p. It is now an exact area average, so every
@@ -1314,7 +1324,7 @@ against. The findings are about the old arrangement:
   So a 4K source letterboxed at 1080p60 that overran 16.7 ms still will.
   The encode is the larger share, and only reached when the backend will
   not resize, which both backends now normally do.
-- **Fuzzing: seeded and scripted, not scheduled.** Five targets now start
+- **Fuzzing: seeded and scripted, run by hand.** Five targets now start
   from real traffic. `tests/tools/gen_fuzz_seeds.py` cuts
   `fuzz/seeds/<target>/` out of the captured session (§4): the RTSP requests,
   the ANNOUNCE body, the input batches, the control messages and the ENet
@@ -1344,9 +1354,9 @@ against. The findings are about the old arrangement:
   first, the scaling is done in `i128`, and both inputs are a unit test.
   `spice_draw` then ran clean for five minutes, 8.2 million runs.
 
-  **No scheduled job.** There is no CI in this repository yet, and a nightly
-  fuzz run is the place to start one. `docs/testing.md` §6 sketches it, and
-  `fuzz.sh` is what it would call.
+  **No scheduled job, by decision.** CI builds, lints and tests on push and
+  pull request only (`docs/testing.md` §6). Fuzzing is `fuzz.sh`, run by
+  hand when a parser changes.
 - **More RFB servers.** `docs/testing.md` §3.3 lists exactly what dropping
   `wayvnc`, `x11vnc`, TurboVNC and QEMU's `-vnc` costs. x11vnc is the
   interesting one: libvncserver implements QEMU extended key events in its

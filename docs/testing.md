@@ -32,13 +32,14 @@ matters for testing, but as a *reference host* to diff against — §2.4.
 | T0 | Unit + property tests on pure functions | every push | seconds |
 | T1 | Golden vectors from captured real traffic | every push | seconds |
 | T2 | Mock peers — our own fake client and fake servers | every push | < 1 min |
-| T3 | Real implementations (one QEMU guest, headless Moonlight) | every push | ~1 min |
-| T4 | Server flag sweeps + loss injection | nightly | ~30 min |
-| T5 | Fuzzing | nightly / continuous | hours |
+| T3 | Real implementations (one QEMU guest, headless Moonlight) | every push, where QEMU is | ~1 min |
+| T4 | Server flag sweeps + loss injection | by hand | ~30 min |
+| T5 | Fuzzing | by hand | hours |
 | T6 | Manual (GUI clients, subjective quality) | release gate | — |
 
-T0–T3 should gate merges. Everything below is about how to actually build
-them.
+T0–T3 should gate merges; CI gates T0–T2 today (§6). Nothing is scheduled,
+by decision: T4 and T5 are scripts someone runs. Everything below is about
+how to actually build them.
 
 ---
 
@@ -521,6 +522,17 @@ project's to prove. Two tiers do it:
 
 ## 6. CI shape
 
+**What runs today** is `.github/workflows/ci.yml`, on every push to `main`
+and every pull request: `cargo fmt --check`, `cargo clippy -D warnings` and
+`cargo test --workspace`, on a stock Ubuntu runner. That is T0–T2. The T3
+tests skip themselves there, since the runner has no QEMU, guest image or
+probe; they still run wherever those exist.
+
+**Nothing is scheduled, and that is a decision, not a gap.** The soak, the
+loss sweeps and fuzzing are run by hand -- `tests/tools/fuzz.sh`, the
+`--ignored` soak, the loss scripts -- when the code they cover changes. The
+rest of this section is the shape a fuller T3 job would take.
+
 One container image for T0–T2: `ffmpeg`, the probe client and the barcode
 generator. T3 and above need `qemu-system-x86_64` and the guest image, which
 `tests/guest/build-image.sh` produces — unprivileged, no installer, about
@@ -532,14 +544,14 @@ on push:      T0 unit/property                      ~20 s
               T2 mock client + mock RFB/SPICE       ~40 s
               T3 both backends against the guest    ~45 s
               T3 the host against real Moonlight    ~5 s
-nightly:      T4 image-compression × streaming-video × agent sweeps  ~10 min
+by hand:      T4 image-compression × streaming-video × agent sweeps  ~10 min
               T4 loss injection sweep               ~10 min
               T4 encoding cost measurement          ~1 min
               T5 cargo-fuzz on the eleven targets      ~2 h
 ```
 
 `mlc-probe` is the cheapest of these by a wide margin and the highest-yield
-(§2.2), so it belongs on every push rather than nightly. It needs `gcc`,
+(§2.2), so it belongs on every push. It needs `gcc`,
 `git` and `libssl-dev` in the image, and a cache of its own:
 
 ```yaml
@@ -579,7 +591,7 @@ Three practical constraints:
 
 - **Nested virtualisation.** The guest boots in about five seconds with
   `/dev/kvm` and well under a minute without it, under TCG. Either is fine
-  nightly; only the first is comfortable on every push. Whether hosted
+  by hand; only the first is comfortable on every push. Whether hosted
   runners expose `/dev/kvm` should be checked rather than assumed -- and
   "exposes" means *openable*: a node the user cannot open (not in the `kvm`
   group) used to make `-accel kvm` fail and surface as a QMP timeout. The
@@ -656,6 +668,6 @@ Be honest about the gaps rather than pretending the matrix is complete:
 - **Hardware encoders**, per §6.
 - **Long-running stability.** Memory growth, sequence-number and IV-counter
   wrap, GLZ history-window drift over hours. Needs a soak job, not a CI job.
-  The GLZ part has a test to run (§4.3); nothing runs it on a schedule.
+  The GLZ part has a test to run (§4.3), run by hand (§6).
 - **Other RFB servers and real QXL guests**, deliberately — see §3.3 and §4.2
   for exactly what that costs and when to revisit.

@@ -11,7 +11,10 @@ fn the_guest_boots_and_answers_on_both_channels() {
 
     // The agent channel.
     let uname = guest.sh("uname -s -m").expect("uname in the guest");
-    assert!(uname.contains("Linux"), "unexpected guest kernel: {uname:?}");
+    assert!(
+        uname.contains("Linux"),
+        "unexpected guest kernel: {uname:?}"
+    );
 
     // The QMP channel, and the geometry that came off the kernel command line.
     let shot = guest.screendump().expect("screendump");
@@ -38,7 +41,9 @@ fn a_fill_is_visible_to_qemus_own_capture() {
         ("green", "00ff00", [0x00, 0xff, 0x00]),
         ("blue", "0000ff", [0x00, 0x00, 0xff]),
     ] {
-        guest.fill(hex).unwrap_or_else(|e| panic!("fill {name}: {e}"));
+        guest
+            .fill(hex)
+            .unwrap_or_else(|e| panic!("fill {name}: {e}"));
         let shot = guest.screendump().expect("screendump");
         assert_eq!(
             shot.uniform(),
@@ -72,14 +77,20 @@ fn the_core_x11_primitives_run_in_the_guest() {
 #[test]
 fn a_spice_guest_comes_up_with_its_agent() {
     let Some(guest) = Guest::start(
-        GuestConfig::new().spice(Spice::new().image_compression("quic").streaming_video("off")),
+        GuestConfig::new().spice(
+            Spice::new()
+                .image_compression("quic")
+                .streaming_video("off"),
+        ),
     ) else {
         return;
     };
 
     assert!(guest.spice_port() > 5900, "no SPICE port");
 
-    let spice = guest.qmp("query-spice", serde_json::json!({})).expect("query-spice");
+    let spice = guest
+        .qmp("query-spice", serde_json::json!({}))
+        .expect("query-spice");
     assert_eq!(spice["enabled"], true, "SPICE is not enabled: {spice}");
 
     let agent = guest.sh("pgrep -c spice-vdagent || true").expect("pgrep");

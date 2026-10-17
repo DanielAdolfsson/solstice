@@ -671,3 +671,123 @@ async fn dropping_a_session_closes_its_connection() {
         .expect("the connection stayed open after drop")
         .unwrap();
 }
+
+/// Poll the framebuffer until `pixel` at (x, y) is `want`.
+async fn pixel_becomes(session: &solstice_vnc::backend::VncSession, x: u32, y: u32, want: [u8; 4]) {
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        let got = session.framebuffer().read().pixel(x, y);
+        if got == Some(want) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "({x}, {y}) is {got:?}, never {want:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn point_at(session: &solstice_vnc::backend::VncSession, x: i16, y: i16) {
+    session
+        .send_input(InputEvent::PointerAbsolute {
+            x,
+            y,
+            ref_width: 64,
+            ref_height: 64,
+        })
+        .await
+        .unwrap();
+}
+
+/// Moonlight draws no host cursor, so the pointer the server describes is
+/// drawn into the stream where the client's pointer is, and moving it puts
+/// back what it covered (`docs/roadmap.md` §8).
+#[tokio::test]
+async fn the_servers_cursor_is_drawn_where_the_clients_pointer_is() {
+    const GREY: [u8; 4] = [80, 80, 80, 255];
+    const RED: [u8; 4] = [0, 0, 255, 255];
+    const BLUE: [u8; 4] = [255, 0, 0, 255];
+    let h = harness(MockConfig::default()).await;
+    let encodings =
+        recorded_contains(&h.recorded, |m| matches!(m, ClientMessage::SetEncodings(_))).await;
+    let ClientMessage::SetEncodings(encodings) = encodings else {
+        unreachable!()
+    };
+    assert!(
+        encodings.contains(&-239),
+        "the Cursor pseudo-encoding is listed"
+    );
+
+    h.updates
+        .send(MockUpdate::Fill {
+            rect: Rect::whole(64, 64),
+            colour: GREY,
+        })
+        .await
+        .unwrap();
+    pixel_becomes(&h.session, 0, 0, GREY).await;
+
+    // A 3 x 3 shape, hot spot in the middle, opaque but for its centre.
+    let mut mask = vec![true; 9];
+    mask[4] = false;
+    h.updates
+        .send(MockUpdate::Cursor {
+            hot_x: 1,
+            hot_y: 1,
+            width: 3,
+            height: 3,
+            pixels: vec![RED; 9],
+            mask,
+        })
+        .await
+        .unwrap();
+    point_at(&h.session, 10, 10).await;
+    pixel_becomes(&h.session, 9, 9, RED).await;
+    assert_eq!(
+        h.session.framebuffer().read().pixel(10, 10),
+        Some(GREY),
+        "masked out"
+    );
+
+    point_at(&h.session, 30, 30).await;
+    pixel_becomes(&h.session, 29, 29, RED).await;
+    assert_eq!(
+        h.session.framebuffer().read().pixel(9, 9),
+        Some(GREY),
+        "put back"
+    );
+
+    // An update under the pointer is drawn under it, and is what moving it
+    // reveals.
+    h.updates
+        .send(MockUpdate::Fill {
+            rect: Rect {
+                x: 28,
+                y: 28,
+                width: 8,
+                height: 8,
+            },
+            colour: BLUE,
+        })
+        .await
+        .unwrap();
+    pixel_becomes(&h.session, 34, 34, BLUE).await;
+    assert_eq!(h.session.framebuffer().read().pixel(29, 29), Some(RED));
+    point_at(&h.session, 50, 50).await;
+    pixel_becomes(&h.session, 29, 29, BLUE).await;
+
+    // A 0 x 0 shape hides it.
+    h.updates
+        .send(MockUpdate::Cursor {
+            hot_x: 0,
+            hot_y: 0,
+            width: 0,
+            height: 0,
+            pixels: vec![],
+            mask: vec![],
+        })
+        .await
+        .unwrap();
+    pixel_becomes(&h.session, 49, 49, GREY).await;
+}

@@ -14,6 +14,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::auth::{vnc_auth_response, VncSecurity};
+use crate::cursor::Pointer;
 use crate::handshake::{self, RfbTransport};
 use crate::input::InputState;
 use crate::pixel::PixelFormat;
@@ -243,6 +244,7 @@ where
         events.clone(),
         outgoing.clone(),
     );
+    let pointer = update_loop.pointer();
     {
         let dimensions = dimensions.clone();
         let qemu = qemu_extended_key.clone();
@@ -303,6 +305,7 @@ where
         extended_desktop_size,
         heard,
         connected,
+        pointer,
         tasks,
     })
 }
@@ -328,6 +331,8 @@ pub struct VncSession {
     /// handshake.
     heard: watch::Receiver<bool>,
     connected: Arc<AtomicBool>,
+    /// Drawn where the client's pointer is; see `crate::cursor`.
+    pointer: Arc<Mutex<Pointer>>,
     /// The writer and the update loop. The loop holds a sender to the writer,
     /// so neither ends on its own, and between them they hold the socket:
     /// aborting them, on `close` or drop, is what closes the connection.
@@ -397,13 +402,29 @@ impl Session for VncSession {
         if !self.connected.load(Ordering::Relaxed) {
             return Err(BackendError::Disconnected);
         }
-        let messages = {
+        let (messages, moved_to) = {
             let mut state = self.input.lock().expect("input lock");
             let (w, h) = self.dimensions();
             state.resize(w, h);
             state.qemu_extended_key = self.qemu_extended_key.load(Ordering::Relaxed);
-            state.encode(&event)
+            let messages = state.encode(&event);
+            let moved = matches!(
+                event,
+                InputEvent::PointerAbsolute { .. } | InputEvent::PointerRelative { .. }
+            );
+            (messages, moved.then(|| state.position()))
         };
+        if let Some((x, y)) = moved_to {
+            // The server will not redraw for a move it is not drawing; the
+            // pointer is ours to repaint.
+            let changed = {
+                let mut pointer = self.pointer.lock().expect("pointer lock");
+                pointer.move_to(&mut self.fb.write(), x, y)
+            };
+            if let Some(rect) = changed {
+                let _ = self.events.send(BackendEvent::Damage(rect));
+            }
+        }
         for message in messages {
             self.outgoing
                 .send(message)
