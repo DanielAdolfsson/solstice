@@ -130,8 +130,14 @@ pub fn percent_decode(s: &str) -> String {
 /// A response to write back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HttpResponse {
-    /// Status code.
+    /// The HTTP status. 200 for anything a handler answered, whatever the
+    /// outcome, as Sunshine does: moonlight-qt's HTTP layer turns any other
+    /// status into a bare Qt error number before the XML is read, so the
+    /// client would show "203" where the host said "No such app".
     pub status: u16,
+    /// The outcome: the body's `status_code`, which is what a client acts on.
+    /// The same as `status` for a response with no XML.
+    pub outcome: u16,
     /// Content type.
     pub content_type: &'static str,
     /// Body.
@@ -143,6 +149,7 @@ impl HttpResponse {
     pub fn xml(body: String) -> Self {
         Self {
             status: 200,
+            outcome: 200,
             content_type: "application/xml",
             body: body.into_bytes(),
         }
@@ -152,6 +159,7 @@ impl HttpResponse {
     pub fn status(status: u16) -> Self {
         Self {
             status,
+            outcome: status,
             content_type: "text/plain",
             body: Vec::new(),
         }

@@ -781,9 +781,15 @@ inspection rather than by a bug:
   pointer and played audio (§2.8). Its HTTP layer and certificate pinning
   are exercised now, and it found what the probe could not -- pairing that
   holds `getservercert` for the PIN, `/unpair` on a wrong PIN, frame pacing,
-  the VK byte -- each fixed with a test. That session is not repeatable in
-  CI; it is the manual tier (`docs/testing.md` §8). Android, iOS and tvOS
-  have not connected.
+  the VK byte -- each fixed with a test. A second session the same day, on
+  the LAN, found that every refusal reached it as a Qt error number: the
+  host sent its outcome as the HTTP status, and moonlight-qt's HTTP layer
+  fails on anything but 200 before it reads the XML, so "No such app" showed
+  as "203" (`QNetworkReply::ContentNotFoundError`) and "Not paired" never
+  read as unpaired. Sunshine answers HTTP 200 with the outcome in
+  `status_code`, and so does this host now; only a missing resource is an
+  HTTP 404. That session is not repeatable in CI; it is the manual tier
+  (`docs/testing.md` §8). Android, iOS and tvOS have not connected.
 - **Only the encrypted paths.** The probe asks for `ENCFLG_ALL`, so the
   plaintext RTSP and unencrypted video paths still have only our own client.
 - **Only H.264 at one geometry**, and only against the colour-bar backend.
