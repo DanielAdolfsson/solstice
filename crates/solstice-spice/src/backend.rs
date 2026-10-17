@@ -102,6 +102,18 @@ pub struct SpiceConfig {
     /// server's own `image-compression=` in force, which is what `spice-gtk`
     /// does by default; a preference replaces it outright.
     pub preferred_compression: Option<u8>,
+    /// Whether to let the server send video streams.
+    ///
+    /// Off by default. A stream is the server deciding part of the screen is
+    /// video and sending it as MJPEG, on its own clock and at its own quality.
+    /// Solstice decodes it only to re-encode the whole screen as H.264, so a
+    /// stream is a second lossy generation and an MJPEG encode and decode
+    /// for nothing; with streams off the same pixels arrive losslessly as
+    /// draw commands. Behind a non-QXL card it is worse than that: QEMU's
+    /// 32-pixel strips each become their own stream, paced independently,
+    /// and the columns of one video show different moments of it
+    /// (`docs/roadmap.md` §9).
+    pub video_streams: bool,
 }
 
 impl Default for SpiceConfig {
@@ -119,6 +131,7 @@ impl Default for SpiceConfig {
             limits: DisplayLimits::default(),
             audio: true,
             preferred_compression: None,
+            video_streams: false,
         }
     }
 }
@@ -215,11 +228,23 @@ fn tls_client_config(ca_file: Option<&PathBuf>) -> Result<rustls::ClientConfig> 
 }
 
 /// The capability set each channel type links with.
-fn channel_caps(kind: u8) -> Caps {
+fn channel_caps(kind: u8, video_streams: bool) -> Caps {
     match kind {
         channel_type::MAIN => {
             Caps::from_bits(&[main_cap::NAME_AND_UUID, main_cap::AGENT_CONNECTED_TOKENS])
         }
+        // `MULTI_CODEC` stays when streams are off: it is what makes the
+        // codec list authoritative. A client without it is assumed to take
+        // MJPEG regardless, so leaving it out would turn streams back on.
+        // With it and no codec, `spice-server` finds no encoder for this
+        // client and sends the region as draw commands instead.
+        channel_type::DISPLAY if !video_streams => Caps::from_bits(&[
+            display_cap::MONITORS_CONFIG,
+            display_cap::A8_SURFACE,
+            display_cap::LZ4_COMPRESSION,
+            display_cap::PREF_COMPRESSION,
+            display_cap::MULTI_CODEC,
+        ]),
         channel_type::DISPLAY => Caps::from_bits(&[
             display_cap::SIZED_STREAM,
             display_cap::MONITORS_CONFIG,
@@ -249,9 +274,11 @@ async fn link_channel(
     connection_id: u32,
     kind: u8,
     id: u8,
+    video_streams: bool,
 ) -> Result<(Box<dyn Transport>, bool)> {
     let mut stream = dialer.dial().await?;
-    let request = LinkRequest::new(connection_id, kind, id).with_channel_caps(channel_caps(kind));
+    let request = LinkRequest::new(connection_id, kind, id)
+        .with_channel_caps(channel_caps(kind, video_streams));
     let reply = link::exchange(&mut stream, &request).await?;
 
     if reply.error == link::LINK_ERR_NEED_SECURED {
@@ -394,8 +421,15 @@ pub async fn connect(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<Spi
 async fn connect_inner(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<SpiceSession> {
     // Dropped on any early return below, which closes what has linked so far.
     let tasks = Tasks::default();
-    let (stream, mini) =
-        link_channel(dialer.as_ref(), &config.security, 0, channel_type::MAIN, 0).await?;
+    let (stream, mini) = link_channel(
+        dialer.as_ref(),
+        &config.security,
+        0,
+        channel_type::MAIN,
+        0,
+        config.video_streams,
+    )
+    .await?;
     let (main_reader, main_writer) = tokio::io::split(stream);
     let (main_out, main_out_rx) = mpsc::channel::<OutMessage>(256);
     tasks.spawn(channel::writer_task(main_writer, mini, main_out_rx));
@@ -449,6 +483,7 @@ async fn connect_inner(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<S
             connection_id,
             channel_type::DISPLAY,
             0,
+            config.video_streams,
         )
         .await?;
         let (rx, tx) = tokio::io::split(stream);
@@ -459,7 +494,8 @@ async fn connect_inner(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<S
             display_out.clone(),
             config.limits,
         )
-        .with_preferred_compression(config.preferred_compression);
+        .with_preferred_compression(config.preferred_compression)
+        .with_video_streams(config.video_streams);
         dimensions = display.dimensions_handle();
         counts = display.counts_handle();
         tasks.spawn(display::reader_task(
@@ -484,6 +520,7 @@ async fn connect_inner(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<S
             connection_id,
             channel_type::CURSOR,
             0,
+            config.video_streams,
         )
         .await?;
         let (rx, tx) = tokio::io::split(stream);
@@ -514,6 +551,7 @@ async fn connect_inner(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<S
             connection_id,
             channel_type::INPUTS,
             0,
+            config.video_streams,
         )
         .await?;
         let (rx, tx) = tokio::io::split(stream);
@@ -538,6 +576,7 @@ async fn connect_inner(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<S
             connection_id,
             channel_type::PLAYBACK,
             0,
+            config.video_streams,
         )
         .await?;
         let (rx, tx) = tokio::io::split(stream);
@@ -1127,7 +1166,7 @@ mod tests {
 
     #[test]
     fn the_display_channel_does_not_advertise_capabilities_it_cannot_execute() {
-        let caps = channel_caps(channel_type::DISPLAY);
+        let caps = channel_caps(channel_type::DISPLAY, true);
         assert!(!caps.has(display_cap::GL_SCANOUT));
         assert!(!caps.has(display_cap::GL_SCANOUT2));
         assert!(!caps.has(display_cap::COMPOSITE));
@@ -1136,8 +1175,28 @@ mod tests {
     }
 
     #[test]
+    fn without_video_streams_no_codec_is_advertised_but_multi_codec_is() {
+        let caps = channel_caps(channel_type::DISPLAY, false);
+        // Without MULTI_CODEC the server assumes MJPEG, and streams anyway.
+        assert!(caps.has(display_cap::MULTI_CODEC));
+        for codec in [
+            display_cap::CODEC_MJPEG,
+            display_cap::CODEC_VP8,
+            display_cap::CODEC_H264,
+            display_cap::CODEC_VP9,
+            display_cap::CODEC_H265,
+            display_cap::PREF_VIDEO_CODEC_TYPE,
+            display_cap::STREAM_REPORT,
+            display_cap::SIZED_STREAM,
+        ] {
+            assert!(!caps.has(codec), "capability {codec}");
+        }
+        assert!(!SpiceConfig::default().video_streams, "off by default");
+    }
+
+    #[test]
     fn only_mjpeg_is_advertised_among_the_video_codecs() {
-        let caps = channel_caps(channel_type::DISPLAY);
+        let caps = channel_caps(channel_type::DISPLAY, true);
         assert!(!caps.has(display_cap::CODEC_VP8));
         assert!(!caps.has(display_cap::CODEC_H264));
         assert!(!caps.has(display_cap::CODEC_VP9));
@@ -1146,8 +1205,8 @@ mod tests {
 
     #[test]
     fn the_playback_channel_asks_for_opus_which_is_what_gamestream_carries() {
-        assert!(channel_caps(channel_type::PLAYBACK).has(playback_cap::OPUS));
-        assert!(!channel_caps(channel_type::PLAYBACK).has(playback_cap::CELT_0_5_1));
+        assert!(channel_caps(channel_type::PLAYBACK, false).has(playback_cap::OPUS));
+        assert!(!channel_caps(channel_type::PLAYBACK, false).has(playback_cap::CELT_0_5_1));
     }
 
     #[tokio::test]

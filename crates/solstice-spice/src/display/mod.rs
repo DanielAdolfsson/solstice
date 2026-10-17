@@ -220,6 +220,11 @@ pub struct DisplayChannel {
     /// nothing and a server that never sends it is handled by treating the
     /// first draw as the mark.
     marked: bool,
+    /// Whether video streams were asked for. A server that opens one anyway
+    /// is still decoded -- a stream is correct pixels, just badly paced --
+    /// and warned about once.
+    video_streams: bool,
+    warned_unasked_stream: bool,
 }
 
 impl DisplayChannel {
@@ -246,6 +251,8 @@ impl DisplayChannel {
             drawn_cursor: None,
             dimensions: Arc::new(AtomicU64::new(0)),
             marked: false,
+            video_streams: false,
+            warned_unasked_stream: false,
         }
     }
 
@@ -262,6 +269,14 @@ impl DisplayChannel {
     /// configuration alone. `None`, the default, sends no preference.
     pub fn with_preferred_compression(mut self, preferred: Option<u8>) -> Self {
         self.preferred_compression = preferred;
+        self
+    }
+
+    /// Whether to ask for video streams; see
+    /// [`crate::SpiceConfig::video_streams`]. Off, no codec preference is
+    /// sent: the capabilities already say there is no codec.
+    pub fn with_video_streams(mut self, video_streams: bool) -> Self {
+        self.video_streams = video_streams;
         self
     }
 
@@ -304,12 +319,14 @@ impl DisplayChannel {
         // MJPEG is the only stream codec with a pure-Rust decoder in the
         // tree, and the frames are re-encoded immediately anyway; see
         // `stream.rs` for why that is the right trade rather than a gap.
-        let mut codecs = Writer::new();
-        codecs.u8(1).u8(video_codec::MJPEG);
-        out.push(OutMessage::new(
-            display_msgc::PREFERRED_VIDEO_CODEC_TYPE,
-            codecs.finish(),
-        ));
+        if self.video_streams {
+            let mut codecs = Writer::new();
+            codecs.u8(1).u8(video_codec::MJPEG);
+            out.push(OutMessage::new(
+                display_msgc::PREFERRED_VIDEO_CODEC_TYPE,
+                codecs.finish(),
+            ));
+        }
 
         out
     }
@@ -414,6 +431,13 @@ impl DisplayChannel {
 
             display_msg::STREAM_CREATE => {
                 let (id, stream) = self.streams.create(body)?;
+                if !self.video_streams && !self.warned_unasked_stream {
+                    self.warned_unasked_stream = true;
+                    tracing::warn!(
+                        "the spice server opened a video stream this client did not ask \
+                         for; decoding it anyway"
+                    );
+                }
                 tracing::debug!(
                     id,
                     codec = stream.codec,
@@ -680,6 +704,13 @@ impl DisplayChannel {
         // scratch space the guest blits from, and their damage reaches the
         // screen as a later draw command.
         if self.surfaces.primary_id() == Some(surface_id) {
+            tracing::trace!(
+                left = rect.left,
+                top = rect.top,
+                width = rect.right - rect.left,
+                height = rect.bottom - rect.top,
+                "spice draw on the primary"
+            );
             self.pending = self.pending.union(&rect);
         }
     }
@@ -696,19 +727,20 @@ impl DisplayChannel {
     }
 
     /// Copy the damaged region of the primary surface into the framebuffer,
-    /// draw the cursor over it, and tell the bridge.
-    pub fn publish(&mut self) {
+    /// draw the cursor over it, and tell the bridge. What was published, if
+    /// anything.
+    pub fn publish(&mut self) -> Option<solstice_backend::Rect> {
         if !self.marked || self.pending.is_empty() {
-            return;
+            return None;
         }
         let Some(primary) = self.surfaces.primary() else {
             self.pending = SpiceRect::default();
-            return;
+            return None;
         };
         let (width, height) = (primary.width(), primary.height());
         let Some(rect) = self.pending.clamp_to(width, height) else {
             self.pending = SpiceRect::default();
-            return;
+            return None;
         };
 
         {
@@ -718,7 +750,7 @@ impl DisplayChannel {
                 // happen between a resize and its first publish. Dropping
                 // this one is correct: the next carries the whole surface.
                 self.pending = SpiceRect::default();
-                return;
+                return None;
             }
             let stride = fb.stride();
             let row_bytes = rect.width as usize * 4;
@@ -745,6 +777,7 @@ impl DisplayChannel {
         self.drawn_cursor = self.cursor.bounds();
         self.pending = SpiceRect::default();
         let _ = self.events.send(BackendEvent::Damage(rect));
+        Some(rect)
     }
 
     /// Tell the bridge the display is gone.
@@ -830,6 +863,11 @@ pub async fn reader_task<R>(
     loop {
         match reader.next().await {
             Ok(Some(message)) => {
+                tracing::trace!(
+                    kind = message.kind,
+                    len = message.body.len(),
+                    "spice display message read"
+                );
                 if events.send(DisplayEvent::Message(message)).await.is_err() {
                     break;
                 }
@@ -879,6 +917,85 @@ pub async fn cursor_task<R>(
 /// server costs batching, never frames.
 const MAX_BATCH: std::time::Duration = std::time::Duration::from_millis(8);
 
+/// What went into one publish, for the `debug` log that says whether frames
+/// are arriving whole.
+struct Batch {
+    started: std::time::Instant,
+    queued_at_start: usize,
+    messages: usize,
+    draws: usize,
+    stream_frames: usize,
+    cursor: usize,
+    bytes: usize,
+    busy: std::time::Duration,
+}
+
+impl Batch {
+    fn new(queued_at_start: usize) -> Self {
+        Batch {
+            started: std::time::Instant::now(),
+            queued_at_start,
+            messages: 0,
+            draws: 0,
+            stream_frames: 0,
+            cursor: 0,
+            bytes: 0,
+            busy: std::time::Duration::ZERO,
+        }
+    }
+
+    fn handle(&mut self, display: &mut DisplayChannel, event: DisplayEvent) -> Result<()> {
+        match &event {
+            DisplayEvent::Message(message) => {
+                self.messages += 1;
+                self.bytes += message.body.len();
+                if DRAW_KINDS.contains(&message.kind) {
+                    self.draws += 1;
+                } else if matches!(
+                    message.kind,
+                    display_msg::STREAM_DATA | display_msg::STREAM_DATA_SIZED
+                ) {
+                    self.stream_frames += 1;
+                }
+            }
+            DisplayEvent::Cursor(_) | DisplayEvent::CursorGone => self.cursor += 1,
+        }
+        let started = std::time::Instant::now();
+        let result = display.handle(event);
+        self.busy += started.elapsed();
+        result
+    }
+
+    fn log(
+        &self,
+        ended: &str,
+        published: Option<solstice_backend::Rect>,
+        since_last: std::time::Duration,
+        queued_at_end: usize,
+    ) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        let rect = published.map(|r| format!("{}x{}+{}+{}", r.width, r.height, r.x, r.y));
+        tracing::debug!(
+            ended,
+            span_ms = format!("{:.1}", ms(self.started.elapsed())),
+            busy_ms = format!("{:.1}", ms(self.busy)),
+            since_last_ms = format!("{:.1}", ms(since_last)),
+            messages = self.messages,
+            draws = self.draws,
+            stream_frames = self.stream_frames,
+            cursor = self.cursor,
+            kib = self.bytes / 1024,
+            queued_at_start = self.queued_at_start,
+            queued_at_end,
+            published = rect.as_deref().unwrap_or("nothing"),
+            "spice batch"
+        );
+    }
+}
+
 /// Own the surfaces and publish frames until the queue closes.
 pub async fn display_task(
     mut display: DisplayChannel,
@@ -891,8 +1008,10 @@ pub async fn display_task(
         }
     }
 
+    let mut last_publish = std::time::Instant::now();
     while let Some(event) = events.recv().await {
-        if let Err(e) = display.handle(event) {
+        let mut batch = Batch::new(events.len());
+        if let Err(e) = batch.handle(&mut display, event) {
             tracing::warn!(error = %e, "spice display error");
             display.disconnect();
             return;
@@ -902,25 +1021,31 @@ pub async fn display_task(
         // so long. A server drawing faster than this client rasterises keeps
         // the queue from ever going empty, and waiting for that published
         // nothing at all: the picture froze while decoding carried on.
-        let batch_started = std::time::Instant::now();
-        while batch_started.elapsed() < MAX_BATCH {
+        let ended = loop {
+            if batch.started.elapsed() >= MAX_BATCH {
+                break "limit";
+            }
             match events.try_recv() {
                 Ok(event) => {
-                    if let Err(e) = display.handle(event) {
+                    if let Err(e) = batch.handle(&mut display, event) {
                         tracing::warn!(error = %e, "spice display error");
                         display.disconnect();
                         return;
                     }
                 }
-                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Empty) => break "empty",
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     display.publish();
                     display.disconnect();
                     return;
                 }
             }
+        };
+        let published = display.publish();
+        batch.log(ended, published, last_publish.elapsed(), events.len());
+        if published.is_some() {
+            last_publish = std::time::Instant::now();
         }
-        display.publish();
     }
     // Every sender is gone, which means both channel readers ended.
     display.disconnect();
@@ -1028,6 +1153,7 @@ mod tests {
     #[test]
     fn the_init_messages_declare_the_cache_in_pixels_and_ask_for_mjpeg() {
         let (display, _, _) = channel();
+        let display = display.with_video_streams(true);
         let messages = display.init_messages();
         assert_eq!(messages[0].kind, display_msgc::INIT);
         let mut r = Reader::new(&messages[0].body);
@@ -1047,6 +1173,15 @@ mod tests {
             .find(|m| m.kind == display_msgc::PREFERRED_VIDEO_CODEC_TYPE)
             .unwrap();
         assert_eq!(codecs.body, vec![1, video_codec::MJPEG]);
+    }
+
+    #[test]
+    fn no_video_codec_is_preferred_when_streams_are_off() {
+        let (display, _, _) = channel();
+        assert!(!display
+            .init_messages()
+            .iter()
+            .any(|m| m.kind == display_msgc::PREFERRED_VIDEO_CODEC_TYPE));
     }
 
     #[test]
