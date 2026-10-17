@@ -246,6 +246,7 @@ pub struct PairingManager {
     locked_out: bool,
     generation: u64,
     paired: Option<PairedClient>,
+    client_gave_up: bool,
 }
 
 impl Default for PairingManager {
@@ -266,6 +267,7 @@ impl PairingManager {
             locked_out: false,
             generation: 0,
             paired: None,
+            client_gave_up: false,
         }
     }
 
@@ -281,6 +283,7 @@ impl PairingManager {
         self.locked_out = false;
         self.generation = self.generation.wrapping_add(1);
         self.paired = None;
+        self.client_gave_up = false;
         Ok(())
     }
 
@@ -298,6 +301,21 @@ impl PairingManager {
         self.pin = None;
         self.closes_at = None;
         self.session = None;
+    }
+
+    /// Close the window because the client abandoned its handshake.
+    ///
+    /// Moonlight checks the server's half of the PIN proof itself and, on a
+    /// mismatch, sends `/unpair` instead of the final step -- so this, not a
+    /// failure count, is what a wrong PIN looks like from here.
+    pub fn client_gave_up(&mut self) {
+        self.close();
+        self.client_gave_up = true;
+    }
+
+    /// Whether this window was closed by [`client_gave_up`](Self::client_gave_up).
+    pub fn did_client_give_up(&self) -> bool {
+        self.client_gave_up
     }
 
     /// Whether a window is currently open.

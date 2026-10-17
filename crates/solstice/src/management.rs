@@ -445,6 +445,7 @@ enum Outcome {
     Superseded,
     LockedOut(u32),
     Closed { ran_out: bool },
+    ClientGaveUp,
 }
 
 fn outcome(host: &Host, generation: u64, closes_at: Instant) -> Outcome {
@@ -463,6 +464,9 @@ fn outcome(host: &Host, generation: u64, closes_at: Instant) -> Outcome {
         return Outcome::Waiting {
             failures: mgr.failures(),
         };
+    }
+    if mgr.did_client_give_up() {
+        return Outcome::ClientGaveUp;
     }
     // Run out, or abandoned early by a malformed request. Either way the PIN
     // has no further use.
@@ -550,6 +554,12 @@ async fn pair(
             }
             Outcome::Closed { ran_out: true } => {
                 return send(w, "err", "the window closed before a client paired").await
+            }
+            Outcome::ClientGaveUp => {
+                let e = "the client gave up partway through -- most likely the PIN did \
+                         not match the one it shows; run `solstice pair` again with the \
+                         new PIN";
+                return send(w, "err", e).await;
             }
             Outcome::Closed { ran_out: false } => {
                 let e = "the window was abandoned after a malformed or out-of-order pairing \
