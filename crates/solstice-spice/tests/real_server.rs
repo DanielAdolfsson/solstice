@@ -394,7 +394,11 @@ async fn mjpeg_streams_are_decoded_and_composited_over_the_draw_output() {
     let mut damage = 0usize;
     let mut full_surface = 0usize;
     let mut clipped: Option<solstice_backend::Rect> = None;
-    while tokio::time::Instant::now() < deadline && damage < 50 {
+    // Until frames have arrived as well: the draws come first, and fifty of
+    // them can be done before the server's heuristic has opened a stream.
+    while tokio::time::Instant::now() < deadline
+        && (damage < 50 || session.stream_frame_count() < 10)
+    {
         if let Ok(Ok(BackendEvent::Damage(r))) =
             tokio::time::timeout(Duration::from_millis(500), events.recv()).await
         {
@@ -425,6 +429,15 @@ async fn mjpeg_streams_are_decoded_and_composited_over_the_draw_output() {
     assert!(
         covered.width < 640 && covered.height < 480,
         "the clipped updates still covered the whole screen ({covered:?})"
+    );
+    // `spice-server` sends a stream's Huffman tables in its first frame
+    // only, so a client that has decoded just that one has not been tested
+    // on what every later frame looks like.
+    let frames = session.stream_frame_count();
+    assert!(
+        frames >= 10,
+        "only {frames} stream frames decoded; a stream's frames after the \
+         first carry no Huffman tables"
     );
     session.close().await;
 }

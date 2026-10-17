@@ -126,7 +126,7 @@ const IMAGE_KINDS: [u8; 12] = [
 ];
 
 /// How many of each draw command the display channel has executed, and how
-/// many of each image encoding it has decoded.
+/// many of each image encoding and video-stream frames it has decoded.
 ///
 /// A test can make a guest *emit* `DRAW_STROKE`, but without this it cannot
 /// tell whether one arrived: a correct screen is equally consistent with the
@@ -142,6 +142,7 @@ const IMAGE_KINDS: [u8; 12] = [
 pub struct DisplayCounts {
     draws: [AtomicU64; DRAW_KINDS.len()],
     images: [AtomicU64; IMAGE_KINDS.len()],
+    stream_frames: AtomicU64,
 }
 
 impl DisplayCounts {
@@ -157,6 +158,10 @@ impl DisplayCounts {
         }
     }
 
+    fn record_stream_frame(&self) {
+        self.stream_frames.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// The draw commands executed at least once, keyed by `display_msg`
     /// number.
     pub fn draws(&self) -> BTreeMap<u16, u64> {
@@ -167,6 +172,11 @@ impl DisplayCounts {
     /// number.
     pub fn images(&self) -> BTreeMap<u8, u64> {
         snapshot(&IMAGE_KINDS, &self.images)
+    }
+
+    /// The video-stream frames decoded and composited.
+    pub fn stream_frames(&self) -> u64 {
+        self.stream_frames.load(Ordering::Relaxed)
     }
 }
 
@@ -582,7 +592,20 @@ impl DisplayChannel {
             return Ok(());
         };
         let max_pixels = (surface.width() as u64 * surface.height() as u64).max(1);
-        let decoded = stream::decode_mjpeg(frame.data, max_pixels)?;
+        let data = match self.streams.get_mut(frame.id) {
+            Some(stream) => stream.tables.complete(frame.data),
+            None => return Ok(()),
+        };
+        // A frame is framed by its message, so a bad one costs that frame
+        // and nothing else: the next one decodes on its own.
+        let decoded = match stream::decode_mjpeg(&data, max_pixels) {
+            Ok(decoded) => decoded,
+            Err(e) => {
+                tracing::warn!(id = frame.id, error = %e, "dropping a spice stream frame");
+                return Ok(());
+            }
+        };
+        self.counts.record_stream_frame();
         let src = SpiceRect {
             top: 0,
             left: 0,
@@ -1311,6 +1334,48 @@ mod tests {
             outgoing.try_recv().is_err(),
             "the server should be told once, not once a frame"
         );
+    }
+
+    /// What took a live session down: Firefox's video became an MJPEG
+    /// stream, its second frame had no Huffman tables, and the decode error
+    /// ended the display channel.
+    #[test]
+    fn mjpeg_frames_after_the_first_decode_and_a_bad_one_costs_only_itself() {
+        let (mut display, _, _) = channel();
+        let counts = display.counts_handle();
+        display
+            .handle(DisplayEvent::Message(surface_create(0, 64, 64, true)))
+            .unwrap();
+
+        let mut w = Writer::new();
+        w.u32(0).u32(1).u8(0).u8(video_codec::MJPEG).u64(0);
+        w.u32(8).u32(8).u32(8).u32(8);
+        w.i32(0).i32(0).i32(8).i32(8);
+        w.u8(clip_type::NONE);
+        display
+            .handle(DisplayEvent::Message(Message {
+                kind: display_msg::STREAM_CREATE,
+                body: w.finish(),
+            }))
+            .unwrap();
+
+        let frame = |jpeg: &[u8]| {
+            let mut w = Writer::new();
+            w.u32(1).u32(0).u32(jpeg.len() as u32).bytes(jpeg);
+            DisplayEvent::Message(Message {
+                kind: display_msg::STREAM_DATA,
+                body: w.finish(),
+            })
+        };
+        display.handle(frame(&stream::test_jpeg(true))).unwrap();
+        display.handle(frame(&stream::test_jpeg(false))).unwrap();
+        display.handle(frame(&stream::test_jpeg(false))).unwrap();
+        assert_eq!(counts.stream_frames(), 3);
+
+        display.handle(frame(b"\xFF\xD8 not really")).unwrap();
+        assert_eq!(counts.stream_frames(), 3, "a bad frame is not counted");
+        display.handle(frame(&stream::test_jpeg(false))).unwrap();
+        assert_eq!(counts.stream_frames(), 4, "and the stream carries on");
     }
 
     #[test]

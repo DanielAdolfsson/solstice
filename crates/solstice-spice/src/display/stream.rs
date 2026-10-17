@@ -31,6 +31,7 @@
 //! could not decode" (`spice.proto:1011-1017`), and `spice-server` responds
 //! by dropping the stream and going back to draw commands.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::display::image::DecodedImage;
@@ -61,6 +62,8 @@ pub struct Stream {
     /// Whether this client has already told the server it cannot decode the
     /// stream, so it is told once rather than once a frame.
     pub refused: bool,
+    /// The tables its frames leave out after the first.
+    pub tables: JpegTables,
 }
 
 impl Stream {
@@ -117,6 +120,7 @@ impl StreamSet {
             clip,
             report_id: None,
             refused: false,
+            tables: JpegTables::default(),
         };
         self.streams.insert(id, stream.clone());
         Ok((id, stream))
@@ -216,11 +220,112 @@ pub fn parse_data_sized(body: &[u8]) -> Result<StreamFrame<'_>> {
     })
 }
 
+/// The tables an MJPEG stream sends once and then leaves out.
+///
+/// `spice-server` compresses every frame of a stream with one libjpeg
+/// object and calls `jpeg_start_compress(&cinfo, encoder->first_frame)`
+/// (`server/mjpeg-encoder.c:817` in 0.15.2), so only the first frame carries
+/// its Huffman tables. Every later one is an abbreviated datastream with no
+/// `DHT`, which decodes only because `spice-gtk` keeps one libjpeg
+/// decompressor per stream and libjpeg keeps the tables it last read. A
+/// decoder built fresh per frame fails on the second one with "no DC table".
+///
+/// This is that memory: the `DHT` and `DQT` segments of the last frame that
+/// had them, spliced back into a frame that does not. `DQT` is kept on the
+/// same terms although `spice-server` rewrites it every frame, because
+/// libjpeg would let it leave that out as well.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JpegTables {
+    huffman: Vec<u8>,
+    quantization: Vec<u8>,
+}
+
+impl JpegTables {
+    /// Remember the tables `frame` carries and fill in the ones it lacks,
+    /// returning the bytes to decode.
+    ///
+    /// A frame whose headers do not parse is handed back untouched, for the
+    /// decoder to reject with a better message than this could give.
+    pub fn complete<'a>(&mut self, frame: &'a [u8]) -> Cow<'a, [u8]> {
+        let Some((huffman, quantization)) = table_segments(frame) else {
+            return Cow::Borrowed(frame);
+        };
+        let missing_huffman = huffman.is_empty() && !self.huffman.is_empty();
+        let missing_quantization = quantization.is_empty() && !self.quantization.is_empty();
+        if !huffman.is_empty() {
+            self.huffman = huffman;
+        }
+        if !quantization.is_empty() {
+            self.quantization = quantization;
+        }
+        if !missing_huffman && !missing_quantization {
+            return Cow::Borrowed(frame);
+        }
+
+        // Tables may sit anywhere before the scan, so straight after SOI is
+        // as good a place as any.
+        let mut completed =
+            Vec::with_capacity(frame.len() + self.huffman.len() + self.quantization.len());
+        completed.extend_from_slice(&frame[..2]);
+        if missing_quantization {
+            completed.extend_from_slice(&self.quantization);
+        }
+        if missing_huffman {
+            completed.extend_from_slice(&self.huffman);
+        }
+        completed.extend_from_slice(&frame[2..]);
+        Cow::Owned(completed)
+    }
+}
+
+/// The `DHT` and `DQT` segments before a JPEG's first scan, each run
+/// concatenated, or `None` if the headers do not parse.
+fn table_segments(jpeg: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    const SOI: u8 = 0xD8;
+    const SOS: u8 = 0xDA;
+    const DHT: u8 = 0xC4;
+    const DQT: u8 = 0xDB;
+
+    if jpeg.get(..2)? != [0xFF, SOI] {
+        return None;
+    }
+    let mut huffman = Vec::new();
+    let mut quantization = Vec::new();
+    let mut at = 2;
+    loop {
+        if *jpeg.get(at)? != 0xFF {
+            return None;
+        }
+        // Any number of 0xFF fill bytes may precede a marker (T.81 B.1.1.2).
+        while *jpeg.get(at + 1)? == 0xFF {
+            at += 1;
+        }
+        let marker = jpeg[at + 1];
+        match marker {
+            SOS => return Some((huffman, quantization)),
+            // Markers with no length: TEM and the restart markers.
+            0x01 | 0xD0..=0xD7 => at += 2,
+            _ => {
+                let len = u16::from_be_bytes([*jpeg.get(at + 2)?, *jpeg.get(at + 3)?]) as usize;
+                if len < 2 {
+                    return None;
+                }
+                let segment = jpeg.get(at..at + 2 + len)?;
+                match marker {
+                    DHT => huffman.extend_from_slice(segment),
+                    DQT => quantization.extend_from_slice(segment),
+                    _ => {}
+                }
+                at += 2 + len;
+            }
+        }
+    }
+}
+
 /// Decode one MJPEG frame.
 ///
-/// An MJPEG stream is a run of complete JPEG images, so each frame decodes on
-/// its own with no inter-frame state -- which is the other reason it is the
-/// codec worth supporting in a bridge that re-encodes everything anyway.
+/// Each frame is a JPEG image, but not necessarily a complete one: run it
+/// through the stream's [`JpegTables`] first.
 pub fn decode_mjpeg(data: &[u8], max_pixels: u64) -> Result<DecodedImage> {
     crate::display::image::decode_jpeg_frame(data, max_pixels)
 }
@@ -252,6 +357,43 @@ pub fn stream_report(
 /// The report that says "this client cannot decode this stream".
 pub fn unsupported_report(stream_id: u32, unique_id: u32, mm_time: u32) -> Vec<u8> {
     stream_report(stream_id, unique_id, mm_time, mm_time, 0, 0xFFFF_FFFF)
+}
+
+/// A baseline 8x8 YCbCr JPEG of flat mid-grey, written out by hand,
+/// with its Huffman tables or without them -- the second is what every
+/// `spice-server` stream frame after the first looks like.
+///
+/// The tables are one code each, for "DC difference 0" and "end of block",
+/// which is deliberately not the T.81 Annex K set: a decoder that falls back
+/// to the standard tables cannot decode this, so a passing test means the
+/// tables really were carried over.
+#[cfg(test)]
+pub(crate) fn test_jpeg(with_huffman: bool) -> Vec<u8> {
+    let mut j = vec![0xFF, 0xD8];
+    // DQT: table 0, all ones.
+    j.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43, 0x00]);
+    j.extend_from_slice(&[1; 64]);
+    // SOF0: 8-bit, 8x8, three components, all 1x1 sampling on table 0.
+    j.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 8, 0, 8, 0, 8, 3]);
+    for id in 1..=3 {
+        j.extend_from_slice(&[id, 0x11, 0]);
+    }
+    if with_huffman {
+        // DHT: DC table 0 and AC table 0, each one 1-bit code for symbol 0.
+        for class in [0x00, 0x10] {
+            j.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x14, class, 1]);
+            j.extend_from_slice(&[0; 15]);
+            j.push(0);
+        }
+    }
+    // SOS: all three components on tables 0/0, spectral 0..63.
+    j.extend_from_slice(&[
+        0xFF, 0xDA, 0x00, 0x0C, 3, 1, 0x00, 2, 0x00, 3, 0x00, 0, 63, 0,
+    ]);
+    // Per block, DC "0" and AC "0" (end of block); then 1-padding.
+    j.push(0b0000_0011);
+    j.extend_from_slice(&[0xFF, 0xD9]);
+    j
 }
 
 #[cfg(test)]
@@ -374,5 +516,84 @@ mod tests {
         assert!(streams.get(0).unwrap().clip.rects.is_some());
         streams.destroy(0);
         assert!(streams.get(0).is_none());
+    }
+
+    #[test]
+    fn the_hand_built_jpeg_decodes_to_flat_grey() {
+        let image = decode_mjpeg(&test_jpeg(true), 64).unwrap();
+        assert_eq!((image.width, image.height), (8, 8));
+        assert!(image
+            .data
+            .chunks_exact(4)
+            .all(|p| p[..3] == [128, 128, 128]));
+    }
+
+    #[test]
+    fn a_frame_without_huffman_tables_does_not_decode_on_its_own() {
+        // The bug: what a fresh decoder per frame made of every frame after
+        // a stream's first.
+        assert!(decode_mjpeg(&test_jpeg(false), 64).is_err());
+        let mut tables = JpegTables::default();
+        assert!(matches!(
+            tables.complete(&test_jpeg(false)),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn a_frame_without_huffman_tables_borrows_the_last_frames() {
+        let mut tables = JpegTables::default();
+        let full = test_jpeg(true);
+        assert!(matches!(tables.complete(&full), Cow::Borrowed(_)));
+
+        let abbreviated = test_jpeg(false);
+        let completed = tables.complete(&abbreviated);
+        assert!(matches!(completed, Cow::Owned(_)));
+        assert_eq!(
+            decode_mjpeg(&completed, 64).unwrap(),
+            decode_mjpeg(&full, 64).unwrap()
+        );
+        // And on the frame after that, too: the memory is not used up.
+        assert!(decode_mjpeg(&tables.complete(&abbreviated), 64).is_ok());
+    }
+
+    #[test]
+    fn a_frame_without_quantization_tables_borrows_them_too() {
+        let mut tables = JpegTables::default();
+        tables.complete(&test_jpeg(true));
+        let mut bare = test_jpeg(false);
+        bare.drain(2..2 + 4 + 65);
+        assert!(decode_mjpeg(&bare, 64).is_err());
+        assert!(decode_mjpeg(&tables.complete(&bare), 64).is_ok());
+    }
+
+    #[test]
+    fn tables_a_frame_carries_replace_the_remembered_ones() {
+        let mut tables = JpegTables::default();
+        let mut other = test_jpeg(true);
+        // The same tables but for symbol 1, which would misdecode the scan.
+        let at = other.windows(2).position(|w| w == [0xFF, 0xC4]).unwrap();
+        other[at + 2 + 2 + 1 + 16] = 1;
+        tables.complete(&other);
+        tables.complete(&test_jpeg(true));
+        assert_eq!(
+            decode_mjpeg(&tables.complete(&test_jpeg(false)), 64).unwrap(),
+            decode_mjpeg(&test_jpeg(true), 64).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_frame_whose_headers_do_not_parse_is_passed_through() {
+        let mut tables = JpegTables::default();
+        tables.complete(&test_jpeg(true));
+        for junk in [
+            &b""[..],
+            b"\xFF",
+            b"\xFF\xD8",
+            b"\xFF\xD8\xFF\xC4\x00\x40",
+            b"not a jpeg",
+        ] {
+            assert!(matches!(tables.complete(junk), Cow::Borrowed(b) if b == junk));
+        }
     }
 }
