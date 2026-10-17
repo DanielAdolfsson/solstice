@@ -1283,6 +1283,29 @@ against. The findings are about the old arrangement:
 
 ## 8. Smaller items
 
+- **A cursor for the VNC backend.** Moonlight draws no host cursor, and the
+  RFB backend neither asks for the Cursor pseudo-encoding (-239) nor draws one,
+  so a VNC desktop streams with no pointer at all. The SPICE backend already
+  composites one (`crates/solstice-spice/src/cursor.rs`); RFB needs the same,
+  drawn at the position Moonlight last sent.
+- **The letterbox scaler is nearest-neighbour.** `convert_scaled` takes one
+  source pixel per output pixel, which drops a third of the rows of a 1080p
+  desktop streamed at 720p -- text loses strokes. It is also slow: a
+  4K-to-1080p conversion plus the encode overran the 16.7 ms budget at 60 fps.
+  Only reached when the backend will not resize, which both backends now
+  normally do; an area-averaging downscale is the fix.
+- **A backend session outlives its stream.** When a stream ends the SPICE
+  connection to the guest stays open until the next session's connect
+  displaces it. `close()` marks the session closed but leaves the channel
+  sockets open. The RFB backend has not been checked for the same.
+- **`/resume` ignores the new `rikey`.** Moonlight sends fresh keys on resume;
+  the handler returns the launch's old ones. Only reachable between `/launch`
+  and the stream starting, since a stream's end removes its session -- but a
+  resume that did reach it would stream nothing the client could decrypt.
+- **"damage events lagged" floods the log** -- one warning per frame whenever
+  the encoder falls behind the backend, 5958 in one run at 1080p120. Count
+  and report it, or log it at debug.
+
 - **Fuzzing: seeded and scripted, not scheduled.** Five targets now start
   from real traffic. `tests/tools/gen_fuzz_seeds.py` cuts
   `fuzz/seeds/<target>/` out of the captured session (§4): the RTSP requests,
