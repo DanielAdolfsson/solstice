@@ -774,10 +774,14 @@ inspection rather than by a bug:
 
 ### What is still not covered
 
-- **No third-party Moonlight *application* has connected.** The probe is the
-  shared protocol core, which is the part that matters, but moonlight-qt's
-  own HTTP layer, its certificate handling and its platform decoders are not
-  exercised. That is the manual tier (`docs/testing.md` §8).
+- **moonlight-qt has connected, by hand, once.** 2026-10-17, the Flatpak
+  build over a 220 ms link: it paired, streamed at 1080p60, typed, moved the
+  pointer and played audio (§2.8). Its HTTP layer and certificate pinning
+  are exercised now, and it found what the probe could not -- pairing that
+  holds `getservercert` for the PIN, `/unpair` on a wrong PIN, frame pacing,
+  the VK byte -- each fixed with a test. That session is not repeatable in
+  CI; it is the manual tier (`docs/testing.md` §8). Android, iOS and tvOS
+  have not connected.
 - **Only the encrypted paths.** The probe asks for `ENCFLG_ALL`, so the
   plaintext RTSP and unencrypted video paths still have only our own client.
 - **Only H.264 at one geometry**, and only against the colour-bar backend.
@@ -1149,11 +1153,11 @@ That includes the half-second tail. In steady state the 1080p figure is 5 ×
 
 ### What is left
 
-- **No Moonlight *application* has seen a slowed stream.** The probe is the
-  protocol core. moonlight-qt's frame pacer and the platform decoders above it
-  are the layers that could plausibly mind a 5 fps idle stream, and none has
-  been tried (the manual tier, `docs/testing.md` §8). If one does mind, raise
-  `idle_fps`. Do not remove the back-off.
+- **No Moonlight *application* is known to have sat through a slowed
+  stream.** moonlight-qt has streamed from this host (§3), but nothing
+  recorded whether its frame pacer and decoder saw the idle back-off, and
+  those are the layers that could plausibly mind a 5 fps idle stream. If one
+  does mind, raise `idle_fps`. Do not remove the back-off.
 - **A changed frame still costs a whole-frame analysis.** Typing one character
   at 1080p is a full encode of a frame that is 99.9% unchanged. Encoder-side
   region-of-interest or skip hints would be the next lever. OpenH264 exposes
@@ -1265,8 +1269,9 @@ against. The findings are about the old arrangement:
 
 ### What is left
 
-- **No moonlight-qt.** The same limit as §3: the probe is the shared protocol
-  core, and an application has not connected.
+- **moonlight-qt, once, by hand.** Its control stream ran through this host
+  over a 220 ms link (§3): input arrived and the session ended cleanly. Not
+  under loss, and not repeatable in CI.
 - **A fragmenting client would be cut off.** Not a real client today, by the
   256-byte buffer above. If Moonlight ever builds a larger control message,
   the client retransmits it unacknowledged until it times out. The `fragments`
@@ -1298,18 +1303,6 @@ against. The findings are about the old arrangement:
   4K-to-1080p conversion plus the encode overran the 16.7 ms budget at 60 fps.
   Only reached when the backend will not resize, which both backends now
   normally do; an area-averaging downscale is the fix.
-- **A backend session outlives its stream.** When a stream ends the SPICE
-  connection to the guest stays open until the next session's connect
-  displaces it. `close()` marks the session closed but leaves the channel
-  sockets open. The RFB backend has not been checked for the same.
-- **`/resume` ignores the new `rikey`.** Moonlight sends fresh keys on resume;
-  the handler returns the launch's old ones. Only reachable between `/launch`
-  and the stream starting, since a stream's end removes its session -- but a
-  resume that did reach it would stream nothing the client could decrypt.
-- **"damage events lagged" floods the log** -- one warning per frame whenever
-  the encoder falls behind the backend, 5958 in one run at 1080p120. Count
-  and report it, or log it at debug.
-
 - **Fuzzing: seeded and scripted, not scheduled.** Five targets now start
   from real traffic. `tests/tools/gen_fuzz_seeds.py` cuts
   `fuzz/seeds/<target>/` out of the captured session (§4): the RTSP requests,
