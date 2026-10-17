@@ -2,9 +2,9 @@
 //!
 //! An endpoint is declared three ways, and all three are the same [`Spec`]:
 //! an `[[endpoint]]` table in the configuration, a `--endpoint` flag on
-//! `solstice run`, and -- later -- a request on the management socket. One
-//! spec, one resolution, one set of refusals, so that no entry point is a way
-//! around another's checks (`docs/roadmap.md` §9).
+//! `solstice run`, and `solstice endpoint add` on a running daemon. One spec,
+//! one resolution, one set of refusals, so that no entry point is a way around
+//! another's checks (`docs/roadmap.md` §9).
 //!
 //! ```text
 //! --endpoint 'name=Build box,kind=vnc,host=10.0.0.5,password_file=/etc/solstice/build.pw'
@@ -19,11 +19,12 @@
 //! and Moonlight then sees an empty app list.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use serde::Deserialize;
 use solstice_backend::Backend;
 use solstice_gamestream::nvhttp::applist::App;
+use solstice_gamestream::nvhttp::Host;
 
 use crate::config::{
     is_loopback_host, BackendKind, Spice, SpiceSecurityKind, Vnc, VncSecurityKind,
@@ -195,6 +196,25 @@ impl Spec {
         })
     }
 
+    /// Refuse relative paths. For an endpoint added to a running daemon:
+    /// the daemon opens the files, from its own working directory, which is
+    /// not the one the path was typed in.
+    pub fn require_absolute_paths(&self) -> Result<(), String> {
+        for (key, path) in [
+            ("password_file", &self.password_file),
+            ("ca_file", &self.ca_file),
+        ] {
+            if let Some(path) = path.as_deref().filter(|p| !p.is_absolute()) {
+                return Err(format!(
+                    "{key} = {} is relative; the daemon would read it from its own \
+                     working directory, so give an absolute path",
+                    path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn password(&self) -> Result<Option<String>, String> {
         match (&self.password, &self.password_file) {
             (Some(_), Some(_)) => Err("give password or password_file, not both".into()),
@@ -360,6 +380,7 @@ pub fn check_unique<'a>(mut endpoints: impl Iterator<Item = (u32, &'a str)>) -> 
 }
 
 /// A built endpoint: its app, and the backend that dials it.
+#[derive(Clone)]
 pub struct Entry {
     /// Its app id.
     pub id: u32,
@@ -371,56 +392,108 @@ pub struct Entry {
     pub backend: Arc<dyn Backend>,
 }
 
-/// Every endpoint the daemon offers.
+/// Every endpoint the daemon offers. Shared by the supervisor, which dials
+/// them, and the management socket, which adds and removes them.
 pub struct Endpoints {
-    entries: Vec<Entry>,
+    entries: RwLock<Vec<Entry>>,
 }
 
 impl Endpoints {
     /// Build the set, refusing duplicates.
     pub fn new(entries: Vec<Entry>) -> Result<Self, String> {
         check_unique(entries.iter().map(|e| (e.id, e.name.as_str())))?;
-        Ok(Self { entries })
+        Ok(Self {
+            entries: RwLock::new(entries),
+        })
     }
 
     /// One backend, offered as the old single app was: [`LEGACY_APP_ID`],
     /// titled `title`.
     pub fn single(title: &str, backend: Arc<dyn Backend>) -> Self {
         Self {
-            entries: vec![Entry {
+            entries: RwLock::new(vec![Entry {
                 id: LEGACY_APP_ID,
                 name: title.to_owned(),
                 detail: backend.name().to_owned(),
                 backend,
-            }],
+            }]),
         }
     }
 
     /// What `/applist` should offer.
     pub fn apps(&self) -> Vec<App> {
-        self.entries
-            .iter()
-            .map(|e| App {
-                id: e.id,
-                title: e.name.clone(),
-            })
-            .collect()
+        apps_of(&self.entries.read().expect("endpoint lock"))
+    }
+
+    /// Offer them as `host`'s apps.
+    pub fn publish(&self, host: &Host) {
+        // Under the lock, so that it cannot land between a change and that
+        // change's own publish and undo it.
+        let entries = self.entries.read().expect("endpoint lock");
+        host.set_apps(apps_of(&entries));
+    }
+
+    /// Add one, and offer it from `host` at once.
+    pub fn add(&self, entry: Entry, host: &Host) -> Result<(), String> {
+        let mut entries = self.entries.write().expect("endpoint lock");
+        check_unique(
+            entries
+                .iter()
+                .chain(std::iter::once(&entry))
+                .map(|e| (e.id, e.name.as_str())),
+        )?;
+        entries.push(entry);
+        host.set_apps(apps_of(&entries));
+        Ok(())
+    }
+
+    /// Remove the one named `name`, stop offering it, and end its sessions.
+    /// Returns it, and how many sessions ended; `None` if there is no such
+    /// endpoint.
+    pub fn remove(&self, name: &str, host: &Host) -> Option<(Entry, usize)> {
+        let entry = {
+            let mut entries = self.entries.write().expect("endpoint lock");
+            let at = entries.iter().position(|e| e.name == name)?;
+            let entry = entries.remove(at);
+            host.set_apps(apps_of(&entries));
+            entry
+        };
+        // After the app list, so that no new launch can name it meanwhile.
+        // Its running stream sees its launch record go, as a revoked client's
+        // does, and tells the client before it stops.
+        let ended = host.end_sessions_of_app(entry.id);
+        Some((entry, ended))
     }
 
     /// The endpoint behind an app id.
-    pub fn get(&self, id: u32) -> Option<&Entry> {
-        self.entries.iter().find(|e| e.id == id)
+    pub fn get(&self, id: u32) -> Option<Entry> {
+        self.entries
+            .read()
+            .expect("endpoint lock")
+            .iter()
+            .find(|e| e.id == id)
+            .cloned()
     }
 
     /// Every endpoint, in order.
-    pub fn iter(&self) -> impl Iterator<Item = &Entry> {
-        self.entries.iter()
+    pub fn list(&self) -> Vec<Entry> {
+        self.entries.read().expect("endpoint lock").clone()
     }
 
     /// Whether there are none.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.read().expect("endpoint lock").is_empty()
     }
+}
+
+fn apps_of(entries: &[Entry]) -> Vec<App> {
+    entries
+        .iter()
+        .map(|e| App {
+            id: e.id,
+            title: e.name.clone(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -553,6 +626,70 @@ mod tests {
             let id = app_id(&format!("endpoint {i}"));
             assert!((2..=i32::MAX as u32).contains(&id), "{id}");
         }
+    }
+
+    #[test]
+    fn relative_paths_are_found() {
+        for spec in [
+            "name=A,kind=vnc,password_file=pw",
+            "name=A,kind=vnc,ca_file=./ca.pem",
+        ] {
+            let err = Spec::parse(spec)
+                .unwrap()
+                .require_absolute_paths()
+                .unwrap_err();
+            assert!(err.contains("absolute"), "{spec}: {err}");
+        }
+        assert!(
+            Spec::parse("name=A,kind=vnc,password_file=/etc/pw,ca_file=/etc/ca.pem")
+                .unwrap()
+                .require_absolute_paths()
+                .is_ok()
+        );
+    }
+
+    fn host() -> Host {
+        Host::new(
+            Default::default(),
+            solstice_gamestream::crypto::certs::HostIdentity::generate("t").unwrap(),
+            solstice_gamestream::crypto::certs::ClientStore::new(),
+        )
+    }
+
+    fn entry(name: &str) -> Entry {
+        Entry {
+            id: app_id(name),
+            name: name.into(),
+            detail: "testpattern".into(),
+            backend: Arc::new(crate::testpattern::TestPatternBackend::new(64, 64, 30)),
+        }
+    }
+
+    #[test]
+    fn adding_and_removing_changes_what_the_host_offers() {
+        let host = host();
+        let endpoints = Endpoints::new(vec![entry("A")]).unwrap();
+        endpoints.publish(&host);
+        assert_eq!(host.apps().len(), 1);
+
+        endpoints.add(entry("B"), &host).unwrap();
+        let titles: Vec<_> = host.apps().into_iter().map(|a| a.title).collect();
+        assert_eq!(titles, ["A", "B"]);
+        assert!(host.has_app(app_id("B")));
+
+        let err = endpoints.add(entry("B"), &host).unwrap_err();
+        assert!(err.contains("named `B`"), "{err}");
+        assert_eq!(host.apps().len(), 2, "a refused add changes nothing");
+
+        let (removed, ended) = endpoints.remove("A", &host).unwrap();
+        assert_eq!((removed.name.as_str(), ended), ("A", 0));
+        assert!(!host.has_app(app_id("A")));
+        assert!(endpoints.get(app_id("A")).is_none());
+        assert!(endpoints.remove("A", &host).is_none());
+
+        endpoints.remove("B", &host).unwrap();
+        assert!(endpoints.is_empty());
+        assert!(host.apps().is_empty());
     }
 
     #[test]

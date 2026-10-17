@@ -156,9 +156,19 @@ impl Host {
     /// End every session `cert_der` launched, and tell their streams.
     /// Returns how many there were.
     pub fn end_sessions_of(&self, cert_der: &[u8]) -> usize {
+        self.end_sessions_where(|s| s.client_cert_der == cert_der)
+    }
+
+    /// End every session of `app_id` -- its endpoint has gone -- and tell
+    /// their streams. Returns how many there were.
+    pub fn end_sessions_of_app(&self, app_id: u32) -> usize {
+        self.end_sessions_where(|s| s.app_id == app_id)
+    }
+
+    fn end_sessions_where(&self, ends: impl Fn(&LaunchSession) -> bool) -> usize {
         let mut sessions = self.sessions.lock().expect("session lock");
         let before = sessions.len();
-        sessions.retain(|s| s.client_cert_der != cert_der);
+        sessions.retain(|s| !ends(s));
         let closed = before - sessions.len();
         drop(sessions);
         if closed > 0 {
@@ -626,6 +636,47 @@ mod tests {
 
         // Revoking someone with nothing running says nothing.
         assert!(!h.revoke(&der));
+        assert!(!ended.has_changed().unwrap());
+    }
+
+    /// An endpoint removed while streaming takes its sessions with it, and
+    /// only its own.
+    #[test]
+    fn ending_an_app_tells_its_streams_and_spares_the_others() {
+        let (mut h, der) = paired_host();
+        h.set_apps(vec![
+            App {
+                id: 1,
+                title: "Desktop".into(),
+            },
+            App {
+                id: 77,
+                title: "Other".into(),
+            },
+        ]);
+        h.config.max_sessions = 2;
+        for app in [1, 77] {
+            let req = request(&format!(
+                "/launch?rikey=000102030405060708090a0b0c0d0e0f&rikeyid=1&localAudioPlayMode=0&appid={app}"
+            ));
+            assert_eq!(handle(&h, &ctx(&req, true, Some(&der))).status, 200);
+        }
+        let mut ended = h.watch_ended();
+
+        assert_eq!(h.end_sessions_of_app(77), 1);
+        assert!(ended.has_changed().unwrap());
+        ended.mark_unchanged();
+        let left: Vec<u32> = h
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.app_id)
+            .collect();
+        assert_eq!(left, [1]);
+
+        // An app with nothing running says nothing.
+        assert_eq!(h.end_sessions_of_app(77), 0);
         assert!(!ended.has_changed().unwrap());
     }
 

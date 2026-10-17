@@ -86,6 +86,44 @@ pub enum Command {
         /// prints.
         prefix: String,
     },
+
+    /// Add, remove or list the running daemon's endpoints.
+    ///
+    /// A change lasts until the daemon stops. A restart is back to the
+    /// configuration's `[[endpoint]]` tables and `run`'s `--endpoint` flags.
+    Endpoint {
+        /// What to do.
+        #[command(subcommand)]
+        action: EndpointAction,
+    },
+}
+
+/// `solstice endpoint ...`.
+#[derive(Subcommand, Debug)]
+pub enum EndpointAction {
+    /// Offer one more endpoint, at once.
+    ///
+    /// The SPEC is what `run --endpoint` takes. The daemon reads
+    /// password_file and ca_file itself, so they must be absolute paths.
+    Add {
+        /// `name=...,kind=...[,key=value...]`.
+        #[arg(value_name = "SPEC", value_parser = checked_spec)]
+        spec: String,
+    },
+    /// Stop offering an endpoint. A stream from it is ended, and the client
+    /// told.
+    Remove {
+        /// Its name, exactly as `list` prints it.
+        name: String,
+    },
+    /// Every endpoint on offer.
+    List,
+}
+
+/// Refuse here what the daemon would refuse anyway, before connecting.
+fn checked_spec(spec: &str) -> Result<String, String> {
+    Spec::parse(spec)?.require_absolute_paths()?;
+    Ok(spec.to_owned())
 }
 
 #[cfg(test)]
@@ -120,6 +158,40 @@ mod tests {
             panic!("expected run")
         };
         assert!(endpoints.is_empty(), "no endpoints is a valid start");
+    }
+
+    #[test]
+    fn endpoint_subcommands_check_the_spec_before_connecting() {
+        let cli = Cli::parse_from([
+            "solstice",
+            "endpoint",
+            "add",
+            "name=Build box,kind=vnc,host=10.0.0.5",
+        ]);
+        let Command::Endpoint {
+            action: EndpointAction::Add { spec },
+        } = cli.command
+        else {
+            panic!("expected endpoint add")
+        };
+        assert_eq!(spec, "name=Build box,kind=vnc,host=10.0.0.5");
+
+        for spec in [
+            "name=A,kind=vnc,password=x",
+            "name=A,kind=vnc,password_file=pw",
+            "kind=vnc",
+        ] {
+            assert!(
+                Cli::try_parse_from(["solstice", "endpoint", "add", spec]).is_err(),
+                "{spec} was accepted"
+            );
+        }
+        assert!(matches!(
+            Cli::parse_from(["solstice", "endpoint", "remove", "Build box"]).command,
+            Command::Endpoint {
+                action: EndpointAction::Remove { .. }
+            }
+        ));
     }
 
     #[test]
