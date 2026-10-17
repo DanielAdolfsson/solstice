@@ -99,9 +99,10 @@ solstice --config /etc/solstice/solstice.toml run \
 Each endpoint is one app in Moonlight's list: connect to the host, then pick
 the desktop. They can come from `--endpoint`, repeated, or from
 `[[endpoint]]` tables in the configuration, with the same keys either way.
-None at all is a valid start, so you can pair first and add desktops
-afterwards. `--endpoint` takes no `password`, because every user on the
-machine can read the command line; use `password_file`.
+None at all is a valid start: Moonlight shows one "No desktops on this
+host" tile, and you can pair first and add desktops afterwards.
+`--endpoint` takes no `password`, because every user on the machine can
+read the command line; use `password_file`.
 
 A running daemon takes more, or fewer, without a restart:
 

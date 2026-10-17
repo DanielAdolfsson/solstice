@@ -21,14 +21,36 @@ pub struct App {
     pub title: String,
 }
 
+/// The id of the one entry `/applist` shows when there are no apps.
+///
+/// Inside the range real ids are hashed into, but never alongside one: it is
+/// only ever listed when nothing else is.
+pub const PLACEHOLDER_APP_ID: u32 = i32::MAX as u32;
+
+/// Its title.
+pub const PLACEHOLDER_TITLE: &str = "No desktops on this host";
+
+/// What a launch is refused with while there are no apps -- the placeholder's,
+/// or a tile the client still holds from before.
+pub const NO_APPS_REFUSAL: &str = "This host has no desktops to offer yet. \
+     Add one with `solstice endpoint add`, or in its configuration";
+
 /// Build the `/applist` response.
 ///
-/// With no apps this is an empty, successful list rather than an error: a
-/// client treats a failed fetch as a problem with the host, and an empty one
-/// as a host with nothing to offer yet.
+/// With no apps, this is one placeholder entry rather than an empty list.
+/// moonlight-qt treats an empty list as a failed fetch and goes on showing
+/// whatever it had cached (`PcMonitorThread::updateAppList`), so a host whose
+/// last desktop went away would still show it, and launching it would fail.
+/// The placeholder replaces that cache, and launching it explains.
 pub fn applist(host: &Host) -> String {
-    let markup: String = host
-        .apps()
+    let mut apps = host.apps();
+    if apps.is_empty() {
+        apps.push(App {
+            id: PLACEHOLDER_APP_ID,
+            title: PLACEHOLDER_TITLE.into(),
+        });
+    }
+    let markup: String = apps
         .iter()
         .map(|app| {
             format!(
