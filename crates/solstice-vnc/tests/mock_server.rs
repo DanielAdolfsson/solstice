@@ -276,7 +276,8 @@ async fn a_server_with_258_gets_scancodes() {
         ClientMessage::QemuKeyEvent {
             down: true,
             keysym: 0xFF8D,
-            keycode: 0xE01C
+            // rfbproto's form of 0xE0 0x1C: the prefix is the high bit.
+            keycode: 0x9C
         }
     );
 }

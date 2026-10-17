@@ -64,8 +64,14 @@ has the wrong shape and cannot be retrofitted.
 Not a discovery so much as a confirmation that the design pays off: the mock
 RFB server advertises no pseudo-encoding -258 and the same `InputEvent`
 produces a `KeyEvent` with keysym `0xFF8D` against it and a QEMU extended key
-event with keycode `0xE01C` against a server that does. Both are tested from
+event with keycode `0x9C` against a server that does. Both are tested from
 the same input, which is what `docs/testing.md` §3.2 asked for.
+
+That keycode was first written `0xE01C`, here and in the test, and the mock
+agreed because it was written from the same reading. rfbproto folds the 0xE0
+prefix into the high bit of the make code; QEMU drops a keycode it cannot
+look up, so every extended key -- arrows, Home/End, Delete, AltGr -- was lost
+until a real Moonlight user with a Swedish keyboard reached for one.
 
 ---
 

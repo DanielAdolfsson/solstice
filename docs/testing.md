@@ -258,7 +258,7 @@ a live desktop:
 
 ```
 inject Moonlight key event (VK_RETURN, EXTENDED)
-    → assert mock received QEMU ext key event, keycode 0xE01C, down=1
+    → assert mock received QEMU ext key event, keycode 0x9C, down=1
 inject the same with the mock advertising no -258
     → assert mock received KeyEvent, keysym 0xFF8D (KP_Enter)
 ```
