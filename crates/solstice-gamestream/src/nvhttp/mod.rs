@@ -242,13 +242,13 @@ impl Host {
 }
 
 /// Dispatch one request.
+///
+/// What a handler answers -- refusals included -- is HTTP 200 with the outcome
+/// in the XML, which is where clients read it (`HttpResponse::status`). Only a
+/// resource that does not exist is an HTTP 404, as in Sunshine's `not_found`.
 pub fn handle(host: &Host, ctx: &RequestContext) -> HttpResponse {
     if ctx.request.method != "GET" {
-        return HttpResponse {
-            status: 405,
-            content_type: "text/plain",
-            body: Vec::new(),
-        };
+        return HttpResponse::status(405);
     }
 
     // Everything but /serverinfo and /pair requires a paired client over TLS.
@@ -257,12 +257,16 @@ pub fn handle(host: &Host, ctx: &RequestContext) -> HttpResponse {
         "/serverinfo" | "/pair" | "/unpair"
     );
     if needs_paired_tls {
+        // Absent from the plaintext listener, not refused on it.
         if !ctx.over_tls {
-            return xml_response(404, Root::error(404, "Not found").render());
+            return not_found("Not found");
         }
+        // An answer, which is how moonlight-qt learns it is no longer paired
+        // and offers to pair again; an HTTP 401 would reach it as a bare
+        // network error.
         match ctx.client_cert {
             Some(der) if host.is_paired(der) => {}
-            _ => return xml_response(401, Root::error(401, "Not paired").render()),
+            _ => return answer(401, Root::error(401, "Not paired").render()),
         }
     }
 
@@ -273,20 +277,21 @@ pub fn handle(host: &Host, ctx: &RequestContext) -> HttpResponse {
             // belongs on the plaintext listener, and accepting it here would be
             // a second, untested path into the same state machine.
             if ctx.over_tls && ctx.request.param("phrase") != Some("pairchallenge") {
-                (404, Root::error(404, "Not found").render())
+                return not_found("Not found");
             } else {
                 pair::pair(host, ctx)
             }
         }
         "/unpair" if !ctx.over_tls => unpair(host, ctx),
         "/applist" => (200, applist::applist(host)),
-        "/appasset" => (404, Root::error(404, "No box art").render()),
+        // A real 404: a 200 would be fetched as an image and cached broken.
+        "/appasset" => return not_found("No box art"),
         "/launch" => launch::launch(host, ctx),
         "/resume" => launch::resume(host, ctx),
         "/cancel" => launch::cancel(host, ctx),
-        _ => (404, Root::error(404, "Not found").render()),
+        _ => return not_found("Not found"),
     };
-    xml_response(status, body)
+    answer(status, body)
 }
 
 /// Plaintext `/unpair`: what Moonlight sends after a handshake it gave up on,
@@ -308,11 +313,20 @@ fn unpair(host: &Host, ctx: &RequestContext) -> (u16, String) {
     (200, Root::ok().render())
 }
 
-fn xml_response(status: u16, body: String) -> HttpResponse {
+/// A handler's answer: HTTP 200, `outcome` in the XML.
+fn answer(outcome: u16, body: String) -> HttpResponse {
     HttpResponse {
-        status,
-        content_type: "application/xml",
-        body: body.into_bytes(),
+        outcome,
+        ..HttpResponse::xml(body)
+    }
+}
+
+/// No such resource.
+fn not_found(message: &str) -> HttpResponse {
+    HttpResponse {
+        status: 404,
+        outcome: 404,
+        ..HttpResponse::xml(Root::error(404, message).render())
     }
 }
 
@@ -369,13 +383,55 @@ mod tests {
         String::from_utf8(response.body.clone()).unwrap()
     }
 
+    /// moonlight-qt reads a refusal from the XML only if the HTTP status is
+    /// 200; anything else reaches it as a bare Qt error number. A resource
+    /// that does not exist is the one real 404.
+    #[test]
+    fn refusals_are_http_200_and_only_missing_resources_are_404() {
+        let (h, der) = paired_host();
+        let http = |target: &str, over_tls: bool, cert: Option<&[u8]>| {
+            let req = request(target);
+            let r = handle(&h, &ctx(&req, over_tls, cert));
+            (r.status, r.outcome, body(&r))
+        };
+
+        let (status, outcome, xml) = http(
+            "/launch?rikey=000102030405060708090a0b0c0d0e0f&rikeyid=1&localAudioPlayMode=0&appid=99",
+            true,
+            Some(&der),
+        );
+        assert_eq!((status, outcome), (200, 404));
+        assert!(
+            xml.contains("status_code=\"404\" status_message=\"No such app\""),
+            "{xml}"
+        );
+
+        let (status, outcome, xml) = http("/applist", true, Some(&[9, 9, 9]));
+        assert_eq!((status, outcome), (200, 401), "not paired is an answer");
+        assert!(xml.contains("status_code=\"401\""), "{xml}");
+
+        for (target, over_tls) in [
+            ("/nonsense", true),
+            ("/applist", false),
+            ("/appasset?appid=1", true),
+            ("/pair?phrase=getservercert", true),
+        ] {
+            let (status, outcome, _) = http(target, over_tls, Some(&der));
+            assert_eq!((status, outcome), (404, 404), "{target}");
+        }
+
+        let raw = "POST /serverinfo HTTP/1.1\r\nHost: x\r\n\r\n";
+        let req = http::parse_request(raw.as_bytes()).unwrap().unwrap().0;
+        assert_eq!(handle(&h, &ctx(&req, false, None)).status, 405);
+    }
+
     #[test]
     fn serverinfo_is_served_on_both_listeners() {
         let h = host();
         for over_tls in [false, true] {
             let req = request("/serverinfo");
             let r = handle(&h, &ctx(&req, over_tls, None));
-            assert_eq!(r.status, 200);
+            assert_eq!(r.outcome, 200);
             let xml = body(&r);
             assert!(xml.contains("<appversion>7.1.431.-1</appversion>"));
             assert!(xml.contains("<ServerCodecModeSupport>1</ServerCodecModeSupport>"));
@@ -417,7 +473,7 @@ mod tests {
         let h = host();
         for path in ["/applist", "/launch", "/resume", "/cancel", "/appasset"] {
             let req = request(path);
-            assert_eq!(handle(&h, &ctx(&req, false, None)).status, 404, "{path}");
+            assert_eq!(handle(&h, &ctx(&req, false, None)).outcome, 404, "{path}");
         }
     }
 
@@ -427,12 +483,12 @@ mod tests {
         for path in ["/applist", "/launch", "/resume", "/cancel"] {
             let req = request(path);
             assert_eq!(
-                handle(&h, &ctx(&req, true, None)).status,
+                handle(&h, &ctx(&req, true, None)).outcome,
                 401,
                 "{path} without a cert"
             );
             assert_eq!(
-                handle(&h, &ctx(&req, true, Some(&[9, 9, 9]))).status,
+                handle(&h, &ctx(&req, true, Some(&[9, 9, 9]))).outcome,
                 401,
                 "{path} with an unpaired cert"
             );
@@ -443,7 +499,7 @@ mod tests {
     fn plaintext_unpair_removes_no_client() {
         let (h, der) = paired_host();
         let req = request("/unpair?uniqueid=uid");
-        assert_eq!(handle(&h, &ctx(&req, false, None)).status, 200);
+        assert_eq!(handle(&h, &ctx(&req, false, None)).outcome, 200);
         assert!(
             h.is_paired(&der),
             "an unauthenticated unpair must not unpair"
@@ -460,7 +516,7 @@ mod tests {
             .open("1234", Duration::from_secs(60), now)
             .unwrap();
         let req = request("/unpair");
-        assert_eq!(handle(&h, &ctx(&req, false, None)).status, 200);
+        assert_eq!(handle(&h, &ctx(&req, false, None)).outcome, 200);
         assert!(h.pairing.lock().unwrap().is_open(now));
     }
 
@@ -510,7 +566,7 @@ mod tests {
         h.set_apps(Vec::new());
         let req = request("/applist");
         let r = handle(&h, &ctx(&req, true, Some(&der)));
-        assert_eq!(r.status, 200);
+        assert_eq!(r.outcome, 200);
         let xml = body(&r);
         assert!(xml.contains("<root status_code=\"200\"></root>"), "{xml}");
     }
@@ -526,7 +582,7 @@ mod tests {
             let req = request(&format!(
                 "/launch?rikey=000102030405060708090a0b0c0d0e0f&rikeyid=1&localAudioPlayMode=0&appid={app}"
             ));
-            handle(&h, &ctx(&req, true, Some(&der))).status
+            handle(&h, &ctx(&req, true, Some(&der))).outcome
         };
         assert_eq!(launch(1), 404, "no longer offered");
         assert_eq!(launch(77), 200);
@@ -541,7 +597,7 @@ mod tests {
             "/launch?rikey=000102030405060708090a0b0c0d0e0f&rikeyid=-1234&localAudioPlayMode=0&appid=1&mode=1920x1080x60&corever=1",
         );
         let r = handle(&h, &ctx(&req, true, Some(&der)));
-        assert_eq!(r.status, 200);
+        assert_eq!(r.outcome, 200);
         let xml = body(&r);
         assert!(xml.contains("rtspenc://127.0.0.1:48010"), "{xml}");
 
@@ -578,7 +634,7 @@ mod tests {
         ] {
             let req = request(target);
             assert_eq!(
-                handle(&h, &ctx(&req, true, Some(&der))).status,
+                handle(&h, &ctx(&req, true, Some(&der))).outcome,
                 400,
                 "{target}"
             );
@@ -586,7 +642,7 @@ mod tests {
         let req = request(
             "/launch?rikey=000102030405060708090a0b0c0d0e0f&rikeyid=1&localAudioPlayMode=0&appid=99",
         );
-        assert_eq!(handle(&h, &ctx(&req, true, Some(&der))).status, 404);
+        assert_eq!(handle(&h, &ctx(&req, true, Some(&der))).outcome, 404);
         assert!(h.sessions.lock().unwrap().is_empty());
     }
 
@@ -596,8 +652,8 @@ mod tests {
         let req = request(
             "/launch?rikey=000102030405060708090a0b0c0d0e0f&rikeyid=1&localAudioPlayMode=0&appid=1",
         );
-        assert_eq!(handle(&h, &ctx(&req, true, Some(&der))).status, 200);
-        assert_eq!(handle(&h, &ctx(&req, true, Some(&der))).status, 503);
+        assert_eq!(handle(&h, &ctx(&req, true, Some(&der))).outcome, 200);
+        assert_eq!(handle(&h, &ctx(&req, true, Some(&der))).outcome, 503);
     }
 
     /// Revocation takes effect now, and takes the session with it.
@@ -613,7 +669,7 @@ mod tests {
         assert!(h.revoke(&der));
         assert!(h.sessions.lock().unwrap().is_empty());
         let req = request("/applist");
-        assert_eq!(handle(&h, &ctx(&req, true, Some(&der))).status, 401);
+        assert_eq!(handle(&h, &ctx(&req, true, Some(&der))).outcome, 401);
     }
 
     /// A running stream learns of it: the signal changes, and its session is
@@ -703,14 +759,14 @@ mod tests {
             })
             .unwrap();
         let cancel = request("/cancel");
-        assert_eq!(handle(&h, &ctx(&cancel, true, Some(&other))).status, 200);
+        assert_eq!(handle(&h, &ctx(&cancel, true, Some(&other))).outcome, 200);
         assert!(
             !ended.has_changed().unwrap(),
             "nothing of theirs was running"
         );
         assert!(h.has_session(&id));
 
-        assert_eq!(handle(&h, &ctx(&cancel, true, Some(&der))).status, 200);
+        assert_eq!(handle(&h, &ctx(&cancel, true, Some(&der))).outcome, 200);
         assert!(ended.has_changed().unwrap());
         assert!(!h.has_session(&id));
     }
@@ -734,8 +790,8 @@ mod tests {
         handle(&h, &ctx(&req, true, Some(&der)));
 
         let req = request("/resume?rikey=000102030405060708090a0b0c0d0e0f&rikeyid=1");
-        assert_eq!(handle(&h, &ctx(&req, true, Some(&der))).status, 200);
-        assert_eq!(handle(&h, &ctx(&req, true, Some(&other))).status, 404);
+        assert_eq!(handle(&h, &ctx(&req, true, Some(&der))).outcome, 200);
+        assert_eq!(handle(&h, &ctx(&req, true, Some(&other))).outcome, 404);
     }
 
     /// Moonlight sends fresh keys on every resume and encrypts with them; the
@@ -749,7 +805,7 @@ mod tests {
         handle(&h, &ctx(&req, true, Some(&der)));
 
         let req = request("/resume?rikey=f0e0d0c0b0a090807060504030201000&rikeyid=-7");
-        assert_eq!(handle(&h, &ctx(&req, true, Some(&der))).status, 200);
+        assert_eq!(handle(&h, &ctx(&req, true, Some(&der))).outcome, 200);
         let sessions = h.sessions.lock().unwrap();
         assert_eq!(
             *sessions[0].rikey,
@@ -777,7 +833,7 @@ mod tests {
         ] {
             let req = request(path);
             assert_eq!(
-                handle(&h, &ctx(&req, true, Some(&der))).status,
+                handle(&h, &ctx(&req, true, Some(&der))).outcome,
                 400,
                 "{path}"
             );
@@ -794,7 +850,7 @@ mod tests {
             "/pair?phrase=getservercert&salt=00112233445566778899aabbccddeeff&clientcert=00",
         );
         let r = handle(&h, &ctx(&req, false, None));
-        assert_eq!(r.status, 503);
+        assert_eq!(r.outcome, 503);
         assert!(body(&r).contains("<paired>0</paired>"));
     }
 
@@ -815,7 +871,7 @@ mod tests {
             client_cert: None,
             peer_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
         };
-        assert_eq!(handle(&h, &remote).status, 403);
+        assert_eq!(handle(&h, &remote).outcome, 403);
     }
 
     #[test]
@@ -829,7 +885,7 @@ mod tests {
         let req = request(
             "/pair?phrase=getservercert&salt=00112233445566778899aabbccddeeff&clientcert=00",
         );
-        assert_eq!(handle(&h, &ctx(&req, true, None)).status, 404);
+        assert_eq!(handle(&h, &ctx(&req, true, None)).outcome, 404);
     }
 
     #[test]
@@ -845,13 +901,13 @@ mod tests {
         let h = host();
         let mut req = request("/serverinfo");
         req.method = "POST".into();
-        assert_eq!(handle(&h, &ctx(&req, true, None)).status, 405);
+        assert_eq!(handle(&h, &ctx(&req, true, None)).outcome, 405);
     }
 
     #[test]
     fn unknown_paths_are_not_found() {
         let (h, der) = paired_host();
         let req = request("/../../etc/passwd");
-        assert_eq!(handle(&h, &ctx(&req, true, Some(&der))).status, 404);
+        assert_eq!(handle(&h, &ctx(&req, true, Some(&der))).outcome, 404);
     }
 }

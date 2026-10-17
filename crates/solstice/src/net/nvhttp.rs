@@ -129,7 +129,7 @@ where
         peer_ip: peer.ip(),
     };
     let response = handle(&host, &ctx);
-    tracing::debug!(%peer, path = %request.path, status = response.status, over_tls, "nvhttp");
+    tracing::debug!(%peer, path = %request.path, status = response.status, outcome = response.outcome, over_tls, "nvhttp");
     stream.write_all(&response.to_bytes()).await?;
     stream.flush().await?;
     Ok(())
