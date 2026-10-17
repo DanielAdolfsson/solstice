@@ -11,7 +11,7 @@ use solstice_backend::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::auth::{vnc_auth_response, VncSecurity};
 use crate::handshake::{self, RfbTransport};
@@ -233,6 +233,7 @@ where
     let qemu_extended_key = Arc::new(AtomicBool::new(false));
     let extended_desktop_size = Arc::new(AtomicBool::new(false));
     let connected = Arc::new(AtomicBool::new(true));
+    let (heard_tx, heard) = watch::channel(false);
 
     let mut update_loop = UpdateLoop::new(
         reader,
@@ -262,6 +263,7 @@ where
                 let caps = update_loop.capabilities();
                 qemu.store(caps.qemu_extended_key, Ordering::Relaxed);
                 eds.store(caps.extended_desktop_size, Ordering::Relaxed);
+                heard_tx.send_replace(true);
                 {
                     let fb = fb.read();
                     dimensions.store(pack_dimensions(fb.width(), fb.height()), Ordering::Relaxed);
@@ -297,9 +299,13 @@ where
         dimensions,
         qemu_extended_key,
         extended_desktop_size,
+        heard,
         connected,
     })
 }
+
+/// How long `request_resize` waits to learn whether the server can resize.
+const CAPABILITY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 const fn pack_dimensions(width: u32, height: u32) -> u64 {
     ((width as u64) << 32) | height as u64
@@ -314,6 +320,10 @@ pub struct VncSession {
     dimensions: Arc<AtomicU64>,
     qemu_extended_key: Arc<AtomicBool>,
     extended_desktop_size: Arc<AtomicBool>,
+    /// True once the server's first message has been read. What it supports
+    /// is only known from the pseudo-rectangles in its replies, not from the
+    /// handshake.
+    heard: watch::Receiver<bool>,
     connected: Arc<AtomicBool>,
 }
 
@@ -337,6 +347,12 @@ impl Session for VncSession {
     async fn request_resize(&self, width: u32, height: u32) -> solstice_backend::Result<bool> {
         // Best-effort by construction: ExtendedDesktopSize lets a client *ask*,
         // and a server is free to decline. The caller falls back to scaling.
+        //
+        // The caller asks straight after `connect`, before the server has
+        // answered `SetEncodings` -- so wait for that answer, or a server that
+        // supports resizing is always reported as one that does not.
+        let mut heard = self.heard.clone();
+        let _ = tokio::time::timeout(CAPABILITY_WAIT, heard.wait_for(|h| *h)).await;
         if !self.extended_desktop_size.load(Ordering::Relaxed) {
             return Ok(false);
         }

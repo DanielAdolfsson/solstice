@@ -66,6 +66,7 @@ pub struct MainChannel {
     mouse_mode: MouseMode,
     multi_media_time: u32,
     name: Option<String>,
+    init_seen: bool,
 }
 
 impl Default for MainChannel {
@@ -84,6 +85,7 @@ impl MainChannel {
             mouse_mode: MouseMode::Server,
             multi_media_time: 0,
             name: None,
+            init_seen: false,
         }
     }
 
@@ -129,6 +131,7 @@ impl MainChannel {
                 let _ram_hint = r.u32()?;
 
                 self.connection_id = session_id;
+                self.init_seen = true;
                 self.supported_modes = supported_mouse_modes;
                 self.multi_media_time = multi_media_time;
                 self.set_mouse_mode(current_mouse_mode, &mut outcomes);
@@ -358,6 +361,13 @@ impl MainChannel {
     /// Whether a resize request would be honoured.
     pub fn can_resize(&self) -> bool {
         self.agent.can_resize()
+    }
+
+    /// Whether [`can_resize`](Self::can_resize) is a settled answer: `INIT`
+    /// has said whether an agent is attached, and an attached agent has
+    /// announced what it can do. Before that, "no" only means "not yet".
+    pub fn resize_settled(&self) -> bool {
+        self.init_seen && (!self.agent.is_connected() || self.agent.has_announced())
     }
 
     /// Whether clipboard messages would reach the guest.

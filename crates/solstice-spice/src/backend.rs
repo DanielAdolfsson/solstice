@@ -573,6 +573,7 @@ async fn connect_inner(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<S
         counts,
         connected,
         audio: Mutex::new(audio),
+        display_events,
     };
 
     // Give the display channel a moment to deliver the primary surface, so
@@ -775,6 +776,8 @@ pub struct SpiceSession {
     counts: Arc<DisplayCounts>,
     connected: Arc<AtomicBool>,
     audio: Mutex<Option<mpsc::Receiver<AudioFrame>>>,
+    /// The display queue, for moving the composited pointer.
+    display_events: mpsc::Sender<DisplayEvent>,
 }
 
 impl std::fmt::Debug for SpiceSession {
@@ -940,6 +943,10 @@ impl SpiceSession {
     }
 }
 
+/// How long `request_resize` waits for the guest agent to say whether it can
+/// resize.
+const RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[async_trait]
 impl Session for SpiceSession {
     fn dimensions(&self) -> (u32, u32) {
@@ -951,6 +958,21 @@ impl Session for SpiceSession {
         // Best-effort, like RFB's: without `spice-vdagent` in the guest
         // there is nothing that can change the mode, and the caller falls
         // back to scaling (`docs/bridging-design.md` §2.2).
+        //
+        // The caller asks straight after `connect`, and the agent announces
+        // itself a moment later -- a real session decided "no agent" 0.1 ms
+        // before the announcement arrived, and scaled a desktop it could have
+        // resized. So wait until the answer is settled, briefly.
+        let deadline = tokio::time::Instant::now() + RESIZE_SETTLE;
+        while !self
+            .main
+            .lock()
+            .expect("main channel lock")
+            .resize_settled()
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         let messages = {
             let mut main = self.main.lock().expect("main channel lock");
             if !main.can_resize() {
@@ -984,19 +1006,37 @@ impl Session for SpiceSession {
         if !self.connected.load(Ordering::Relaxed) {
             return Err(BackendError::Disconnected);
         }
-        let messages = {
+        let (messages, pointer) = {
             let mut state = self.input.lock().expect("input lock");
             let (width, height) = self.dimensions();
             if width != 0 && height != 0 {
                 state.resize(width, height);
             }
-            state.encode(&event)
+            let before = state.position();
+            let messages = state.encode(&event);
+            let after = state.position();
+            // In client mode the server never sends the pointer's position:
+            // the client is expected to draw it where *its* pointer is, and
+            // only a shape change carries a position at all. Following the
+            // cursor channel alone left the composited pointer stuck wherever
+            // the shape last changed.
+            let moved = state.mode() == MouseMode::Client && after != before;
+            (messages, moved.then_some(after))
         };
         for message in messages {
             self.inputs_out
                 .send(message)
                 .await
                 .map_err(|_| BackendError::Disconnected)?;
+        }
+        if let Some((x, y)) = pointer {
+            let _ = self
+                .display_events
+                .send(DisplayEvent::Cursor(crate::cursor::CursorUpdate::Move {
+                    x: x as i32,
+                    y: y as i32,
+                }))
+                .await;
         }
         Ok(())
     }

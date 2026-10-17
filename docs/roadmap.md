@@ -671,10 +671,14 @@ packet per negotiated duration.
 
 #### What is left
 
-- **No Moonlight application has played it.** The probe decodes nothing
-  itself; the tests decode its packets as its configuration says to. A
-  moonlight-qt build hearing a guest is the manual tier
-  (`docs/testing.md` §8).
+- **moonlight-qt has played it, by ear.** 2026-10-17, the Flatpak build over
+  a 220 ms link, at 1080p60 and 15.5 Mbps -- 5 ms packets, so re-encoded --
+  heard the guest in stereo, 5.1 and 7.1 (high quality: 6 and 8 uncoupled
+  streams). Clean, on the right sides, no audible stutter, and the daemon
+  counted no underruns in 100 s of stereo. Each session also logged
+  `dropped=119`: about 1.2 s of audio that queued between the SPICE connect
+  and the audio task starting, trimmed as the jitter buffer should. Starting
+  the task sooner would save decoding it. Nothing measured the latency.
 - **Nothing is resampled.** A backend at a rate other than 48 kHz is
   dropped, with one warning per session. `spice-server` sends 48 kHz in both
   modes, so a resampler would be code with no source to test it.
@@ -1282,6 +1286,29 @@ against. The findings are about the old arrangement:
 ---
 
 ## 8. Smaller items
+
+- **A cursor for the VNC backend.** Moonlight draws no host cursor, and the
+  RFB backend neither asks for the Cursor pseudo-encoding (-239) nor draws one,
+  so a VNC desktop streams with no pointer at all. The SPICE backend already
+  composites one (`crates/solstice-spice/src/cursor.rs`); RFB needs the same,
+  drawn at the position Moonlight last sent.
+- **The letterbox scaler is nearest-neighbour.** `convert_scaled` takes one
+  source pixel per output pixel, which drops a third of the rows of a 1080p
+  desktop streamed at 720p -- text loses strokes. It is also slow: a
+  4K-to-1080p conversion plus the encode overran the 16.7 ms budget at 60 fps.
+  Only reached when the backend will not resize, which both backends now
+  normally do; an area-averaging downscale is the fix.
+- **A backend session outlives its stream.** When a stream ends the SPICE
+  connection to the guest stays open until the next session's connect
+  displaces it. `close()` marks the session closed but leaves the channel
+  sockets open. The RFB backend has not been checked for the same.
+- **`/resume` ignores the new `rikey`.** Moonlight sends fresh keys on resume;
+  the handler returns the launch's old ones. Only reachable between `/launch`
+  and the stream starting, since a stream's end removes its session -- but a
+  resume that did reach it would stream nothing the client could decrypt.
+- **"damage events lagged" floods the log** -- one warning per frame whenever
+  the encoder falls behind the backend, 5958 in one run at 1080p120. Count
+  and report it, or log it at debug.
 
 - **Fuzzing: seeded and scripted, not scheduled.** Five targets now start
   from real traffic. `tests/tools/gen_fuzz_seeds.py` cuts

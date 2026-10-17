@@ -58,8 +58,13 @@ pub fn translate(records: &[InputRecord]) -> Translation {
             } => {
                 let extended = modifiers & vk::modifier::EXTENDED != 0;
                 let shift = modifiers & vk::modifier::SHIFT != 0;
-                let sc = scancode(*key_code, extended);
-                let ks = keysym(*key_code, extended, shift);
+                // The VK is the low byte. moonlight-qt sends every key as
+                // `0x8000 | vk`, and Sunshine masks it the same way
+                // (`keyCode & 0x00FF`); the headless client sends a bare VK,
+                // which is how this went unnoticed until a real one typed.
+                let vk_code = key_code & 0x00FF;
+                let sc = scancode(vk_code, extended);
+                let ks = keysym(vk_code, extended, shift);
                 if sc.is_none() && ks.is_none() {
                     out.dropped.push(DroppedInput::UnmappableKey {
                         key_code: *key_code,
@@ -333,6 +338,26 @@ mod tests {
         let t = translate(&[InputRecord::Text(String::new())]);
         assert!(t.events.is_empty());
         assert!(t.dropped.is_empty());
+    }
+
+    /// moonlight-qt sets the high byte on every key; only the low byte is
+    /// the VK.
+    #[test]
+    fn the_high_byte_moonlight_qt_sets_is_ignored() {
+        let bare = translate(&[InputRecord::Key {
+            down: true,
+            flags: 0,
+            key_code: b'D' as u16,
+            modifiers: 0,
+        }]);
+        let flagged = translate(&[InputRecord::Key {
+            down: true,
+            flags: 0,
+            key_code: 0x8000 | b'D' as u16,
+            modifiers: 0,
+        }]);
+        assert!(flagged.dropped.is_empty());
+        assert_eq!(flagged.events, bare.events);
     }
 
     /// Every VK a client can send must either translate or be reported.

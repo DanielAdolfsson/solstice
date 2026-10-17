@@ -220,7 +220,10 @@ pub fn handle(host: &Host, ctx: &RequestContext) -> HttpResponse {
     }
 
     // Everything but /serverinfo and /pair requires a paired client over TLS.
-    let needs_paired_tls = !matches!(ctx.request.path.as_str(), "/serverinfo" | "/pair");
+    let needs_paired_tls = !matches!(
+        ctx.request.path.as_str(),
+        "/serverinfo" | "/pair" | "/unpair"
+    );
     if needs_paired_tls {
         if !ctx.over_tls {
             return xml_response(404, Root::error(404, "Not found").render());
@@ -243,6 +246,7 @@ pub fn handle(host: &Host, ctx: &RequestContext) -> HttpResponse {
                 pair::pair(host, ctx)
             }
         }
+        "/unpair" if !ctx.over_tls => unpair(host, ctx),
         "/applist" => (200, applist::applist(host)),
         "/appasset" => (404, Root::error(404, "No box art").render()),
         "/launch" => launch::launch(host, ctx),
@@ -251,6 +255,25 @@ pub fn handle(host: &Host, ctx: &RequestContext) -> HttpResponse {
         _ => (404, Root::error(404, "Not found").render()),
     };
     xml_response(status, body)
+}
+
+/// Plaintext `/unpair`: what Moonlight sends after a handshake it gave up on,
+/// which is how a wrong PIN ends -- the client spots the mismatch itself and
+/// never sends the step that would have told the server. Answering 404 buries
+/// the client's "incorrect PIN" under a transfer error.
+///
+/// Unauthenticated, so it removes nothing from the client store: it only drops
+/// the handshake in flight, and only for a source allowed to pair. A window
+/// opened ahead of the client, with nothing in flight yet, is left alone.
+fn unpair(host: &Host, ctx: &RequestContext) -> (u16, String) {
+    if host.pairing_allowed_from(ctx.peer_ip) {
+        let mut mgr = host.pairing.lock().expect("pairing lock");
+        if mgr.session().is_some() {
+            mgr.client_gave_up();
+            tracing::info!(peer = %ctx.peer_ip, "the client abandoned pairing");
+        }
+    }
+    (200, Root::ok().render())
 }
 
 fn xml_response(status: u16, body: String) -> HttpResponse {
@@ -377,6 +400,31 @@ mod tests {
                 "{path} with an unpaired cert"
             );
         }
+    }
+
+    #[test]
+    fn plaintext_unpair_removes_no_client() {
+        let (h, der) = paired_host();
+        let req = request("/unpair?uniqueid=uid");
+        assert_eq!(handle(&h, &ctx(&req, false, None)).status, 200);
+        assert!(
+            h.is_paired(&der),
+            "an unauthenticated unpair must not unpair"
+        );
+    }
+
+    #[test]
+    fn unpair_leaves_a_window_with_nothing_in_flight_open() {
+        let h = host();
+        let now = std::time::Instant::now();
+        h.pairing
+            .lock()
+            .unwrap()
+            .open("1234", Duration::from_secs(60), now)
+            .unwrap();
+        let req = request("/unpair");
+        assert_eq!(handle(&h, &ctx(&req, false, None)).status, 200);
+        assert!(h.pairing.lock().unwrap().is_open(now));
     }
 
     fn paired_host() -> (Host, Vec<u8>) {

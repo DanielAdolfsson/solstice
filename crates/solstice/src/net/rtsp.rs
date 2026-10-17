@@ -272,6 +272,9 @@ async fn serve_one(
                 width = config.width,
                 height = config.height,
                 fps = config.fps,
+                bitrate_kbps = config.bitrate_kbps,
+                audio_channels = config.audio_channels,
+                audio_packet_ms = config.audio_packet_duration,
                 "rtsp PLAY -- starting the stream"
             );
             let _ = negotiated

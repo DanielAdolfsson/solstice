@@ -204,6 +204,11 @@ impl Agent {
         self.connected
     }
 
+    /// Whether the guest has announced its capabilities yet.
+    pub fn has_announced(&self) -> bool {
+        self.announced
+    }
+
     /// Whether the guest announced a capability.
     pub fn guest_has(&self, bit: u32) -> bool {
         self.announced && self.guest_caps.has(bit)

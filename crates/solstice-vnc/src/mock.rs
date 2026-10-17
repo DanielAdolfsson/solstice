@@ -113,6 +113,10 @@ pub struct MockConfig {
     /// Under Tight, send full-colour rectangles through the gradient filter
     /// rather than the copy filter.
     pub tight_gradient: bool,
+    /// How long to wait before acknowledging the pseudo-encodings. A real
+    /// server answers `SetEncodings` a moment later, and a client must not
+    /// decide what the server supports before it has.
+    pub pseudo_reply_delay: std::time::Duration,
 }
 
 impl Default for MockConfig {
@@ -129,6 +133,7 @@ impl Default for MockConfig {
             offer_extended_desktop_size: false,
             offer_tight: false,
             tight_gradient: false,
+            pseudo_reply_delay: std::time::Duration::ZERO,
         }
     }
 }
@@ -224,9 +229,32 @@ impl MockServer {
         });
 
         if !pseudo_reply.is_empty() {
+            tokio::time::sleep(self.config.pseudo_reply_delay).await;
             let mut frame = vec![server_msg::FRAMEBUFFER_UPDATE, 0];
             frame.extend_from_slice(&(pseudo_reply.len() as u16).to_be_bytes());
             for e in &pseudo_reply {
+                if *e == encoding::PSEUDO_EXTENDED_DESKTOP_SIZE {
+                    // Unlike the others this one has a body, and its geometry
+                    // is the framebuffer's: one screen covering all of it.
+                    let (w, h) = (self.config.width, self.config.height);
+                    frame.extend_from_slice(
+                        &RectHeader {
+                            x: 0,
+                            y: 0,
+                            width: w,
+                            height: h,
+                            encoding: *e,
+                        }
+                        .to_bytes(),
+                    );
+                    frame.extend_from_slice(&[1, 0, 0, 0]);
+                    frame.extend_from_slice(&0u32.to_be_bytes()); // screen id
+                    frame.extend_from_slice(&[0, 0, 0, 0]); // x, y
+                    frame.extend_from_slice(&w.to_be_bytes());
+                    frame.extend_from_slice(&h.to_be_bytes());
+                    frame.extend_from_slice(&0u32.to_be_bytes()); // flags
+                    continue;
+                }
                 frame.extend_from_slice(
                     &RectHeader {
                         x: 0,
@@ -363,6 +391,10 @@ impl MockServer {
             self.config.offer_flow_control,
         );
         offer(encoding::PSEUDO_FENCE, self.config.offer_flow_control);
+        offer(
+            encoding::PSEUDO_EXTENDED_DESKTOP_SIZE,
+            self.config.offer_extended_desktop_size,
+        );
         out
     }
 

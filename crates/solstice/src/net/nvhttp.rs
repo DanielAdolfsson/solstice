@@ -1,7 +1,9 @@
 //! The two NVHTTP listeners.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use solstice_gamestream::nvhttp::http::{self, HttpResponse};
 use solstice_gamestream::nvhttp::{handle, Host, RequestContext};
@@ -10,6 +12,16 @@ use tokio::net::TcpListener;
 
 /// How long a client has to send a complete request head.
 const HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The longest a `getservercert` is held waiting for `solstice pair`: the
+/// longest window that command can open.
+const PAIR_HOLD: std::time::Duration = crate::management::MAX_WINDOW;
+
+/// How often a held `getservercert` looks at the window.
+const PAIR_HOLD_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Whether a `getservercert` is already being held. One at a time.
+static PAIR_HOLDING: AtomicBool = AtomicBool::new(false);
 
 /// Serve plaintext NVHTTP: `/serverinfo` and the PIN handshake.
 pub async fn serve_plaintext(host: Arc<Host>, addr: SocketAddr) -> std::io::Result<()> {
@@ -101,6 +113,15 @@ where
         }
     };
 
+    if !over_tls && wants_pair_hold(&host, &request, peer) {
+        if let Some(guard) = HoldGuard::take() {
+            if !hold_for_pairing(&host, &mut stream, &request, peer).await {
+                return Ok(());
+            }
+            drop(guard);
+        }
+    }
+
     let ctx = RequestContext {
         request: &request,
         over_tls,
@@ -112,6 +133,89 @@ where
     stream.write_all(&response.to_bytes()).await?;
     stream.flush().await?;
     Ok(())
+}
+
+/// Whether this is a `getservercert` that arrived before `solstice pair`.
+///
+/// Moonlight makes the PIN up, shows it, and sends `getservercert` at once,
+/// expecting the host to hold the request until someone types the PIN in --
+/// Sunshine does exactly that. Refusing it instead would make pairing
+/// impossible from a real client: the window can only be opened with a PIN the
+/// client has not shown until it sends this request. Only an allowed source is
+/// held, and never while pairing is locked out; anything else is answered at
+/// once, as before.
+fn wants_pair_hold(host: &Host, request: &http::HttpRequest, peer: SocketAddr) -> bool {
+    if request.path != "/pair" || request.param("phrase") != Some("getservercert") {
+        return false;
+    }
+    if !host.pairing_allowed_from(peer.ip()) {
+        return false;
+    }
+    let mgr = host.pairing.lock().expect("pairing lock");
+    !mgr.is_locked_out() && !mgr.is_open(Instant::now())
+}
+
+/// The one held `getservercert`, released on drop.
+struct HoldGuard;
+
+impl HoldGuard {
+    fn take() -> Option<Self> {
+        PAIR_HOLDING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then_some(Self)
+    }
+}
+
+impl Drop for HoldGuard {
+    fn drop(&mut self) {
+        PAIR_HOLDING.store(false, Ordering::Release);
+    }
+}
+
+/// Wait for the window to open. False if the client hung up first, in which
+/// case there is no one to answer. A hold that runs out, or ends in a lockout,
+/// is answered as a closed window by the handler.
+async fn hold_for_pairing<S>(
+    host: &Host,
+    stream: &mut S,
+    request: &http::HttpRequest,
+    peer: SocketAddr,
+) -> bool
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let device = request.param("devicename").unwrap_or("unknown");
+    tracing::info!(
+        %peer,
+        device,
+        "a client is waiting to pair: run `solstice pair --pin <the PIN it shows>`"
+    );
+    let deadline = tokio::time::Instant::now() + PAIR_HOLD;
+    let mut scratch = [0u8; 64];
+    loop {
+        {
+            let mgr = host.pairing.lock().expect("pairing lock");
+            if mgr.is_open(Instant::now()) || mgr.is_locked_out() {
+                return true;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::info!(%peer, "gave up holding a pairing request: no window opened");
+            return true;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(PAIR_HOLD_POLL) => {}
+            // The client sends nothing more on this connection; a read ending
+            // means it cancelled.
+            read = stream.read(&mut scratch) => {
+                if matches!(read, Ok(0) | Err(_)) {
+                    tracing::info!(%peer, "the waiting client cancelled pairing");
+                    return false;
+                }
+            }
+        }
+    }
 }
 
 /// Convenience for tests: run one request against an in-memory stream.

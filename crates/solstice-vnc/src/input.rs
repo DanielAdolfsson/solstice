@@ -200,18 +200,42 @@ pub fn key_event(down: bool, keysym: u32) -> Vec<u8> {
 }
 
 /// Build a QEMU Extended Key Event message (255 / submessage 0).
-pub fn qemu_key_event(down: bool, keysym: u32, keycode: u16) -> Vec<u8> {
+///
+/// `scancode` is an XT make code, `0xE0 << 8 | code` for an extended key.
+pub fn qemu_key_event(down: bool, keysym: u32, scancode: u16) -> Vec<u8> {
     let mut out = vec![client_msg::QEMU, client_msg::QEMU_SUB_EXTENDED_KEY];
     out.extend_from_slice(&u16::from(down).to_be_bytes());
     out.extend_from_slice(&keysym.to_be_bytes());
-    out.extend_from_slice(&(keycode as u32).to_be_bytes());
+    out.extend_from_slice(&rfb_keycode(scancode).to_be_bytes());
     out
+}
+
+/// The RFB form of an XT scancode: the 0xE0 prefix folds into the high bit of
+/// the make code, so `0xE0 0x4D` (Right) is `0xCD` (rfbproto, "QEMU Extended
+/// Key Event"). Sent as `0xE04D`, QEMU looks it up, finds nothing and drops
+/// it -- which lost every arrow, the navigation cluster and AltGr.
+fn rfb_keycode(scancode: u16) -> u32 {
+    if scancode >> 8 == 0xE0 {
+        0x80 | u32::from(scancode & 0x7F)
+    } else {
+        u32::from(scancode)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use solstice_input::vk;
+
+    /// The examples from rfbproto's own table.
+    #[test]
+    fn extended_scancodes_fold_the_prefix_into_the_high_bit() {
+        let keycode = |m: Vec<u8>| u32::from_be_bytes(m[8..12].try_into().unwrap());
+        assert_eq!(keycode(qemu_key_event(true, 0x41, 0x1E)), 0x1E);
+        assert_eq!(keycode(qemu_key_event(true, 0xFF53, 0xE04D)), 0xCD);
+        // Right Alt, which is AltGr on most non-US layouts.
+        assert_eq!(keycode(qemu_key_event(true, 0xFE03, 0xE038)), 0xB8);
+    }
 
     fn state(qemu: bool) -> InputState {
         let mut s = InputState::new(1920, 1080);
@@ -238,7 +262,8 @@ mod tests {
         assert_eq!(with_258[0][0], client_msg::QEMU);
         assert_eq!(with_258[0][1], 0);
         assert_eq!(&with_258[0][2..4], &1u16.to_be_bytes()); // down
-        assert_eq!(&with_258[0][8..12], &0xE01Cu32.to_be_bytes()); // keycode
+                                                             // 0xE0 0x1C, with the prefix folded into the high bit.
+        assert_eq!(&with_258[0][8..12], &0x9Cu32.to_be_bytes()); // keycode
 
         let without = state(false).encode(&event);
         assert_eq!(without.len(), 1);

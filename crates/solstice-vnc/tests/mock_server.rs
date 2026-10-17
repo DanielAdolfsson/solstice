@@ -103,6 +103,37 @@ async fn recorded_contains(
     .expect("the expected message never arrived")
 }
 
+/// The supervisor asks for a resize straight after `connect`, before the
+/// server has answered `SetEncodings`. A real QEMU session decided "cannot
+/// resize" every time, and letterboxed a desktop it could have resized.
+#[tokio::test]
+async fn a_resize_asked_before_the_server_answers_still_goes_out() {
+    let h = harness(MockConfig {
+        offer_extended_desktop_size: true,
+        pseudo_reply_delay: Duration::from_millis(200),
+        ..MockConfig::default()
+    })
+    .await;
+    assert!(h.session.request_resize(1280, 720).await.unwrap());
+    let message = recorded_contains(&h.recorded, |m| {
+        matches!(m, ClientMessage::SetDesktopSize { .. })
+    })
+    .await;
+    assert_eq!(
+        message,
+        ClientMessage::SetDesktopSize {
+            width: 1280,
+            height: 720
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_server_without_extended_desktop_size_is_not_asked() {
+    let h = harness(MockConfig::default()).await;
+    assert!(!h.session.request_resize(1280, 720).await.unwrap());
+}
+
 #[tokio::test]
 async fn the_client_sets_its_format_and_encodings_before_anything_else() {
     // The mock enforces this ordering itself and errors out otherwise; getting
@@ -276,7 +307,8 @@ async fn a_server_with_258_gets_scancodes() {
         ClientMessage::QemuKeyEvent {
             down: true,
             keysym: 0xFF8D,
-            keycode: 0xE01C
+            // rfbproto's form of 0xE0 0x1C: the prefix is the high bit.
+            keycode: 0x9C
         }
     );
 }
