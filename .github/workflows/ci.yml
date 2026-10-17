@@ -1,0 +1,35 @@
+# Build, lint and test on every push to main and every pull request.
+#
+# Nothing here is scheduled, on purpose: the long tiers -- the GLZ soak, loss
+# injection, fuzzing -- stay manual scripts (docs/testing.md §6). The real-peer
+# tests skip themselves on a runner without QEMU, the guest image or the
+# Moonlight probe, so `cargo test` here is T0-T2.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      # rust-toolchain.toml pins stable with rustfmt and clippy; this installs it.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      # cmake is on the runner image already, for opusic-sys (`audio`).
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked

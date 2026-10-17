@@ -27,7 +27,12 @@ impl std::fmt::Debug for Ppm {
         write!(
             f,
             "Ppm({}x{}, dominant #{:02x}{:02x}{:02x} at {:.1}%)",
-            self.width, self.height, colour[0], colour[1], colour[2], share * 100.0
+            self.width,
+            self.height,
+            colour[0],
+            colour[1],
+            colour[2],
+            share * 100.0
         )
     }
 }
@@ -67,7 +72,8 @@ impl Ppm {
                 while self.at < self.bytes.len() && !self.bytes[self.at].is_ascii_whitespace() {
                     self.at += 1;
                 }
-                (self.at > start).then(|| std::str::from_utf8(&self.bytes[start..self.at]).unwrap_or(""))
+                (self.at > start)
+                    .then(|| std::str::from_utf8(&self.bytes[start..self.at]).unwrap_or(""))
             }
         }
 
@@ -88,7 +94,9 @@ impl Ppm {
         let height = number(&mut lexer, "height")?;
         let max = number(&mut lexer, "maximum value")?;
         if max != 255 {
-            return Err(bad(&format!("expected 8-bit samples, found a maximum of {max}")));
+            return Err(bad(&format!(
+                "expected 8-bit samples, found a maximum of {max}"
+            )));
         }
         // Exactly one whitespace byte separates the header from the raster.
         let cursor = lexer.at + 1;
@@ -112,7 +120,10 @@ impl Ppm {
     /// # Panics
     /// If the coordinate is outside the image.
     pub fn pixel(&self, x: u32, y: u32) -> [u8; 3] {
-        assert!(x < self.width && y < self.height, "({x}, {y}) is outside {self:?}");
+        assert!(
+            x < self.width && y < self.height,
+            "({x}, {y}) is outside {self:?}"
+        );
         let i = (y as usize * self.width as usize + x as usize) * 3;
         [self.rgb[i], self.rgb[i + 1], self.rgb[i + 2]]
     }
