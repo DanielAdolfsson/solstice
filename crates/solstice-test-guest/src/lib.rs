@@ -211,6 +211,7 @@ pub struct GuestConfig {
     spice: Option<Spice>,
     vnc: bool,
     display: Display,
+    qxl_ram_mb: Option<u32>,
 }
 
 impl Default for GuestConfig {
@@ -227,6 +228,7 @@ impl Default for GuestConfig {
             spice: None,
             vnc: false,
             display: Display::Qxl,
+            qxl_ram_mb: None,
         }
     }
 }
@@ -266,6 +268,18 @@ impl GuestConfig {
     /// Guest memory in MiB.
     pub fn memory_mb(mut self, mb: u32) -> Self {
         self.memory_mb = mb;
+        self
+    }
+
+    /// The QXL device's RAM in MiB, which holds the commands and images the
+    /// guest hands the device; QEMU's default is 64. Only for QXL.
+    ///
+    /// The GLZ soak needs more. Under TCG with the default, the guest's QXL
+    /// driver ran out and blocked waiting for the device to release memory
+    /// (`docs/roadmap.md` §2.7), which is a known regression in the guest
+    /// kernel rather than anything a SPICE client controls.
+    pub fn qxl_ram_mb(mut self, mb: u32) -> Self {
+        self.qxl_ram_mb = Some(mb);
         self
     }
 }
@@ -537,11 +551,20 @@ impl Guest {
         // openable, not merely present -- a user outside the `kvm` group sees
         // the device node, and `-accel kvm` then fails before QMP is up, which
         // surfaces as a boot timeout that names nothing useful.
-        if std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/kvm")
-            .is_ok()
+        if let (Display::Qxl, Some(mb)) = (config.display, config.qxl_ram_mb) {
+            qemu.args(["-global", &format!("qxl-vga.ram_size_mb={mb}")]);
+        }
+
+        // `SOLSTICE_GUEST_ACCEL=tcg` forces TCG on a host that has KVM, to
+        // reproduce what a slower runner sees: a guest that is slow relative
+        // to the client changes which races a test can hit.
+        let force_tcg = std::env::var("SOLSTICE_GUEST_ACCEL").is_ok_and(|v| v == "tcg");
+        if !force_tcg
+            && std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/kvm")
+                .is_ok()
         {
             qemu.args(["-accel", "kvm"]);
         }
@@ -750,16 +773,53 @@ impl Guest {
         self.vnc_port.expect("this guest has no VNC server")
     }
 
+    /// Where the guest's X server and drawing clients are blocked, for a
+    /// command that timed out.
+    ///
+    /// The guest agent is separate from X, so it still answers when X is
+    /// stuck. Each process's state, kernel wait channel and kernel stack say
+    /// whether it is waiting on the display device, on a client or on nothing,
+    /// and `dmesg` carries anything the driver logged. This is what showed the
+    /// GLZ soak's stalls to be the guest's QXL driver waiting for the device to
+    /// release memory, with the client idle and up to date
+    /// (`docs/roadmap.md` §2.7).
+    pub fn stall_report(&self) -> String {
+        match self.sh(STALL_REPORT) {
+            Ok(report) => report,
+            Err(e) => format!("the guest agent did not answer either: {e}"),
+        }
+    }
+
     /// Everything the guest wrote to its serial console, for failure messages.
     pub fn console(&self) -> String {
         std::fs::read_to_string(self.dir.join("console.log")).unwrap_or_default()
     }
 }
 
+/// What [`Guest::stall_report`] runs in the guest.
+const STALL_REPORT: &str = "for p in $(pidof Xorg X solstice-draw xterm); do \
+    echo \"== $p $(cat /proc/$p/comm): wchan=$(cat /proc/$p/wchan), \
+    $(grep State /proc/$p/status)\"; head -20 /proc/$p/stack 2>&1; done; \
+    echo '== dmesg'; dmesg | tail -20";
+
 impl Drop for Guest {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The report runs only when a guest command has already hung, which is
+    /// the worst moment to find out its quoting is broken.
+    #[test]
+    fn the_stall_report_is_valid_shell() {
+        let status = std::process::Command::new("sh")
+            .args(["-n", "-c", super::STALL_REPORT])
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 }

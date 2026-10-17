@@ -851,6 +851,11 @@ pub async fn cursor_task<R>(
     let _ = events.send(DisplayEvent::CursorGone).await;
 }
 
+/// The longest the display task batches commands before publishing what it
+/// has. Under a client's frame interval at any rate it streams at, so a busy
+/// server costs batching, never frames.
+const MAX_BATCH: std::time::Duration = std::time::Duration::from_millis(8);
+
 /// Own the surfaces and publish frames until the queue closes.
 pub async fn display_task(
     mut display: DisplayChannel,
@@ -870,8 +875,12 @@ pub async fn display_task(
             return;
         }
         // Drain whatever else is already queued before painting, so one
-        // frame's worth of commands produces one damage event.
-        loop {
+        // frame's worth of commands produces one damage event -- but only for
+        // so long. A server drawing faster than this client rasterises keeps
+        // the queue from ever going empty, and waiting for that published
+        // nothing at all: the picture froze while decoding carried on.
+        let batch_started = std::time::Instant::now();
+        while batch_started.elapsed() < MAX_BATCH {
             match events.try_recv() {
                 Ok(event) => {
                     if let Err(e) = display.handle(event) {
@@ -944,6 +953,53 @@ mod tests {
             kind: display_msg::DRAW_FILL,
             body: w.finish(),
         }
+    }
+
+    /// A server that draws faster than this client rasterises keeps the
+    /// queue from ever going empty. Publishing only on an empty queue then
+    /// published nothing, ever: the picture froze while decoding carried on.
+    /// A real guest under KVM did exactly this to a debug build.
+    ///
+    /// Modelled as a queue holding far more work than one batch may take: the
+    /// first damage must arrive while most of it is still queued.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_queue_that_never_empties_still_publishes() {
+        const QUEUED: usize = 64;
+        let (display, mut damage, _) = channel();
+        let (queue, rx) = mpsc::channel(QUEUED + 2);
+        let (outgoing, _out_rx) = mpsc::channel(64);
+        queue
+            .try_send(DisplayEvent::Message(surface_create(0, 640, 480, true)))
+            .unwrap();
+        queue
+            .try_send(DisplayEvent::Message(Message {
+                kind: display_msg::MARK,
+                body: Vec::new(),
+            }))
+            .unwrap();
+        for n in 0..QUEUED as u32 {
+            queue
+                .try_send(DisplayEvent::Message(fill(0, 0, 0, 640, 480, n * 0x010101)))
+                .unwrap();
+        }
+        let task = tokio::spawn(display_task(display, rx, outgoing));
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if let Ok(BackendEvent::Damage(_)) = damage.recv().await {
+                    return;
+                }
+            }
+        })
+        .await;
+        // `capacity` is the free slots, so what is still queued is the rest.
+        let still_queued = queue.max_capacity() - queue.capacity();
+        task.abort();
+        assert!(first.is_ok(), "nothing was ever published");
+        assert!(
+            still_queued > QUEUED / 2,
+            "the first publish waited for the queue to drain ({still_queued} of {QUEUED} left)"
+        );
     }
 
     #[test]

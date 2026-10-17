@@ -535,24 +535,67 @@ the clipboard are each validated against a real `spice-vdagent` (§2.6).
   twenty rounds. It has run clean for 3,000 rounds: 36,000 GLZ images and
   25.6 million fills over 46 minutes, with the screen exact at every check.
   Nothing has yet been found wrong in the GLZ window itself.
-- **The soak sometimes stalls, and the cause is not found.** Three of five
-  runs, after the runtime fix in §2.6, stalled a few minutes in. Each time a
-  guest command hung because its X server was blocked on a full QXL ring.
-  The client's runtime was alive (a task printing its counters kept
-  printing), but the session received nothing more. QEMU's threads were
-  all idle, and the SPICE worker was waiting in its poll loop, which is what
-  it does when it is waiting on a client's `ACK` or socket. That points at the
-  join between this client's display channel and the server. Candidates
-  include an `ACK` dropped by `try_send` on a full queue, or a task parked
-  somewhere unexpected. It is not certain the harness is innocent either.
-  **Until it is explained, treat it as able to hang a real session.** What
-  closes it: a backtrace of the test process at the moment of a stall.
-  `gdb -p` works on this box. One capture caught QEMU's side but attached to
-  the wrong process for the client.
-- **Nothing is tuned.** The rasteriser's inner loops are per-pixel closures.
-  A debug build keeps up with a scrolling terminal over MJPEG; nothing
-  heavier has been measured, and it should be measured against a real frame
-  rather than guessed at.
+- **The soak stall is explained, and it is not in this client.** Under TCG
+  the soak still stalls: 5 of 6 baseline runs, between rounds 299 and 2,639.
+  It was traced in three steps.
+  - **The client is idle and up to date.** At each stall, every socket queue
+    between client and QEMU was empty in both directions, before and after a
+    five-second wait. Both runtime workers were parked. Counting on the
+    display channel showed 10.6 million messages received and one `ACK` per
+    20 sent, none dropped. By `spice-server`'s own rule
+    (`red-channel-client.cpp`, `waiting_for_ack`) that leaves it 19 messages
+    into a window of 40, so it was not waiting for an `ACK`. A missing
+    `ACK`, the leading suspect, is ruled out.
+  - **The guest's X server is blocked in its QXL driver.**
+    `Guest::stall_report` asks the guest agent, which still answers. Xorg was
+    in uninterruptible sleep in `qxl_fence_wait`, under
+    `qxl_execbuffer_ioctl` → `qxl_alloc_release_reserved` → TTM eviction. It
+    is waiting for the device to release memory before it can submit
+    another command. The server has nothing to send because the guest submits
+    nothing, and the guest submits nothing because the server has not
+    released the memory.
+  - **It is the guest kernel's known regression.** The guest runs Linux
+    6.18, whose `qxl_fence_wait` is the simplified version upstream reverted
+    in April 2024 for exactly this, `[TTM] Buffer eviction failed` under
+    load (Debian #1054514). A month later it was reapplied to fix a boot
+    hang, with the note that the eviction failures "may obviously" return.
+    The client's only lever on what the server holds is the GLZ window it
+    declares, and that is not the cause either. Windows of 64, 24 and 1 MiB
+    all stalled.
+
+  More QXL memory avoids it. With the device's RAM at 128 MiB, twice QEMU's
+  default, two TCG soaks ran all 3,000 rounds clean. A third was clean to
+  round 1,259 when a time limit stopped it. With the default, 5 of 6 runs
+  stalled. The soak exists to exercise this client's GLZ decoding, not the
+  guest kernel's memory handling, so its guest now gets 128 MiB
+  (`GuestConfig::qxl_ram_mb`), and every other test keeps the default
+  device. **For a real deployment:** a Linux guest on a QXL device can stall
+  this way under heavy drawing. The client had nothing outstanding when it
+  did, so no client-side change is known to help, and a larger
+  `qxl-vga.ram_size_mb` is the mitigation. Only TCG has reproduced it.
+
+  Two things are changed here. The soak's guest calls now print
+  `Guest::stall_report` when they time out. The SPICE tests also install a
+  log subscriber, warnings on by default, because the client reports a
+  failed display by logging and closing it, and without a subscriber that
+  looked like a server gone quiet. `SOLSTICE_GUEST_ACCEL=tcg` forces TCG on
+  a host with KVM, which is where this reproduces; with KVM a 3,000-round
+  soak ran clean in six minutes.
+- **A busy server froze the picture.** The display task published damage
+  only when its queue went momentarily empty. A server drawing faster than
+  the client rasterises never lets it empty. Under KVM, a debug build fell
+  that far behind a scrolling terminal, and
+  `mjpeg_streams_are_decoded_and_composited_over_the_draw_output` saw no
+  updates at all while decoding carried on. Batches are now capped at 8 ms,
+  and `a_queue_that_never_empties_still_publishes` fails without the cap.
+- **Nothing is tuned, and a debug build shows it.** The rasteriser's inner
+  loops are per-pixel closures. Under KVM an unoptimised client fell behind
+  a scrolling terminal badly enough to fail the MJPEG test: about 130 ms per
+  GLZ image, and 16 updates where the test needs 50. The dev profile now
+  optimises `solstice-spice` and `solstice-spice-codec`, as it already did
+  the RSA crates. Overflow checks and debug assertions stay on. A release
+  build passed with or without that. Tuning should still be measured
+  against a real frame rather than guessed at.
 - **GLZ out-of-order images are refused, not awaited.** `spice-gtk` blocks on
   a coroutine when a match refers to an image that has not arrived. With one
   display channel the case does not arise, because one channel delivers in
