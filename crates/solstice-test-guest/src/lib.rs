@@ -112,7 +112,11 @@ pub struct Spice {
 
 impl Default for Spice {
     fn default() -> Self {
-        Self { options: Vec::new(), agent: true, audio: false }
+        Self {
+            options: Vec::new(),
+            agent: true,
+            audio: false,
+        }
     }
 }
 
@@ -474,8 +478,7 @@ fn unavailable(need_mb: u32) -> Option<String> {
 /// Warn, without failing, when the built image predates the committed lock.
 fn warn_if_stale() {
     let built = image_dir().join("manifest.lock");
-    let committed = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/guest/manifest.lock");
+    let committed = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/guest/manifest.lock");
     if let (Ok(a), Ok(b)) = (std::fs::read(&built), std::fs::read(&committed)) {
         if a != b {
             println!(
@@ -535,14 +538,26 @@ impl Guest {
                 ),
             ])
             .args(["-vga", config.display.vga()])
-            .args(["-qmp", &format!("unix:{},server=on,wait=off", sock("qmp.sock").display())])
+            .args([
+                "-qmp",
+                &format!("unix:{},server=on,wait=off", sock("qmp.sock").display()),
+            ])
             .args([
                 "-chardev",
-                &format!("socket,path={},server=on,wait=off,id=qga0", sock("qga.sock").display()),
+                &format!(
+                    "socket,path={},server=on,wait=off,id=qga0",
+                    sock("qga.sock").display()
+                ),
             ])
             .args(["-device", "virtio-serial"])
-            .args(["-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0"])
-            .args(["-serial", &format!("file:{}", sock("console.log").display())])
+            .args([
+                "-device",
+                "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
+            ])
+            .args([
+                "-serial",
+                &format!("file:{}", sock("console.log").display()),
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
 
@@ -577,8 +592,7 @@ impl Guest {
         if let Some(spice) = &config.spice {
             let port = free_port()?;
             spice_port = Some(port);
-            let mut value =
-                format!("port={port},addr=127.0.0.1,disable-ticketing=on");
+            let mut value = format!("port={port},addr=127.0.0.1,disable-ticketing=on");
             for (key, option) in &spice.options {
                 value.push_str(&format!(",{key}={option}"));
             }
@@ -587,7 +601,10 @@ impl Guest {
                 // Without this pair spice-vdagentd has no port and the guest
                 // comes up agentless.
                 qemu.args(["-chardev", "spicevmc,id=vdagent,name=vdagent"]);
-                qemu.args(["-device", "virtserialport,chardev=vdagent,name=com.redhat.spice.0"]);
+                qemu.args([
+                    "-device",
+                    "virtserialport,chardev=vdagent,name=com.redhat.spice.0",
+                ]);
             }
             if spice.audio {
                 qemu.args(["-audiodev", "spice,id=snd0"]);
@@ -656,12 +673,18 @@ impl Guest {
 
     /// Issue a QMP command.
     pub fn qmp(&self, command: &str, args: Value) -> Result<Value> {
-        self.qmp.lock().expect("QMP channel poisoned").cmd(command, args)
+        self.qmp
+            .lock()
+            .expect("QMP channel poisoned")
+            .cmd(command, args)
     }
 
     /// Issue a guest-agent command.
     pub fn qga(&self, command: &str, args: Value) -> Result<Value> {
-        self.qga.lock().expect("agent channel poisoned").cmd(command, args)
+        self.qga
+            .lock()
+            .expect("agent channel poisoned")
+            .cmd(command, args)
     }
 
     /// Run a program in the guest and wait for it, capturing both streams.

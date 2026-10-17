@@ -1292,11 +1292,20 @@ against. The findings are about the old arrangement:
 
 ## 8. Smaller items
 
-- **A cursor for the VNC backend.** Moonlight draws no host cursor, and the
-  RFB backend neither asks for the Cursor pseudo-encoding (-239) nor draws one,
-  so a VNC desktop streams with no pointer at all. The SPICE backend already
-  composites one (`crates/solstice-spice/src/cursor.rs`); RFB needs the same,
-  drawn at the position Moonlight last sent.
+- **The VNC cursor is drawn; three things are left.** The RFB backend lists
+  the Cursor pseudo-encoding (−239) and composites the shape at the position
+  Moonlight last sent (`crates/solstice-vnc/src/cursor.rs`), tested against
+  the mock. Left:
+  - **No real server has sent it to this client yet.** QEMU sends −239 for a
+    guest with a hardware cursor (virtio-gpu), so the guest tier is the
+    place to check, before trusting it.
+  - **Cursor With Alpha (−314)** is not listed, so shapes are 1-bit masked:
+    no soft edges or drop shadows. QEMU and TigerVNC send it to a client
+    that asks; its layout should be checked against a real server.
+  - **In relative mode the drawn pointer can drift** from the guest's. The
+    position is the one the client sends, which is exact for an absolute
+    pointer, but a guest that accelerates relative motion moves further.
+    Nothing reads the guest's position back.
 - **The letterbox scaler is nearest-neighbour.** `convert_scaled` takes one
   source pixel per output pixel, which drops a third of the rows of a 1080p
   desktop streamed at 720p -- text loses strokes. It is also slow: a

@@ -96,10 +96,8 @@ fn start_server() -> Option<Guest> {
     )?;
 
     guest.fill("2e3436").ok()?;
-    let _ = guest.sh(
-        "nohup xterm -fn 10x20 -geometry 100x40+10+10 \
-         -e sh -c 'while :; do ls -lR /usr 2>/dev/null; done' >/dev/null 2>&1 &",
-    );
+    let _ = guest.sh("nohup xterm -fn 10x20 -geometry 100x40+10+10 \
+         -e sh -c 'while :; do ls -lR /usr 2>/dev/null; done' >/dev/null 2>&1 &");
     let _ = guest.sh(
         "nohup sh -c 'while :; do solstice-draw stroke 48; solstice-draw text; \
          sleep 0.2; done' >/dev/null 2>&1 &",
@@ -245,7 +243,9 @@ async fn what_each_encoding_costs() {
         results.push(measure(port, name, &encodings).await);
     }
 
-    println!("\n{WIDTH}x{HEIGHT} QEMU guest, scrolling text plus vector drawing, {MEASURE:?} per case\n");
+    println!(
+        "\n{WIDTH}x{HEIGHT} QEMU guest, scrolling text plus vector drawing, {MEASURE:?} per case\n"
+    );
     println!(
         "{:<22} {:>10} {:>9} {:>9} {:>10} {:>12}",
         "encoding", "MB/s", "updates", "CPU %", "MPixel/s", "bytes/pixel"

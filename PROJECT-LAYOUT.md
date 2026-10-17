@@ -214,6 +214,7 @@ src/
 ├── handshake.rs      # version, security type, VeNCrypt
 ├── auth.rs           # None / VNC Auth / VeNCrypt — with the policy from security.md §4.1
 ├── session.rs        # the update loop; ContinuousUpdates + Fence when available
+├── cursor.rs         # the Cursor pseudo-encoding, drawn where the client points
 ├── encodings/        # Raw, CopyRect, Hextile, ZRLE, Tight
 ├── pixel.rs          # PIXEL_FORMAT → BGRA blit
 └── input.rs          # InputEvent → KeyEvent / QEMU ext key / PointerEvent

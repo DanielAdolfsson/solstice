@@ -22,11 +22,7 @@ pub(crate) struct Channel {
 
 impl Channel {
     /// Connect, retrying until QEMU has created the socket.
-    pub(crate) fn connect(
-        path: &Path,
-        name: &'static str,
-        timeout: Duration,
-    ) -> Result<Self> {
+    pub(crate) fn connect(path: &Path, name: &'static str, timeout: Duration) -> Result<Self> {
         let deadline = Instant::now() + timeout;
         let stream = loop {
             match UnixStream::connect(path) {
