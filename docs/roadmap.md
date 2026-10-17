@@ -1599,8 +1599,14 @@ and over VNC, with endpoints added and removed while it watched:
   The blit is 0.4 and 0.8 ms of that; the rest is the bitmap's conversion.
   `the_unscaled_blit_matches_the_per_pixel_one` holds the span path to the
   per-pixel one over 5,000 random blits, with overlapping clips, offsets off
-  either edge and all sixteen operations. It has not been re-measured
-  against the live guest.
+  either edge and all sixteen operations. On the live guest, the display
+  task's busy time per batch fell from a mean of 9.5 ms (p90 15.3) to
+  1.2 ms (p90 1.8). The frame rate did not move, because it was never the
+  client's: KWin draws at about 60 Hz, and the client was keeping up
+  before. The gain is headroom, which 1080p, where the old path cost about
+  a frame, needs. Moonlight's host processing latency does not show it
+  either: that is measured from the frame tick through conversion and
+  encode, and the display task runs before it.
 
 ### What is left
 
