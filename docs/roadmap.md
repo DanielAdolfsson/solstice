@@ -524,7 +524,8 @@ the clipboard are each validated against a real `spice-vdagent` (§2.6).
   unit-tested only. A Windows guest with the QXL display driver is the source
   to try next. It is not known for certain to emit them either, so check
   with the counts before building on it.
-- **The GLZ soak exists, and nothing runs it on a schedule.**
+- **The GLZ soak exists, and is run by hand.** Nothing schedules it, by
+  decision (`docs/testing.md` §6).
   `glz_soak_keeps_the_screen_exact_across_thousands_of_images` repaints with
   changing content and compares the screen with QEMU's screendump every
   twenty rounds. It has run clean for 3,000 rounds: 36,000 GLZ images and
@@ -1285,8 +1286,8 @@ against. The findings are about the old arrangement:
   client's data until its half of the handshake completes, which under that
   much loss takes several retransmissions. One baseline run also hit the
   audio FEC defect §5 fixed. 20% and 30% pass.
-- **The control-loss script is manual.** It belongs in the nightly loss tier
-  (`docs/testing.md` §5) when there is one.
+- **The control-loss script is manual**, like the rest of the loss tier
+  (`docs/testing.md` §5, §6).
 
 ---
 
@@ -1303,7 +1304,7 @@ against. The findings are about the old arrangement:
   4K-to-1080p conversion plus the encode overran the 16.7 ms budget at 60 fps.
   Only reached when the backend will not resize, which both backends now
   normally do; an area-averaging downscale is the fix.
-- **Fuzzing: seeded and scripted, not scheduled.** Five targets now start
+- **Fuzzing: seeded and scripted, run by hand.** Five targets now start
   from real traffic. `tests/tools/gen_fuzz_seeds.py` cuts
   `fuzz/seeds/<target>/` out of the captured session (§4): the RTSP requests,
   the ANNOUNCE body, the input batches, the control messages and the ENet
@@ -1333,9 +1334,9 @@ against. The findings are about the old arrangement:
   first, the scaling is done in `i128`, and both inputs are a unit test.
   `spice_draw` then ran clean for five minutes, 8.2 million runs.
 
-  **No scheduled job.** There is no CI in this repository yet, and a nightly
-  fuzz run is the place to start one. `docs/testing.md` §6 sketches it, and
-  `fuzz.sh` is what it would call.
+  **No scheduled job, by decision.** CI builds, lints and tests on push and
+  pull request only (`docs/testing.md` §6). Fuzzing is `fuzz.sh`, run by
+  hand when a parser changes.
 - **More RFB servers.** `docs/testing.md` §3.3 lists exactly what dropping
   `wayvnc`, `x11vnc`, TurboVNC and QEMU's `-vnc` costs. x11vnc is the
   interesting one: libvncserver implements QEMU extended key events in its

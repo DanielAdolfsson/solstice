@@ -339,20 +339,21 @@ nearest-neighbour sampling. For a text-heavy desktop that is a defensible
 default — a smoothing filter costs CPU to make text less legible — but it has
 not been compared against anything.
 
-### The fuzz targets have no corpus and no CI job
+### The fuzz targets are seeded, and run by hand
 
 Ten targets exist and each runs clean for a minute to a few
 (`rtsp_message`, `sdp_announce`, `input_batch`, `control_envelope`,
 `enet_host`, `rfb_rect`, `spice_quic`, `spice_lz`, `spice_draw`,
 `spice_message`). `enet_host` has had the longest run, ten minutes seeded
 from the captured session (`docs/roadmap.md` §7). That is
-a smoke test, not the nightly tier `docs/testing.md` §6 describes. There is no
-seed corpus, no persistent corpus, and nothing runs them unattended.
+a smoke test, not the hours-long T5 runs `docs/testing.md` §6 describes. Five
+targets are now seeded and `tests/tools/fuzz.sh` runs them
+(`docs/roadmap.md` §8); nothing runs them unattended, by decision.
 
 The short runs have not been wasted: four of those targets have each found a
 real unbounded allocation or out-of-bounds index in under two minutes, all
 four on the SPICE side, all four now with named regression tests. That is a
-reasonable argument that the nightly tier would find more.
+reasonable argument that longer runs would find more.
 
 ### What a real SPICE server found, and what it still cannot reach
 
