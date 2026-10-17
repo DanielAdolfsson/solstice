@@ -163,16 +163,21 @@ impl FrameClock {
             self.last_change = now;
         }
         let still = now.saturating_duration_since(self.last_change) >= IDLE_AFTER;
-        // Schedule from `now` rather than from the old deadline: after a stall
-        // (a slow encode, a backend hiccup) advancing the old deadline would
-        // emit a burst of catch-up frames, which is exactly the burst the
-        // pacing in the packetiser exists to avoid.
-        self.next_deadline = now
-            + if still {
-                self.idle_interval
-            } else {
-                self.interval
-            };
+        // Schedule from the old deadline, not from `now`: every wake-up is a
+        // little late, and scheduling from when it happened adds that lateness
+        // to every interval -- a real 1080p60 session measured 56 fps, about
+        // 1.2 ms of oversleep a frame. But after a stall (a slow encode, a
+        // backend hiccup) advancing the old deadline would emit a burst of
+        // catch-up frames, which is exactly the burst the pacing in the
+        // packetiser exists to avoid; so once a whole interval behind, start
+        // again from `now`.
+        let interval = if still {
+            self.idle_interval
+        } else {
+            self.interval
+        };
+        let next = self.next_deadline + interval;
+        self.next_deadline = if next > now { next } else { now + interval };
         self.last_emitted = Some(now);
         Some(tick)
     }
@@ -329,6 +334,30 @@ mod tests {
             "a second frame was due at the same instant"
         );
         assert!(clock.poll(resumed + clock.interval()).is_some());
+    }
+
+    #[test]
+    fn late_wake_ups_do_not_lower_the_rate() {
+        // Every poll lands 1.2 ms after its deadline, as a sleeping thread's
+        // do. Sixty frames must still take one second, not 1.07.
+        let start = Instant::now();
+        let mut clock = FrameClock::new(60, start);
+        let late = Duration::from_micros(1200);
+        let mut now = start;
+        let mut emitted = 0;
+        let mut last = start;
+        while emitted < 61 {
+            if clock.poll(now).is_some() {
+                emitted += 1;
+                last = now;
+            }
+            now += clock.time_until_next(now) + late;
+        }
+        let took = last - start;
+        assert!(
+            took <= Duration::from_millis(1005),
+            "61 frames at 60 fps took {took:?}"
+        );
     }
 
     #[test]

@@ -98,6 +98,10 @@ pub async fn run(
     loop {
         let now = Instant::now();
         if let Some(tick) = clock.poll(now) {
+            // The latency the client is told covers conversion as well as the
+            // encode: both are host time spent on this frame, and a scaled
+            // conversion can cost as much as the encode.
+            let started = Instant::now();
             // Convert only what changed, unless the geometries disagree -- a
             // scaled frame has no one-to-one rectangle mapping.
             if let Some(rect) = tick.damage {
@@ -115,7 +119,6 @@ pub async fn run(
             } else {
                 FrameType::P
             };
-            let started = Instant::now();
             let encoded = match encoder.encode(&frame, tick.force_idr) {
                 Ok(encoded) => encoded,
                 Err(e) => {
