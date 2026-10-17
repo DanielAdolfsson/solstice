@@ -114,15 +114,16 @@ without starting a daemon.
 src/
 ├── main.rs
 ├── lib.rs            # ▲ also a library, so the end-to-end test can start it
-├── cli.rs            # clap: run, pair, status, list-clients, revoke
+├── cli.rs            # clap: run [--endpoint ...], pair, status, list-clients, revoke
 ├── management.rs     # ▲ the control socket those subcommands talk to the daemon over
 ├── config.rs         # serde + toml; see §5
+├── endpoint.rs       # ▲ the desktops on offer: one spec for TOML, --endpoint and (later) the socket
 ├── supervisor.rs     # session lifecycle, resource ceilings, shutdown
 ├── pipeline.rs       # ▲ the frame loop: framebuffer → convert → encode → packetise
 ├── testpattern.rs    # ▲ the colour-bar backend (and a tone), for milestone 1 and the tests
 ├── audio.rs          # ▲ the audio sender: one packet per negotiated duration
 ├── tls.rs            # ▲ the mutual-TLS listener's client-certificate policy
-├── backend_factory.rs# config → Arc<dyn Backend>, where the feature flags land
+├── backend_factory.rs# endpoint → Arc<dyn Backend>, where the feature flags land
 └── net/
     ├── nvhttp.rs     # the two HTTP listeners
     ├── rtsp.rs       # TCP 48010, plaintext and GCM-wrapped
@@ -574,21 +575,24 @@ encoder   = "openh264"
 codecs    = ["h264"]
 fec_percentage = 0
 
-[backend]
-kind = "vnc"
-
-[backend.vnc]
+# Zero or more; each is one Moonlight app. `solstice run --endpoint
+# 'name=...,kind=...'` takes the same keys.
+[[endpoint]]
+name     = "Build box"          # the app id is a hash of this
+kind     = "vnc"
 host     = "127.0.0.1"
 port     = 5900
 security = "vencrypt"           # refuse "none"/"vncauth" off-loopback
 ca_file  = "/etc/solstice/vnc-ca.pem"
 
-# [backend.spice]
-# host     = "127.0.0.1"
-# port     = 5901              # the server's *TLS* port, configured separately
-# security = "tls"             # refuse "plain" off-loopback
-# ca_file  = "/etc/solstice/spice-ca.pem"
-# audio    = true
+[[endpoint]]
+name     = "Windows VM"
+kind     = "spice"
+host     = "127.0.0.1"
+port     = 5901                 # the server's *TLS* port, configured separately
+security = "tls"                # refuse "plain" off-loopback
+password_file = "/etc/solstice/windows.pw"
+audio    = true
 ```
 
 ---

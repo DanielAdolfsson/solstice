@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use solstice::config::{BackendKind, Config, Encoder};
+use solstice::config::{Backend, Config, Encoder};
 use solstice::testpattern::TestPatternBackend;
 use solstice_backend::{InputEvent, KeyEvent, MouseButton};
 use solstice_gamestream::crypto::certs::HostIdentity;
@@ -231,7 +231,7 @@ async fn the_reference_moonlight_client_streams_from_this_host() {
     const PORTS: Ports = Ports::from_base(49289);
     let mut config = Config::default();
     config.server.port = PORTS.http;
-    config.backend.kind = BackendKind::TestPattern;
+    config.backend = Some(Backend::default());
     config.video.encoder = Encoder::OpenH264;
     config.limits.max_width = WIDTH;
     config.limits.max_height = HEIGHT;
@@ -458,7 +458,7 @@ async fn the_reference_client_sits_through_a_still_screen_at_the_idle_rate() {
     const PORTS: Ports = Ports::from_base(49489);
     let mut config = Config::default();
     config.server.port = PORTS.http;
-    config.backend.kind = BackendKind::TestPattern;
+    config.backend = Some(Backend::default());
     config.video.encoder = Encoder::OpenH264;
     config.video.idle_fps = IDLE_FPS;
     config.limits.max_width = WIDTH;
@@ -609,7 +609,7 @@ async fn revoking_the_client_ends_its_running_stream() {
     const PORTS: Ports = Ports::from_base(49689);
     let mut config = Config::default();
     config.server.port = PORTS.http;
-    config.backend.kind = BackendKind::TestPattern;
+    config.backend = Some(Backend::default());
     config.video.encoder = Encoder::OpenH264;
     config.limits.max_width = WIDTH;
     config.limits.max_height = HEIGHT;
@@ -810,7 +810,7 @@ async fn the_reference_client_hears_the_backends_tone_in_every_layout() {
     const PORTS: Ports = Ports::from_base(49589);
     let mut config = Config::default();
     config.server.port = PORTS.http;
-    config.backend.kind = BackendKind::TestPattern;
+    config.backend = Some(Backend::default());
     config.video.encoder = Encoder::OpenH264;
     config.limits.max_width = WIDTH;
     config.limits.max_height = HEIGHT;
@@ -946,19 +946,22 @@ async fn the_reference_client_hears_a_real_spice_guest() {
     const PORTS: Ports = Ports::from_base(49789);
     let mut config = Config::default();
     config.server.port = PORTS.http;
-    config.backend.kind = BackendKind::Spice;
-    config.backend.spice.host = "127.0.0.1".into();
-    config.backend.spice.port = guest.spice_port();
+    let mut backend = Backend {
+        kind: solstice::config::BackendKind::Spice,
+        ..Backend::default()
+    };
+    backend.spice.host = "127.0.0.1".into();
+    backend.spice.port = guest.spice_port();
     // Loopback, which is the only place plaintext SPICE is permitted.
-    config.backend.spice.security = solstice::config::SpiceSecurityKind::Plain;
-    config.backend.spice.audio = true;
+    backend.spice.security = solstice::config::SpiceSecurityKind::Plain;
+    backend.spice.audio = true;
+    config.backend = Some(backend);
     config.video.encoder = Encoder::OpenH264;
     config.limits.max_width = WIDTH;
     config.limits.max_height = HEIGHT;
     config.limits.max_fps = FPS;
 
-    let backend = solstice::backend_factory::build(&config).unwrap();
-    let (_host, state_dir) = start_daemon_with(config, "mlc-spice-audio", backend);
+    let (_host, state_dir) = common::start_daemon(config, "mlc-spice-audio");
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // `speaker-test -c 2` takes the channels in turn, so each would carry the

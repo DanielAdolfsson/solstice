@@ -45,6 +45,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::endpoint::Endpoints;
+
 /// The longest request line accepted, newline included.
 const MAX_REQUEST: u64 = 256;
 /// How long a peer has to send its request.
@@ -202,8 +204,8 @@ pub struct Context {
     pub host: Arc<Host>,
     /// The window `pair` opens when it is not given one.
     pub pairing_window: Duration,
-    /// The backend's name, for `status`.
-    pub backend: &'static str,
+    /// What the daemon offers, for `status`.
+    pub endpoints: Arc<Endpoints>,
 }
 
 /// A bound management socket, not yet serving.
@@ -422,9 +424,17 @@ fn status_lines(context: &Context) -> Vec<String> {
             "closed".into()
         }
     };
-    vec![
-        format!("name: {}", host.config.name),
-        format!("backend: {}", context.backend),
+    let mut lines = vec![format!("name: {}", host.config.name)];
+    if context.endpoints.is_empty() {
+        lines.push("endpoints: none; Moonlight shows an empty app list".into());
+    }
+    for entry in context.endpoints.iter() {
+        lines.push(format!(
+            "endpoint: {} (app {}): {}",
+            entry.name, entry.id, entry.detail
+        ));
+    }
+    lines.extend([
         format!("pairing: {pairing}"),
         format!(
             "paired clients: {}",
@@ -434,7 +444,8 @@ fn status_lines(context: &Context) -> Vec<String> {
             "sessions: {}",
             host.sessions.lock().expect("session lock").len()
         ),
-    ]
+    ]);
+    lines
 }
 
 /// What became of the window a `pair` request opened.

@@ -13,6 +13,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use crate::endpoint::Spec;
+
 /// A proxy that lets a Moonlight client connect to a VNC or SPICE desktop.
 #[derive(Parser, Debug)]
 #[command(name = "solstice", version, about)]
@@ -34,7 +36,18 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Run the daemon.
-    Run,
+    Run {
+        /// A remote desktop to offer, as `name=...,kind=...[,key=value...]`,
+        /// in addition to the configuration's `[[endpoint]]` tables. Repeat
+        /// for several; none at all is fine.
+        ///
+        /// The keys are the `[[endpoint]]` keys: name, kind (vnc, spice,
+        /// testpattern), host, port, security, password_file, ca_file and
+        /// audio. Not password, which every user on the machine could read
+        /// here.
+        #[arg(long = "endpoint", value_name = "SPEC", value_parser = Spec::parse)]
+        endpoints: Vec<Spec>,
+    },
 
     /// Open a time-boxed pairing window on the running daemon, and wait for it.
     ///
@@ -103,9 +116,42 @@ mod tests {
 
     #[test]
     fn run_is_a_subcommand_not_a_default() {
-        assert!(matches!(
-            Cli::parse_from(["solstice", "run"]).command,
-            Command::Run
-        ));
+        let Command::Run { endpoints } = Cli::parse_from(["solstice", "run"]).command else {
+            panic!("expected run")
+        };
+        assert!(endpoints.is_empty(), "no endpoints is a valid start");
+    }
+
+    #[test]
+    fn endpoints_are_repeatable_and_parsed_up_front() {
+        let cli = Cli::parse_from([
+            "solstice",
+            "run",
+            "--endpoint",
+            "name=My Spice X,kind=spice,host=127.0.0.1,port=7878",
+            "--endpoint",
+            "name=Bars,kind=testpattern",
+        ]);
+        let Command::Run { endpoints } = cli.command else {
+            panic!("expected run")
+        };
+        assert_eq!(
+            endpoints
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            ["My Spice X", "Bars"]
+        );
+        assert_eq!(endpoints[0].port, Some(7878));
+
+        let err = Cli::try_parse_from([
+            "solstice",
+            "run",
+            "--endpoint",
+            "name=A,kind=vnc,password=x",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("password_file"), "{err}");
     }
 }

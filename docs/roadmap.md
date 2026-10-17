@@ -42,6 +42,7 @@ What is left is ordinary work.
 | 6 | [The still-frame encode cost](#6-the-still-frame-encode-cost) | **done** — a still screen drops to a keep-alive rate, about 12× cheaper, and a real `moonlight-common-c` sits through it; what is left is in §6 | nothing |
 | 7 | [ENet: audit or reimplement](#7-enet-audit-or-reimplement) | **done** — reimplemented: the subset Moonlight uses, stricter than ENet before authentication, and held against upstream ENet under loss, the captured session and the real client; what is left is in §7 | nothing |
 | 8 | [Smaller items](#8-smaller-items) | varies | |
+| 9 | [Several endpoints, one app each](#9-several-endpoints-one-app-each) | **declared at startup: done** — `[[endpoint]]` and `--endpoint`, zero or more; adding and removing them at runtime is what is left, in §9 | nothing |
 
 §6, the still-frame cost, is done too: an idle 1080p60 session went from 56%
 of a core to under 5%. And §7, ENet, the last item on the pre-authentication
@@ -1379,3 +1380,111 @@ against. The findings are about the old arrangement:
   protocol one.
 - **UPnP / NAT-PMP.** `docs/security.md` §5.6: **do not implement this.**
   Automatically making a service internet-reachable is the operator's decision.
+
+---
+
+## 9. Several endpoints, one app each
+
+One daemon used to bridge one desktop. Moonlight already has a screen for
+choosing between several things on one host, the app list, so several
+desktops are several apps: connect to the host, then pick the machine.
+
+### What it is
+
+An **endpoint** is a name, a kind and that kind's settings. It can be
+declared in three places, and all three take the same keys and go through
+the same parser (`crates/solstice/src/endpoint.rs`):
+
+```toml
+[[endpoint]]
+name = "Windows VM"
+kind = "spice"
+host = "127.0.0.1"
+port = 5901
+```
+
+```sh
+solstice run --endpoint 'name=Windows VM,kind=spice,host=127.0.0.1,port=5901'
+```
+
+The third place, the management socket, is what is left (below).
+
+- **Zero is valid.** The daemon pairs, `/applist` is an empty successful
+  list rather than an error, `status` says `endpoints: none`, and a warning
+  is logged at startup. Pair first, add desktops later. The default config
+  has no endpoints. The colour bars are now one more endpoint kind,
+  `kind = "testpattern"`.
+- **The app id is a hash of the name**, in `2..=i32::MAX`. Moonlight saves
+  box art, favourites and hidden apps by id. If the id followed list
+  position, removing one endpoint would shift the next onto its
+  predecessor's favourites. Renaming an endpoint makes it a new app. Two
+  names that hash to the same id are refused at startup, not left to chance.
+- **The old `[backend]` section still loads**, as one endpoint with app id 1
+  titled `server.app_title`. A client that knew the single app finds it
+  under the same id. A warning points at `[[endpoint]]`.
+- **The same refusals apply everywhere.** Plaintext SPICE and RFB
+  `none`/`vncauth` are refused off loopback, and fields that do not apply to
+  the kind are refused, whether the endpoint came from the file or a flag. A
+  `password` is refused on the command line, where every user on the machine
+  can read it. `password_file` is accepted everywhere. Names are at most 64
+  characters, without commas (the `--endpoint` separator) or control
+  characters (they reach the terminal through `status`).
+- **One stream at a time**, as before. Every stream binds the same fixed UDP
+  ports (`supervisor.rs`, `ports_free`), so this is "choose one of N", not N
+  at once. Streaming two endpoints simultaneously needs per-session ports.
+  That is a separate and larger piece of work.
+
+### Where it plugs in
+
+`Host` in `solstice-gamestream` holds the app list (`set_apps`, `has_app`)
+and knows nothing about backends. `/launch` accepts only an id on the list.
+The daemon's `Endpoints` maps each id to its `Arc<dyn Backend>`, and the
+supervisor looks up the session's `app_id` when its stream starts.
+`backend_factory` builds one backend per endpoint. Nothing is dialled until
+a stream starts.
+
+### How it is tested
+
+- The spec parser, resolution and refusals, the app-id range and stability,
+  and duplicate names: unit tests in `endpoint.rs`, `config.rs` and
+  `backend_factory.rs`.
+- `/applist` with several apps (in order, titles escaped) and with none, and
+  `/launch` refusing an id no longer offered: `nvhttp` unit tests.
+- `a_launch_streams_from_the_endpoint_it_named`: two test-pattern
+  endpoints, a full client session launching the second, and only the second
+  backend is dialled.
+- `status_lists_the_endpoints_from_the_file_and_the_flags`: the real binary
+  with a `[[endpoint]]` table and an `--endpoint` flag, a duplicate refused
+  before the daemon creates anything, and a daemon with none.
+
+### What is left
+
+- **Adding and removing at runtime, over the management socket.**
+
+  ```text
+  -> endpoint add name=Windows VM,kind=spice,host=127.0.0.1,port=5901
+  -> endpoint remove Windows VM
+  -> endpoint list
+  ```
+
+  `add` takes the same spec as `--endpoint` and goes through the same
+  `Spec::resolve`. That way the socket cannot get around the startup
+  refusals: it would otherwise be a way to make the daemon dial anywhere
+  with any security. The socket's trust is the same as the configuration
+  file's (0600 and a peer-credential check, §5). `remove` of an endpoint
+  that is streaming ends that session through the `ended` watch, as
+  revocation does. `MAX_REQUEST` (256 bytes) will need raising. `Endpoints`
+  becomes a locked map, and `Host::set_apps` follows every change.
+- **Runtime changes live in memory only**, unless that turns out wrong. A
+  restart returns to the file and the flags. Persisting them to `state_dir`
+  would make three sources that can disagree. For example, an `--endpoint`
+  removed at runtime: does it come back after a restart? Whatever drives
+  add and remove (a script that starts VMs, say) owns that state. This is a
+  decision to revisit if endpoints turn out to be managed by hand.
+- **How often Moonlight re-fetches `/applist`.** Sunshine's apps appear
+  without a reconnect, so clients do re-fetch, but nobody has measured how
+  often moonlight-qt does. That decides how soon an added endpoint shows up.
+- **An empty app list in a real client.** `moonlight-common-c` never looks
+  at it. moonlight-qt and the Android client should be checked for how they
+  show a host with no apps.
+

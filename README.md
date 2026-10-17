@@ -91,8 +91,17 @@ cargo build --no-default-features --features vnc      # no H.264 encoder
 
 ```sh
 cp contrib/solstice.example.toml /etc/solstice/solstice.toml
-solstice --config /etc/solstice/solstice.toml run
+solstice --config /etc/solstice/solstice.toml run \
+    --endpoint 'name=Windows VM,kind=spice,host=127.0.0.1,port=5901' \
+    --endpoint 'name=Build box,kind=vnc,host=10.0.0.5,password_file=/etc/solstice/build.pw'
 ```
+
+Each endpoint is one app in Moonlight's list: connect to the host, then pick
+the desktop. They can come from `--endpoint`, repeated, or from
+`[[endpoint]]` tables in the configuration, with the same keys either way.
+None at all is a valid start, so you can pair first and add desktops
+afterwards. `--endpoint` takes no `password`, because every user on the
+machine can read the command line; use `password_file`.
 
 Pairing is opened from a second shell, as the user the daemon runs as, with
 the PIN Moonlight is showing. The command waits until the client has paired,
@@ -110,9 +119,10 @@ There is no HTTP management API and no web UI.
 
 The shipped defaults are the deployment `docs/security.md` recommends: bound to
 loopback, pairing closed, encryption mandatory, one session, and a ceiling on
-every resolution, rate and bitrate the client can ask for. The default backend
-is the built-in colour-bar generator, so the host half can be brought up and
-pointed at a client before any desktop is involved.
+every resolution, rate and bitrate the client can ask for. There are no
+endpoints by default. `--endpoint 'name=Bars,kind=testpattern'` offers the
+built-in colour bars, so the host half can be brought up and pointed at a
+client before any desktop is involved.
 
 `contrib/solstice.service` is a hardened systemd unit: no capabilities,
 `ProtectSystem=strict`, a seccomp filter, and one writable directory.
@@ -211,6 +221,11 @@ summaries below are just the shape of it.
   the kind of thing that generates bug reports.
 - **HEVC and AV1.** `ServerCodecModeSupport` advertises H.264 only, and the
   DESCRIBE omits the two markers a client reads as "HEVC" and "AV1".
+- **Adding and removing endpoints at runtime.** They are fixed when the
+  daemon starts. The management socket is the planned route,
+  [§9](docs/roadmap.md#9-several-endpoints-one-app-each).
+- **Streaming two endpoints at once.** One stream at a time: every stream
+  binds the same fixed UDP ports.
 - **mDNS discovery.** Moonlight accepts a manually typed host.
 - **Hardware encoders.** The `VideoEncoder` trait is the seam; VAAPI and NVENC
   would arrive behind an `ffmpeg` feature. Licence-compatible — Solstice is

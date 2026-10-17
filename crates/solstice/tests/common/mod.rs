@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use solstice::config::Config;
+use solstice::endpoint::Endpoints;
 use solstice::supervisor::{build_host, Supervisor};
 use solstice_backend::Backend;
 use solstice_gamestream::crypto::certs::{ClientStore, HostIdentity};
@@ -224,8 +225,11 @@ pub fn start_daemon(
     config: Config,
     tag: &str,
 ) -> (Arc<solstice_gamestream::nvhttp::Host>, std::path::PathBuf) {
-    let backend = solstice::backend_factory::build(&config).unwrap();
-    start_daemon_with(config, tag, backend)
+    let endpoints = config.endpoints(&[]).unwrap();
+    let endpoints = solstice::backend_factory::build_all(&endpoints, &config.limits).unwrap();
+    let (host, state_dir) = start_daemon_endpoints(config, tag, endpoints);
+    open_pairing(&host);
+    (host, state_dir)
 }
 
 /// The same, with a backend the caller already holds a handle to.
@@ -239,22 +243,37 @@ pub fn start_daemon_with(
     backend: Arc<dyn Backend>,
 ) -> (Arc<solstice_gamestream::nvhttp::Host>, std::path::PathBuf) {
     let (host, state_dir) = start_daemon_closed(config, tag, backend);
-    // Opened directly rather than through `solstice pair`, so that a streaming
-    // test does not also depend on the management socket; `management.rs`
-    // drives that with the real binary.
+    open_pairing(&host);
+    (host, state_dir)
+}
+
+/// Opened directly rather than through `solstice pair`, so that a streaming
+/// test does not also depend on the management socket; `management.rs` drives
+/// that with the real binary.
+fn open_pairing(host: &solstice_gamestream::nvhttp::Host) {
     host.pairing
         .lock()
         .unwrap()
         .open(PIN, Duration::from_secs(120), std::time::Instant::now())
         .unwrap();
-    (host, state_dir)
 }
 
-/// Start a daemon with pairing closed, as a real one starts.
+/// Start a daemon with pairing closed, as a real one starts, offering one
+/// backend as app 1.
 pub fn start_daemon_closed(
     config: Config,
     tag: &str,
     backend: Arc<dyn Backend>,
+) -> (Arc<solstice_gamestream::nvhttp::Host>, std::path::PathBuf) {
+    let title = config.server.app_title.clone();
+    start_daemon_endpoints(config, tag, Endpoints::single(&title, backend))
+}
+
+/// Start a daemon with pairing closed, offering `endpoints`.
+pub fn start_daemon_endpoints(
+    config: Config,
+    tag: &str,
+    endpoints: Endpoints,
 ) -> (Arc<solstice_gamestream::nvhttp::Host>, std::path::PathBuf) {
     let state_dir = std::env::temp_dir().join(format!("solstice-e2e-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&state_dir);
@@ -265,7 +284,7 @@ pub fn start_daemon_closed(
     let clients = ClientStore::load(state_dir.join("clients.tsv")).unwrap();
     let host = Arc::new(build_host(&config, identity, clients));
 
-    let supervisor = Supervisor::new(config, host.clone(), backend);
+    let supervisor = Supervisor::new(config, host.clone(), endpoints);
     tokio::spawn(async move {
         if let Err(e) = supervisor.run().await {
             eprintln!("supervisor ended: {e}");

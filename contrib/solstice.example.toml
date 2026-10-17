@@ -10,6 +10,7 @@ name      = "solstice"
 bind      = "127.0.0.1"
 port      = 47989          # every other port is a fixed offset from this
 state_dir = "/var/lib/solstice"
+# The app title of an old single [backend] section; [[endpoint]] names its own.
 app_title = "Desktop"
 
 [security]
@@ -44,31 +45,48 @@ idle_fps       = 5
 # 10 ms stereo and re-encoded to the client's layout otherwise.
 enabled = true
 
-[backend]
-# "vnc", "spice" (needs the `spice` Cargo feature) or "testpattern".
-kind = "testpattern"
-
-[backend.vnc]
-host     = "127.0.0.1"
-port     = 5900
-# "none" and "vncauth" are refused against anything but loopback.
-security = "vencrypt"
-# password = "..."
-# ca_file  = "/etc/solstice/vnc-ca.pem"
-
-[backend.spice]
-host     = "127.0.0.1"
-# The port to link on. With security = "tls" this is the server's *TLS* port,
-# which SPICE configures independently of the plain one and for which there is
-# no convention -- so set it explicitly. QEMU: -spice tls-port=5901,...
-port     = 5900
-# "tls" or "plain". "plain" is refused against anything but loopback: SPICE's
-# ticket is a password check, not a key exchange, so without TLS the display
-# and every keystroke are in the clear (docs/security.md 4.2).
-security = "tls"
-# The ticket password, where the server has ticketing enabled. A server run
-# with --disable-ticketing needs none.
-# password = "..."
-# ca_file  = "/etc/solstice/spice-ca.pem"
-# Open the playback channel: guest audio to the client. Off means silence.
-audio    = true
+# The remote desktops to offer, one Moonlight app each. None is the default,
+# and a valid start: the daemon pairs, and Moonlight shows an empty app list.
+# `solstice run --endpoint 'name=...,kind=...'` adds more, with the same keys.
+#
+# Each app's id is derived from its name, so a name is also an identity:
+# renaming an endpoint makes it a new app to the client.
+#
+# Names are at most 64 characters, with no commas.
+#
+# [[endpoint]]
+# name     = "Build box"
+# kind     = "vnc"           # "vnc", "spice" (needs the `spice` Cargo feature) or "testpattern"
+# host     = "127.0.0.1"
+# port     = 5900
+# # "none" and "vncauth" are refused against anything but loopback.
+# security = "vencrypt"
+# # password      = "..."   # or, as --endpoint must:
+# # password_file = "/etc/solstice/build.pw"
+# # ca_file       = "/etc/solstice/vnc-ca.pem"
+#
+# [[endpoint]]
+# name     = "Windows VM"
+# kind     = "spice"
+# host     = "127.0.0.1"
+# # The port to link on. With security = "tls" this is the server's *TLS*
+# # port, which SPICE configures independently of the plain one and for which
+# # there is no convention -- so set it explicitly. QEMU: -spice tls-port=5901,...
+# port     = 5901
+# # "tls" or "plain". "plain" is refused against anything but loopback: SPICE's
+# # ticket is a password check, not a key exchange, so without TLS the display
+# # and every keystroke are in the clear (docs/security.md 4.2).
+# security = "tls"
+# # The ticket password, where the server has ticketing enabled. A server run
+# # with --disable-ticketing needs none.
+# # password_file = "/etc/solstice/windows.pw"
+# # ca_file       = "/etc/solstice/spice-ca.pem"
+# # Open the playback channel: guest audio to the client. Off means silence.
+# audio    = true
+#
+# [[endpoint]]
+# name     = "Colour bars"
+# kind     = "testpattern"   # takes no other keys
+#
+# The single [backend] section of older configurations still loads, as one
+# endpoint with app id 1 named server.app_title.
