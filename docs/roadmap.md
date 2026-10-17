@@ -1534,6 +1534,18 @@ and over VNC, with endpoints added and removed while it watched:
   `/cancel` went to the old entry, never reached this host, and waited out
   `QUIT_TIMEOUT_MS`. Deleting and re-adding the host cleared all three.
   Worth checking first when a report looks like any of them.
+- **The first video stream ended the session.** Firefox on a Kubuntu live
+  guest (SPICE, `streaming-video=filter`) became an MJPEG stream, and its
+  second frame failed with "No DC table for component Y". `spice-server`
+  writes a stream's Huffman tables in its first frame only
+  (`jpeg_start_compress(&cinfo, encoder->first_frame)`), relying on the
+  client keeping one libjpeg decoder per stream; Solstice decoded each
+  frame from scratch, and the error ended the display channel. Moonlight
+  showed it as error 11, "check UDP 47999". Each stream now keeps the last
+  tables it saw and fills them into frames that lack them, and a frame that
+  still fails costs only itself. The real-server MJPEG test had never seen
+  a stream frame (fifty draw commands satisfied it first); it now requires
+  ten. QEMU itself died on the next reconnect; that one is not understood.
 
 ### What is left
 

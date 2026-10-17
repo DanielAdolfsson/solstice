@@ -844,6 +844,12 @@ impl SpiceSession {
         self.counts.images()
     }
 
+    /// How many video-stream frames the display channel has decoded and
+    /// composited. A frame dropped as undecodable does not count.
+    pub fn stream_frame_count(&self) -> u64 {
+        self.counts.stream_frames()
+    }
+
     /// The pointer representation in force, for tests and logs.
     pub fn mouse_mode(&self) -> MouseMode {
         self.input.lock().expect("input lock").mode()
