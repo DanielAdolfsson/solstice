@@ -18,6 +18,8 @@ struct Harness {
     session: solstice_vnc::backend::VncSession,
     updates: mpsc::Sender<MockUpdate>,
     recorded: std::sync::Arc<std::sync::Mutex<Vec<ClientMessage>>>,
+    /// Ends when the mock sees the client's side of the connection close.
+    server: tokio::task::JoinHandle<()>,
 }
 
 async fn harness(config: MockConfig) -> Harness {
@@ -27,7 +29,7 @@ async fn harness(config: MockConfig) -> Harness {
     let recorded = server.recorded();
     let (updates, updates_rx) = mpsc::channel(16);
 
-    tokio::spawn(async move {
+    let server = tokio::spawn(async move {
         if let Err(e) = server.serve(server_end, updates_rx).await {
             eprintln!("mock server ended: {e}");
         }
@@ -40,6 +42,7 @@ async fn harness(config: MockConfig) -> Harness {
         session,
         updates,
         recorded,
+        server,
     }
 }
 
@@ -645,4 +648,26 @@ async fn the_default_mock_still_sends_raw() {
         height: 16,
     };
     send_and_check(&h, rect, picture(16, 16, 1000, 1), "raw").await;
+}
+
+/// The connection must not outlive the session: a stream that ended used to
+/// leave it open until the next session displaced it (`docs/roadmap.md` §8).
+#[tokio::test]
+async fn closing_a_session_closes_its_connection() {
+    let h = harness(MockConfig::default()).await;
+    h.session.close().await;
+    tokio::time::timeout(TIMEOUT, h.server)
+        .await
+        .expect("the connection stayed open after close")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn dropping_a_session_closes_its_connection() {
+    let h = harness(MockConfig::default()).await;
+    drop(h.session);
+    tokio::time::timeout(TIMEOUT, h.server)
+        .await
+        .expect("the connection stayed open after drop")
+        .unwrap();
 }

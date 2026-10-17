@@ -1059,3 +1059,61 @@ async fn an_oversized_payload_is_refused_without_costing_the_session() {
     })
     .await;
 }
+
+/// Counts the mock's connections still being served.
+struct CountingDialer {
+    server: Arc<MockServer>,
+    open: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl Dialer for CountingDialer {
+    async fn dial(&self) -> Result<Box<dyn Transport>> {
+        use std::sync::atomic::Ordering;
+        let (client, server_end) = tokio::io::duplex(1 << 20);
+        let server = self.server.clone();
+        let open = self.open.clone();
+        open.fetch_add(1, Ordering::SeqCst);
+        tokio::spawn(async move {
+            let _ = server.serve(server_end).await;
+            open.fetch_sub(1, Ordering::SeqCst);
+        });
+        Ok(Box::new(client))
+    }
+}
+
+/// Every channel's connection must close with the session. They used to stay
+/// open until the next session's connect displaced them (`docs/roadmap.md`
+/// §8): each channel's reader holds a sender to its writer, so neither ever
+/// ended on its own.
+#[tokio::test]
+async fn closing_a_session_closes_every_channel() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for drop_instead in [false, true] {
+        let open = Arc::new(AtomicUsize::new(0));
+        let dialer = Arc::new(CountingDialer {
+            server: Arc::new(MockServer::new(MockConfig::default())),
+            open: open.clone(),
+        });
+        let session = tokio::time::timeout(TIMEOUT, connect(dialer, config()))
+            .await
+            .expect("connect timed out")
+            .expect("connect failed");
+        assert!(open.load(Ordering::SeqCst) > 1, "several channels linked");
+
+        if drop_instead {
+            drop(session);
+        } else {
+            session.close().await;
+        }
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        while open.load(Ordering::SeqCst) > 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{} channel(s) still open (dropped: {drop_instead})",
+                open.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}

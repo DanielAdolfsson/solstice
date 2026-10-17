@@ -227,13 +227,14 @@ where
         .send(session::update_request(false, Rect::whole(width, height)))
         .await;
 
-    tokio::spawn(session::writer_task(writer, outgoing_rx));
+    let writer_task = tokio::spawn(session::writer_task(writer, outgoing_rx)).abort_handle();
 
     let dimensions = Arc::new(AtomicU64::new(pack_dimensions(width, height)));
     let qemu_extended_key = Arc::new(AtomicBool::new(false));
     let extended_desktop_size = Arc::new(AtomicBool::new(false));
     let connected = Arc::new(AtomicBool::new(true));
     let (heard_tx, heard) = watch::channel(false);
+    let mut tasks = vec![writer_task];
 
     let mut update_loop = UpdateLoop::new(
         reader,
@@ -250,7 +251,7 @@ where
         let events = events.clone();
         let outgoing = outgoing.clone();
         let fb = fb.clone();
-        tokio::spawn(async move {
+        let update_task = tokio::spawn(async move {
             let mut continuous_enabled = false;
             loop {
                 if let Err(e) = update_loop.step().await {
@@ -289,6 +290,7 @@ where
             connected.store(false, Ordering::Relaxed);
             let _ = events.send(BackendEvent::Disconnected);
         });
+        tasks.push(update_task.abort_handle());
     }
 
     Ok(VncSession {
@@ -301,6 +303,7 @@ where
         extended_desktop_size,
         heard,
         connected,
+        tasks,
     })
 }
 
@@ -325,6 +328,24 @@ pub struct VncSession {
     /// handshake.
     heard: watch::Receiver<bool>,
     connected: Arc<AtomicBool>,
+    /// The writer and the update loop. The loop holds a sender to the writer,
+    /// so neither ends on its own, and between them they hold the socket:
+    /// aborting them, on `close` or drop, is what closes the connection.
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+
+impl VncSession {
+    fn abort_tasks(&self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for VncSession {
+    fn drop(&mut self) {
+        self.abort_tasks();
+    }
 }
 
 impl std::fmt::Debug for VncSession {
@@ -394,8 +415,8 @@ impl Session for VncSession {
 
     async fn close(&self) {
         self.connected.store(false, Ordering::Relaxed);
-        // Dropping the sender ends the writer task, which closes the socket.
         let _ = self.events.send(BackendEvent::Disconnected);
+        self.abort_tasks();
     }
 }
 

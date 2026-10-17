@@ -610,9 +610,58 @@ mod tests {
         );
         handle(&h, &ctx(&req, true, Some(&der)));
 
-        let req = request("/resume");
+        let req = request("/resume?rikey=000102030405060708090a0b0c0d0e0f&rikeyid=1");
         assert_eq!(handle(&h, &ctx(&req, true, Some(&der))).status, 200);
         assert_eq!(handle(&h, &ctx(&req, true, Some(&other))).status, 404);
+    }
+
+    /// Moonlight sends fresh keys on every resume and encrypts with them; the
+    /// launch's old ones would stream nothing it could decrypt.
+    #[test]
+    fn resume_takes_the_new_keys() {
+        let (h, der) = paired_host();
+        let req = request(
+            "/launch?rikey=000102030405060708090a0b0c0d0e0f&rikeyid=1&localAudioPlayMode=0&appid=1",
+        );
+        handle(&h, &ctx(&req, true, Some(&der)));
+
+        let req = request("/resume?rikey=f0e0d0c0b0a090807060504030201000&rikeyid=-7");
+        assert_eq!(handle(&h, &ctx(&req, true, Some(&der))).status, 200);
+        let sessions = h.sessions.lock().unwrap();
+        assert_eq!(
+            *sessions[0].rikey,
+            [
+                0xf0, 0xe0, 0xd0, 0xc0, 0xb0, 0xa0, 0x90, 0x80, 0x70, 0x60, 0x50, 0x40, 0x30, 0x20,
+                0x10, 0x00
+            ]
+        );
+        assert_eq!(sessions[0].rikey_id, -7);
+    }
+
+    #[test]
+    fn resume_without_keys_is_refused_and_changes_nothing() {
+        let (h, der) = paired_host();
+        let req = request(
+            "/launch?rikey=000102030405060708090a0b0c0d0e0f&rikeyid=1&localAudioPlayMode=0&appid=1",
+        );
+        handle(&h, &ctx(&req, true, Some(&der)));
+
+        for path in [
+            "/resume",
+            "/resume?rikeyid=2",
+            "/resume?rikey=zz&rikeyid=2",
+            "/resume?rikey=0001&rikeyid=2",
+        ] {
+            let req = request(path);
+            assert_eq!(
+                handle(&h, &ctx(&req, true, Some(&der))).status,
+                400,
+                "{path}"
+            );
+        }
+        let sessions = h.sessions.lock().unwrap();
+        assert_eq!(sessions[0].rikey[15], 0x0f);
+        assert_eq!(sessions[0].rikey_id, 1);
     }
 
     #[test]
