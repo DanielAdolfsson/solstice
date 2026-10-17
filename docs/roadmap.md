@@ -35,7 +35,7 @@ What is left is ordinary work.
 | | Item | Size | Blocked on |
 |---|---|---|---|
 | 1 | [Tight encoding](#1-tight-encoding-rfb) | **done** — lossless, advertised first, and exact against a real QEMU server; what is left is in §1 | nothing |
-| 2 | [SPICE backend](#2-spice-backend) | **implemented and validated against a real QEMU guest**, agent and clipboard included (§2.6); what is left is in §2.7 | nothing |
+| 2 | [SPICE backend](#2-spice-backend) | **implemented and validated against a real QEMU guest**, agent, clipboard and audio included (§2.6, §2.8); what is left is in §2.7 | nothing |
 | 3 | [Validate against real Moonlight](#3-validate-against-real-moonlight) | **done** — a real `moonlight-common-c` client streams from this host; the eight defects it found are in §3 | nothing |
 | 4 | [Captured golden vectors](#4-captured-sunshine--moonlight-vectors) | **done** — a real session, frozen and replayed in CI; the two defects it found are in §4 | nothing |
 | 5 | [`solstice pair` management socket](#5-solstice-pair-and-a-management-socket) | **done** — `pair`, `status`, `list-clients` and `revoke` reach the running daemon, and a revocation ends a stream already running; what is left is in §5 | nothing |
@@ -48,6 +48,10 @@ of a core to under 5%. And §7, ENet, the last item on the pre-authentication
 path: `rusty_enet` is gone from the daemon, replaced by a few hundred lines of
 the subset Moonlight actually uses. What is left is §8 and the "what is left"
 lists under each item.
+
+§2's audio is wired as well (§2.8). A tone played in a real guest reaches the
+real client, passed through or re-encoded as the client's request requires,
+and a 7.1 client, which could not connect before, now can.
 
 ---
 
@@ -154,8 +158,8 @@ behind the `spice` Cargo feature. `backend.kind = "spice"` builds a working
 backend, and `tests/real_server.rs` drives it against a live `spice-server`
 inside a booted QEMU guest — across every image codec, video streams, input,
 and a real `spice-vdagent` (§2.6) — resize, absolute mouse and the clipboard.
-What is left is the QXL draw-command assertions and audio (§2.7), plus the
-deliberate omissions in §2.5.
+Guest audio reaches a Moonlight client (§2.8). What is left is the QXL
+draw-command assertions (§2.7), plus the deliberate omissions in §2.5.
 
 ### Why it was worth it
 
@@ -176,7 +180,7 @@ mouse**. `docs/spice-protocol.md` §8 is the full analysis.
 | `display/` | surfaces, the `DRAW_*` set, `COPY_BITS`, six image types, video streams, and the framebuffer the encoder reads |
 | `cursor.rs` | five of SPICE's seven cursor types, composited into the framebuffer |
 | `inputs.rs` | scancodes and pointer messages, with `MOUSE_MOTION_ACK` flow control |
-| `playback.rs` | guest audio; Opus is passed through rather than transcoded |
+| `playback.rs` | guest audio, handed on in the format the server sent; whether it can go to the client untouched is decided in `solstice-audio` (§2.8) |
 | `backend.rs` | dialling every channel, and the `Backend`/`Session` implementation |
 | `mock.rs` | a deliberately minimal server that mints a real RSA key and decrypts a real ticket |
 
@@ -313,7 +317,7 @@ decoded, which is the repacketise-not-transcode path §7 of the protocol notes
 hoped for. Whether the pipeline can pass them straight through is now
 answered, by measurement against a real guest: `spice-server` sends 10 ms
 stereo packets and Moonlight asks for 5 ms unless the client is slow or the
-stream is thin, so in the common case it cannot (§2.7).
+stream is thin, so in the common case it cannot. §2.8 is what does it.
 
 ### 2.4 How it is tested
 
@@ -391,7 +395,7 @@ protocol, because the packaged `Xspice` launcher cannot start a
 | Mouse mode | client mode granted and in force **by a real `spice-vdagent`**; absolute positions land where they were sent |
 | The agent | `MONITORS_CONFIG` resize granted, applied by the guest, and the new geometry tracked back by the client (virtio-gpu; see `testing.md` §4.1) |
 | The clipboard | both directions through a real `spice-vdagent`: a guest `xclip` copy offered, requested and delivered byte for byte, and this client's offer requested by the guest, answered, pasted by `xclip -o`, then withdrawn so the paste stops finding an owner |
-| Audio | a tone from `speaker-test` arriving as Opus, 48 kHz stereo, every packet 10 ms by its TOC byte |
+| Audio | a tone from `speaker-test` arriving as Opus, 48 kHz stereo, every packet 10 ms by its TOC byte; and, with the daemon and the real client added, a seamless tone heard in the client's front pair, passed through at 10 ms and re-encoded at 5 ms (§2.8) |
 
 Every test connects to a **black** screen, repaints it **while connected**,
 and asserts the pixels. That shape matters: a client that only ever sees the
@@ -520,15 +524,6 @@ the clipboard are each validated against a real `spice-vdagent` (§2.6).
   unit-tested only. A Windows guest with the QXL display driver is the source
   to try next. It is not known for certain to emit them either, so check
   with the counts before building on it.
-- **Audio is measured, not yet wired.** `spice-server` sends Opus at 48 kHz
-  stereo in 10 ms packets. Moonlight asks for 5 ms by default and 10 ms only
-  for a slow decoder or a stream under 5 Mbit/s (`SdpGenerator.c`), and it
-  sizes its decoder buffer from that. So passing packets through works only
-  when the client asked for 10 ms. The default needs a decode and re-encode,
-  and so does surround. Meanwhile the supervisor sends Opus silence
-  whatever the backend, so none of this reaches a client yet. Wiring it in
-  means an Opus decoder and encoder in the tree, and that is the actual
-  remaining work.
 - **The GLZ soak exists, and nothing runs it on a schedule.**
   `glz_soak_keeps_the_screen_exact_across_thousands_of_images` repaints with
   changing content and compares the screen with QEMU's screendump every
@@ -612,6 +607,85 @@ properties of the environment rather than of the backend:
   tier is QEMU's server, which implements neither. Covered by the mock, which
   is weaker in the specific way §3 warns about, and recorded in
   `docs/testing.md` §3.1.
+
+### 2.8 Audio, wired
+
+**Done.** `crates/solstice-audio` sits between the backend's audio and the
+client's stream, and `crates/solstice/src/audio.rs` sends what it makes, one
+packet per negotiated duration.
+
+- **Pass-through where it lines up.** `spice-server` sends 10 ms stereo
+  Opus. A client that asked for 10 ms stereo gets those packets untouched.
+  Every other client gets them decoded and re-encoded with libopus
+  (`opusic-c`) in its own layout and duration, at Sunshine's bitrates, CBR,
+  `RESTRICTED_LOWDELAY`. Raw S16, which `spice-server` sends when it has no
+  Opus, takes the encode half of the same path.
+- **Surround is offered, and stereo is upmixed into it.** DESCRIBE used to
+  say `surround-params=NONE`, so a 5.1 client fell back to a layout of its
+  own and a 7.1 client failed the connection ("No surround parameters
+  found"). It now offers all six layouts Sunshine does, normal and high
+  quality for 2, 5.1 and 7.1, written so that the client's rotation of the
+  normal-quality mapping leaves it with the identity
+  (`stream/opus_layout.rs`). The layout follows the client's choice: the
+  `Host:` header for stereo, `x-nv-audio.surround.AudioQuality` for
+  surround. SPICE's stereo lands in FL and FR and the rest is silent.
+- **Silence is encoded, not canned.** The old silence packet is single-stream
+  Opus, which no multistream decoder accepts for a surround layout. Silence
+  now comes out of the session's own encoder, so it is valid whatever was
+  negotiated. That includes RFB, which still has no audio of its own.
+- **A small jitter buffer.** The server sends only while the guest plays,
+  in 10 ms bursts. Nothing plays until 20 ms are queued, an underrun sends
+  silence and refills, and more than 100 ms queued is trimmed back to 20,
+  because accumulated latency never drains on its own.
+
+#### How it is tested
+
+| Tier | What |
+|---|---|
+| Unit (`solstice-audio`) | pass-through and its conditions, two 5 ms packets per SPICE packet with the tone intact, stereo into the front pair of 5.1 and nothing elsewhere, decodable silence for a surround layout, the prebuffer, underrun and trim, mono, partial frames, stale leftovers, unusable frames counted rather than fatal |
+| Unit (`solstice-gamestream`) | the DESCRIBE lines run through a transcription of the client's parser, and land on the identity for every layout; the quality flag from the header for stereo and the attribute for surround |
+| Real client (`real_moonlight.rs`) | the test pattern's tone through the daemon to `mlc-probe`, once per layout: stereo at 5 ms and at 10 ms, 5.1 and 7.1 each at normal and high quality. The probe reports the decoder the client built from DESCRIBE and dumps every packet it was handed; each is decoded with that decoder, must be the duration the client sized for, and the tone must be in FL and FR and nowhere else |
+| Real server and real client | `the_reference_client_hears_a_real_spice_guest` (`--features spice`): a seamless tone played by `aplay` in the QEMU guest, through `spice-server`, the daemon and the probe, at 10 ms (passed through: the server's packets, not the bridge's size) and 5 ms (re-encoded) |
+| Fuzzing | `audio_bridge`: arbitrary frames, any format and channel count, through every layout. Clean for three minutes, 192,000 runs. Coverage guides it through the Rust only: libopus is built by CMake without the instrumentation flags |
+
+#### What it found
+
+- **Pass-through never happened against the real server.** The check
+  compared the whole eight-entry mapping, and the negotiated stereo layout
+  fills the unused entries differently from the codec's own stereo constant.
+  Every unit test built its layout from the constant. Only the full chain,
+  with the daemon translating the negotiated layout, showed the 10 ms client
+  getting re-encoded packets. Fixed, with a regression test built the way the
+  daemon builds it.
+- **`MissedTickBehavior::Delay` loses audio.** Under load, a tick more than
+  5 ms late pushes every later tick back, so the sender fell to about 150
+  packets a second against the client's 200. The backend kept real time, the
+  queue overflowed, and each trim was an audible jump. It showed as a tone
+  whose purity fell to 0.1 in the debug-build end-to-end test, where
+  OpenH264 shares the runtime. The sender now uses `Burst`, and makes up a
+  late tick at once. The old silence sender had the same flaw, inaudible
+  because silence has no phase to break.
+- **`speaker-test -c 2` is not a stereo tone.** It plays the channels in
+  turn. The guest test writes one period of a 480 Hz sine (exactly 100
+  samples at 48 kHz) and loops it into `aplay` instead.
+
+#### What is left
+
+- **No Moonlight application has played it.** The probe decodes nothing
+  itself; the tests decode its packets as its configuration says to. A
+  moonlight-qt build hearing a guest is the manual tier
+  (`docs/testing.md` §8).
+- **Nothing is resampled.** A backend at a rate other than 48 kHz is
+  dropped, with one warning per session. `spice-server` sends 48 kHz in both
+  modes, so a resampler would be code with no source to test it.
+- **Downmixing is naive.** More channels in than out keeps the first ones.
+  QEMU's SPICE audio is stereo, so nothing exercises it.
+- **The prebuffer is not tuned.** 20 ms absorbs the jitter seen here, and an
+  underrun or two per session at 10 ms is normal on a loaded host. It adds
+  that much latency; nothing has measured whether a real client would
+  rather have less.
+- **`cmake` is a build requirement again**, for `opusic-sys`, in any build
+  with the `audio` feature, which is on by default (`PROJECT-LAYOUT.md` §4).
 
 ---
 

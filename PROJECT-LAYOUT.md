@@ -6,7 +6,7 @@ in `docs/bridging-design.md` §6 — and the structure survived contact with the
 implementation almost unchanged. Where it did not, the deviation is marked
 **▲** and explained; `docs/implementation-notes.md` has the reasoning.
 
-About 37 000 lines of Rust across eight crates, roughly half of it tests.
+About 52 000 lines of Rust across ten crates, roughly half of it tests.
 
 Design constraints this layout satisfies:
 
@@ -50,6 +50,7 @@ solstice/
 │   ├── solstice-backend/         # [lib] backend trait + neutral types. No I/O.
 │   ├── solstice-vnc/             # [lib] RFB backend, plus the recording mock server
 │   ├── solstice-video/           # [lib] colour conversion + encoder abstraction
+│   ├── solstice-audio/           # [lib] ▲ backend audio → the client's Opus stream
 │   └── solstice-input/           # [lib] VK → scancode / keysym tables. Pure data.
 ├── fuzz/                         # cargo-fuzz targets, its own workspace
 │   ├── seeds/                    # ▲ committed seed inputs, from the captured session
@@ -59,6 +60,7 @@ solstice/
 │       ├── input_batch.rs
 │       ├── control_envelope.rs
 │       ├── enet_host.rs          # ▲ the ENet host, before and after the handshake
+│       ├── audio_bridge.rs       # ▲ backend audio frames through the Opus bridge
 │       └── rfb_rect.rs
 ├── tests/
 │   ├── guest/                    # the QEMU test guest: both backends, one image
@@ -117,7 +119,8 @@ src/
 ├── config.rs         # serde + toml; see §5
 ├── supervisor.rs     # session lifecycle, resource ceilings, shutdown
 ├── pipeline.rs       # ▲ the frame loop: framebuffer → convert → encode → packetise
-├── testpattern.rs    # ▲ the colour-bar backend, for milestone 1 and the tests
+├── testpattern.rs    # ▲ the colour-bar backend (and a tone), for milestone 1 and the tests
+├── audio.rs          # ▲ the audio sender: one packet per negotiated duration
 ├── tls.rs            # ▲ the mutual-TLS listener's client-certificate policy
 ├── backend_factory.rs# config → Arc<dyn Backend>, where the feature flags land
 └── net/
@@ -282,7 +285,7 @@ src/
 │   └── stream.rs     # video streams
 ├── cursor.rs         # cursor shapes, composited by the display task
 ├── inputs.rs         # scancodes, pointer, motion flow control
-├── playback.rs       # Opus, passed through rather than transcoded
+├── playback.rs       # guest audio, handed on as the server sent it
 ├── backend.rs        # dialling every channel; Backend and Session
 └── mock.rs           # a deliberately minimal server, for the negative cases
 ```
@@ -321,6 +324,28 @@ letterboxed-with-scaling for when the backend declines to resize.
 ▲ `ffmpeg.rs` is not written. The `VideoEncoder` trait is the seam it would
 plug into, and the licensing decision in §4 is unchanged.
 
+### `solstice-audio` — audio path
+
+▲ Not in the original layout, which had `opus` in `solstice-gamestream` for
+silence. Silence turned out not to need a codec, and real audio needed
+rather more than one: a decoder, an encoder, a remix and a jitter buffer.
+None of it is GameStream protocol, so it is its own crate, and the daemon
+maps the negotiated layout onto it.
+
+```
+src/
+├── lib.rs
+├── bridge.rs         # AudioBridge: pass-through or transcode, prebuffer, one packet per tick
+├── codec.rs          # libopus: multistream encoder, plain decoder, a client-side decoder for tests
+├── mix.rs            # channel count changes; stereo lands in FL/FR
+├── toc.rs            # packet duration from the TOC byte, for the pass-through decision
+└── tone.rs           # a sine and a Goertzel purity check, for the tests in other crates
+```
+
+The layouts themselves — what DESCRIBE advertises and what the client
+decodes with — are GameStream knowledge and live in
+`solstice-gamestream/src/stream/opus_layout.rs`.
+
 ### `solstice-input` — tables
 
 Pure data, no dependencies, exhaustively unit-tested:
@@ -343,11 +368,14 @@ src/
      solstice-gamestream    |        backend_factory
             |               |          /          \
      solstice-video         |   solstice-vnc   solstice-spice
-            \               |        /              /   \
+            \        solstice-audio  /              /   \
              `------ solstice-backend -------------'     |
                             |                   solstice-spice-codec
                      solstice-input
 ```
+
+`solstice-audio` hangs off the binary like the encoder does, and knows
+nothing of GameStream: the daemon translates the negotiated layout for it.
 
 No cycles; neither backend is reachable from `solstice-gamestream`.
 `solstice-spice-codec` is a leaf — it depends on nothing in the workspace,
@@ -394,7 +422,6 @@ which is what lets it be fuzzed and tested without a SPICE backend existing.
 | `quick-xml` | 0.42 | NVHTTP XML responses |
 | `hyper` / `axum` | 1.12 / 0.8 | the HTTP listeners |
 | `socket2` | 0.6 | UDP socket options, DSCP, batched send |
-| `opus` | 0.4 | silence generation / transcode |
 
 > ▲ There is no ENet crate. The plan was `rusty_enet`, a C-to-Rust
 > transpilation of ENet 1.3.18 whose own README says it "couldn't be much
@@ -421,6 +448,20 @@ which is what lets it be fuzzed and tested without a SPICE backend existing.
 | `ffmpeg-next` | 9.0 | optional: libx264, VAAPI, NVENC, QSV | usually GPL — ▲ compatible now that the project is GPL-3.0-or-later, but still a heavy native dependency |
 | `dcv-color-primitives` | 1.0 | BGRA → NV12, SIMD | |
 | `yuvutils-rs` | 0.8 | alternative colour conversion | |
+
+### `solstice-audio`
+
+| Crate | Version | Use | Licence note |
+|---|---|---|---|
+| `opusic-c` | 1.6 | libopus 1.6.1, vendored: multistream encode, decode | BSD-3 |
+
+▲ Not `opus` 0.4: it binds only single-stream Opus, and a surround client
+decodes multistream. The pure-Rust ports were passed over because the
+decoder reads bytes a SPICE server chose, and libopus is the implementation
+with a decade of fuzzing behind it. The cost is that **`cmake` is back as a
+build requirement** — `opusic-sys` builds the vendored source with it — for
+any build with the `audio` feature, which is on by default. An RFB-only
+build without it keeps the old canned silence.
 
 ### `solstice-vnc`
 
@@ -481,11 +522,13 @@ against `moonlight-common-c` built with `FEC_VALIDATION_MODE` — see
 
 ```toml
 [features]
-default  = ["vnc", "openh264"]
+default  = ["vnc", "openh264", "audio"]
 vnc      = ["dep:solstice-vnc"]
 openh264 = ["solstice-video/openh264"]
 # SPICE is excludable along with its whole dependency tree.
-spice    = ["dep:solstice-spice", "dep:solstice-spice-codec"]
+spice    = ["dep:solstice-spice", "dep:solstice-spice-codec", "audio"]
+# ▲ The Opus codec. Without it: canned stereo silence, backend audio dropped.
+audio    = ["dep:solstice-audio"]
 ```
 
 ▲ `ffmpeg`, `vaapi`, `hevc` and `av1` are not declared. A feature flag that
@@ -589,7 +632,7 @@ with Solstice as the host. It still found two defects (`docs/roadmap.md` §4).
 | 1 | `vnc-rs` vs. a direct RFB implementation | **Direct.** The three things a bridge needs are the three things client crates hide. |
 | 2 | Encoder default | **OpenH264.** The lightest encoder to build — cc and nothing else. (It was chosen for its BSD-2 licence; that stopped mattering when the project became GPL-3.0-or-later, and the choice stands on build weight.) It emits profile_idc 100 (High), which settles the question flagged in §4. |
 | 3 | HEVC and AV1 | **H.264 only.** `ServerCodecModeSupport` advertises `SCM_H264`, and DESCRIBE omits the two markers a client reads as HEVC and AV1. |
-| 4 | Audio beyond Opus silence | **Still silence on RFB**, which has no audio. SPICE's playback channel is implemented and hands the pipeline real Opus packets — 10 ms stereo, measured against a real guest — but the supervisor still sends silence whatever the backend. Wiring it in means a transcode for Moonlight's default 5 ms, and repacketising only when the client asked for 10 ms (`docs/spice-protocol.md` §7). |
+| 4 | Audio beyond Opus silence | **Wired.** SPICE's 10 ms stereo Opus goes to the client untouched when it asked for 10 ms, and through libopus to the client's own layout and duration otherwise, including 5.1 and 7.1, which DESCRIBE now advertises. RFB, which has no audio, gets silence encoded in the negotiated layout. A real guest's tone has been heard by the real client both ways (`docs/roadmap.md` §2.7). |
 | 5 | `rusty_enet` vs. reimplementing ENet | **Reimplemented — the subset.** Once a real client had been captured, what Moonlight uses was a short list: connect, acknowledge, ping, reliable/unreliable/unsequenced sends, bandwidth limit, disconnect, and never a fragment. `stream/enet.rs` is that list, sans-I/O, bounded, and stricter than ENet before authentication. It is held against upstream ENet (via `rusty_enet`, now test-only) under simulated loss, against the captured session byte for byte, and against the real client with netem on the port (`docs/roadmap.md` §7). |
 | 6 | SPICE image decoders: port, FFI, or drop | **Port, and the backend above them is now written too.** `solstice-spice-codec` has QUIC, LZ and GLZ in pure Rust, verified against the real C encoders; `solstice-spice` has the channels, the rasteriser, the agent and the audio. `backend.kind = "spice"` builds a working backend, and a real QEMU guest has answered it — `docs/roadmap.md` §2.6. |
 

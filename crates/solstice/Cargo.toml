@@ -8,18 +8,24 @@ license.workspace = true
 default-run = "solstice"
 
 [features]
-default = ["vnc", "openh264"]
+default = ["vnc", "openh264", "audio"]
 vnc = ["dep:solstice-vnc"]
 openh264 = ["solstice-video/openh264"]
 # SPICE is deliberately excludable along with its dependency tree: it pulls
 # in a JPEG decoder, LZ4, zlib and the image codecs, none of which an
 # RFB-only build needs.
-spice = ["dep:solstice-spice", "dep:solstice-spice-codec"]
+spice = ["dep:solstice-spice", "dep:solstice-spice-codec", "audio"]
+# The Opus codec: libopus, built with CMake. Without it every stream still
+# gets an audio channel, carrying canned stereo silence, and backend audio is
+# dropped. On by default because it is also what makes a surround client's
+# silence decodable.
+audio = ["dep:solstice-audio"]
 
 [dependencies]
 solstice-backend.workspace = true
 solstice-gamestream.workspace = true
 solstice-video.workspace = true
+solstice-audio = { workspace = true, optional = true }
 solstice-spice = { workspace = true, optional = true }
 solstice-spice-codec = { workspace = true, optional = true }
 solstice-vnc = { workspace = true, optional = true }
@@ -45,6 +51,7 @@ async-trait = "0.1.92"
 humantime = "2.4.0"
 
 [dev-dependencies]
+solstice-audio.workspace = true
 solstice-test-guest.workspace = true
 tokio = { workspace = true, features = ["full"] }
 solstice-gamestream.workspace = true

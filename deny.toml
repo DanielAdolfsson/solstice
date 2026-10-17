@@ -42,7 +42,8 @@ unused-allowed-license = "allow"
 [bans]
 multiple-versions = "allow"
 # Now a dependency-weight decision rather than a licence one. Both pull a large
-# native build into what is otherwise a cc-and-nothing-else tree, and both
+# native build into what is otherwise a small one -- cc for OpenH264, and
+# CMake for libopus behind the `audio` feature (`opusic-sys`) -- and both
 # belong behind the `ffmpeg` feature when that feature exists. Remove the entry
 # deliberately, with the feature, rather than by accident.
 deny = [

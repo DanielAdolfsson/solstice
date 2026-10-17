@@ -388,6 +388,9 @@ stream under 5 Mbit/s; everyone else gets **5 ms**
 and re-encode; repacketising is the fast path for the 10 ms case, and
 surround needs a transcode regardless, since SPICE's playback is stereo.
 
+That is what is built (`crates/solstice-audio`, `docs/roadmap.md` §2.8), and
+a real guest's tone has reached the real client both ways.
+
 ---
 
 ## 8. Consequences for Solstice
@@ -456,7 +459,7 @@ ceiling, which is not something a general-purpose client exposes.
 | §5.2 streams | MJPEG only, by choice — a stream is decoded only to be re-encoded, so the cheapest correct decoder wins. Other codecs get the `STREAM_REPORT` the protocol defines for "cannot decode" |
 | §5.3 GL scanout | not advertised, and refused if sent |
 | §6 inputs | all of it, including `MOUSE_MOTION_ACK` flow control |
-| §7 audio | Opus forwarded as Opus; raw S16 forwarded as PCM |
+| §7 audio | Opus forwarded as Opus; raw S16 forwarded as PCM. The daemon passes the Opus through or re-encodes it (`solstice-audio`) |
 
 The cursor channel, which §1 lists as optional, is implemented and
 composited into the framebuffer — in client mouse mode the guest stops

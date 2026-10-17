@@ -9,6 +9,7 @@ members = [
     "crates/solstice-spice-codec",
     "crates/solstice-spice",
     "crates/solstice-video",
+    "crates/solstice-audio",
     "crates/solstice-input",
     "crates/solstice-test-guest",
 ]
@@ -25,6 +26,7 @@ solstice-backend = { path = "crates/solstice-backend" }
 solstice-gamestream = { path = "crates/solstice-gamestream" }
 solstice-input = { path = "crates/solstice-input" }
 solstice-video = { path = "crates/solstice-video" }
+solstice-audio = { path = "crates/solstice-audio" }
 solstice-spice-codec = { path = "crates/solstice-spice-codec" }
 solstice-spice = { path = "crates/solstice-spice" }
 solstice-vnc = { path = "crates/solstice-vnc" }

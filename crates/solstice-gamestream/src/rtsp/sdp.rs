@@ -102,8 +102,10 @@ pub struct StreamConfig {
     pub audio_channel_mask: u32,
     /// Opus packet duration in milliseconds.
     pub audio_packet_duration: u32,
-    /// Whether the client asked for high-quality stereo. See the `Host:`
-    /// header quirk in [`parse_announce`].
+    /// Whether the client asked for high-quality audio. For stereo that is
+    /// the `Host:` header quirk in [`parse_announce`]; for surround it is
+    /// `x-nv-audio.surround.AudioQuality`, and it also changes the layout the
+    /// client decodes with ([`crate::stream::opus_layout`]).
     pub audio_high_quality: bool,
     /// `x-nv-general.useReliableUdp`: 13 means the control stream is encrypted.
     pub use_reliable_udp: u32,
@@ -201,7 +203,9 @@ fn number(attrs: &BTreeMap<String, String>, key: &str, default: u32) -> Result<u
 ///
 /// `host_header` is the RTSP `Host:` header, which carries the stereo audio
 /// quality flag: "high quality" is signalled by whether it is `0.0.0.0` (low)
-/// or a real address (high) (`rtsp.cpp:1163-1172`). Genuinely.
+/// or a real address (high) (`rtsp.cpp:1163-1172`). Genuinely. Surround
+/// signals it with an attribute instead, and Sunshine reads the header only
+/// for stereo, so this does too.
 ///
 /// `required_encryption` is refused outright rather than silently downgraded.
 pub fn parse_announce(
@@ -259,7 +263,11 @@ pub fn parse_announce(
         audio_channels,
         audio_channel_mask: number(&attrs, "x-nv-audio.surround.channelMask", 3)?,
         audio_packet_duration: number(&attrs, "x-nv-aqos.packetDuration", 5)?.clamp(1, 60),
-        audio_high_quality: host_header.is_some_and(|h| !h.starts_with("0.0.0.0")),
+        audio_high_quality: if audio_channels == 2 {
+            host_header.is_some_and(|h| !h.starts_with("0.0.0.0"))
+        } else {
+            number(&attrs, "x-nv-audio.surround.AudioQuality", 0)? != 0
+        },
         use_reliable_udp: number(&attrs, "x-nv-general.useReliableUdp", 1)?,
         encryption_enabled,
         attributes: attrs,
@@ -272,9 +280,11 @@ pub fn parse_announce(
 /// `sprop-parameter-sets=AAAAAU` as "no HEVC" and the absence of
 /// `a=rtpmap:98 AV1/90000` as "no AV1", so a desktop bridge says nothing about
 /// either (`docs/moonlight-sunshine-protocol.md` §2.2).
+///
+/// Every audio layout is offered whatever the backend has, because the client
+/// cannot connect in 7.1 without one (`crate::stream::opus_layout`).
 pub fn describe_body(supported_encryption: u32, requested_encryption: u32) -> String {
-    let mut sdp = String::new();
-    sdp.push_str("a=fmtp:97 surround-params=NONE\r\n");
+    let mut sdp = crate::stream::opus_layout::describe_lines();
     sdp.push_str(&format!(
         "a=x-ss-general.encryptionSupported:{supported_encryption}\r\n"
     ));
@@ -347,6 +357,32 @@ mod tests {
         let none =
             parse_announce(&announce(""), None, &Limits::default(), encryption::ALL).unwrap();
         assert!(!none.audio_high_quality);
+    }
+
+    /// Surround carries its own flag, and the `Host:` header means nothing
+    /// there: a surround client streaming locally still asks for normal
+    /// quality when it has a slow decoder (`SdpGenerator.c`).
+    #[test]
+    fn surround_quality_comes_from_its_attribute_not_the_host_header() {
+        let surround = |quality: &str, host: &str| {
+            let body = String::from_utf8(announce(quality))
+                .unwrap()
+                .replace("numChannels:2", "numChannels:6")
+                .replace("channelMask:3", "channelMask:63");
+            parse_announce(
+                body.as_bytes(),
+                Some(host),
+                &Limits::default(),
+                encryption::ALL,
+            )
+            .unwrap()
+        };
+        let high = surround("a=x-nv-audio.surround.AudioQuality:1\r\n", "0.0.0.0");
+        assert_eq!(high.audio_channels, 6);
+        assert!(high.audio_high_quality);
+        let normal = surround("a=x-nv-audio.surround.AudioQuality:0\r\n", "10.0.0.5");
+        assert!(!normal.audio_high_quality);
+        assert!(!surround("", "10.0.0.5").audio_high_quality);
     }
 
     #[test]
@@ -467,5 +503,18 @@ mod tests {
         // The two markers the client reads as "HEVC" and "AV1" must be absent.
         assert!(!sdp.contains("sprop-parameter-sets=AAAAAU"));
         assert!(!sdp.contains("AV1/90000"));
+    }
+
+    /// A 7.1 client fails the connection when DESCRIBE has no line for it
+    /// (`RtspConnection.c`, "No surround parameters found"), and a 5.1 one
+    /// falls back to a layout of its own.
+    #[test]
+    fn describe_offers_a_layout_for_every_channel_count_moonlight_asks_for() {
+        let sdp = describe_body(encryption::ALL, encryption::ALL);
+        for channels in ["6", "8"] {
+            let prefix = format!("a=fmtp:97 surround-params={channels}");
+            assert_eq!(sdp.matches(&prefix).count(), 2, "{sdp}");
+        }
+        assert!(!sdp.contains("NONE"));
     }
 }

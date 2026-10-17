@@ -1,0 +1,24 @@
+[package]
+name = "solstice-audio"
+description = "Backend audio to the client's Opus stream: pass-through where it lines up, decode and re-encode where it does not, paced by a small jitter buffer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+solstice-backend.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# libopus 1.6, built from the vendored source with CMake. BSD-3-Clause. The
+# reference implementation rather than a port: the decoder reads bytes a
+# SPICE server chose, and libopus is the one that has been fuzzed for a
+# decade. See PROJECT-LAYOUT.md Sec 4.
+opusic-c = { version = "1.6", default-features = false, features = ["bundled"] }
+
+
+[dev-dependencies]
+bytes.workspace = true
+
+[lints.rust]
+missing_docs = "warn"

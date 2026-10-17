@@ -198,8 +198,9 @@ pub enum Encoder {
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Audio {
-    /// Whether to send anything at all. The RFB backend has no audio, so this
-    /// sends Opus silence to keep the client out of its missing-stream paths.
+    /// Whether to send anything at all. The backend's audio where it has any
+    /// (SPICE), and Opus silence otherwise, which keeps the client out of its
+    /// missing-stream paths.
     pub enabled: bool,
 }
 
@@ -291,7 +292,8 @@ pub struct Spice {
     /// PEM file of certificates to trust for TLS.
     pub ca_file: Option<PathBuf>,
     /// Whether to open the playback channel. SPICE's audio is Opus, which is
-    /// also what GameStream carries.
+    /// also what GameStream carries: passed through when the client asked
+    /// for what the server sends, re-encoded otherwise.
     pub audio: bool,
 }
 

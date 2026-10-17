@@ -156,12 +156,18 @@ RFB has no audio. SPICE has Opus on the playback channel.
 
 | Backend | Plan |
 |---|---|
-| None / RFB | Send Opus silence at the negotiated `packetDuration`. Cheap, keeps the client happy, avoids the "no audio stream" edge cases. |
-| SPICE with Opus | Repacketise when the client asked for 10 ms stereo, which is what `spice-server` sends; transcode otherwise, which with Moonlight's default of 5 ms is the common case. Measured — see `spice-protocol.md` §7. |
-| SPICE with CELT | Decode and re-encode, or fall back to silence. |
+| None / RFB | Send Opus silence at the negotiated `packetDuration`. Cheap, keeps the client happy, avoids the "no audio stream" edge cases. ▲ *Encoded* silence, in the negotiated layout: a canned single-stream packet is not valid multistream Opus for a surround client. |
+| SPICE with Opus | Repacketise when the client asked for 10 ms stereo, which is what `spice-server` sends; transcode otherwise, which with Moonlight's default of 5 ms is the common case. Measured — see `spice-protocol.md` §7. ▲ Built: `crates/solstice-audio`, `docs/roadmap.md` §2.8. |
+| SPICE with CELT | Decode and re-encode, or fall back to silence. ▲ CELT is not advertised, so a server that has Opus sends Opus, and one without sends raw S16, which is encoded. |
 
 Either way the audio path is: Opus packet → RTP(pt 97) → optional AES-CBC →
 UDP, plus an RS(4,2) parity pair every four packets.
+
+▲ Surround is a DESCRIBE concern before it is an audio one. The client builds
+its decoder from the `surround-params` lines there, and a 7.1 client with no
+line to read fails the connection, so they are offered whatever the backend
+can produce, and stereo is upmixed into FL and FR
+(`solstice-gamestream/src/stream/opus_layout.rs`).
 
 ---
 
@@ -372,7 +378,7 @@ instead of in shared code.
    forwarded.
 3. **VNC backend.** Framebuffer + damage, wired to the encoder. Input
    forwarded.
-4. **Audio.** Opus silence, then real audio if the backend has it.
+4. **Audio.** Opus silence, then real audio if the backend has it. ▲ Both done.
 5. **Hardening.** Session limits, rate limits, TLS policy, the items in
    `security.md`.
 6. **HEVC/AV1, SPICE** — in whichever order the use case demands. (FEC is

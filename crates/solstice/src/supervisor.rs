@@ -15,7 +15,7 @@ use solstice_gamestream::input::translate;
 use solstice_gamestream::nvhttp::{Host, HostConfig};
 use solstice_gamestream::rtsp::sdp::{encryption, Limits, StreamConfig};
 use solstice_gamestream::rtsp::StreamPorts;
-use solstice_gamestream::stream::audio_tx::{opus_silence_packet, AudioConfig, AudioPacketizer};
+use solstice_gamestream::stream::audio_tx::AudioConfig;
 use solstice_gamestream::stream::control::ControlMessage;
 use solstice_gamestream::stream::video_tx::VideoConfig;
 use solstice_video::encoder::EncoderConfig;
@@ -308,35 +308,25 @@ async fn run_stream(
     let (idr_tx, idr_rx) = mpsc::channel(8);
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
 
-    // 6. Audio: Opus silence at the negotiated packet duration. The RFB backend
-    //    has nothing else to send, and a client that gets no audio stream at
-    //    all takes paths nobody tests.
+    // 6. Audio: the backend's, where it has any, and silence otherwise, one
+    //    packet per negotiated duration either way. The RFB backend has
+    //    nothing to send, and a client that gets no audio stream at all takes
+    //    paths nobody tests.
     if config.audio.enabled {
         if let Some(peer) = audio_peer {
-            let socket = audio_socket.clone();
             let audio_config = AudioConfig {
                 packet_duration_ms: stream_config.audio_packet_duration,
                 encrypt: stream_config.audio_encrypted(),
                 rikey_id,
             };
-            let channels = stream_config.audio_channels as u8;
-            let key = stream_config.audio_encrypted().then_some(key);
-            media_tasks.spawn(async move {
-                let mut packetizer = AudioPacketizer::new(audio_config, key.as_ref());
-                let mut ticker = tokio::time::interval(Duration::from_millis(
-                    audio_config.packet_duration_ms.max(1) as u64,
-                ));
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                let silence = opus_silence_packet(channels);
-                loop {
-                    ticker.tick().await;
-                    for datagram in packetizer.packetize(&silence) {
-                        if socket.send_to(&datagram, peer).await.is_err() {
-                            return;
-                        }
-                    }
-                }
-            });
+            media_tasks.spawn(crate::audio::run(
+                audio_socket.clone(),
+                peer,
+                stream_config.clone(),
+                audio_config,
+                stream_config.audio_encrypted().then_some(key),
+                session.take_audio(),
+            ));
         }
     }
 

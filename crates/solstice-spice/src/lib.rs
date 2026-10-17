@@ -33,7 +33,7 @@
 //! | [`display`] | surfaces, draw commands, image decoding, video streams, and the framebuffer |
 //! | [`cursor`] | cursor shapes, composited by the display task |
 //! | [`inputs`] | scancodes and pointer messages, with motion flow control |
-//! | [`playback`] | guest audio, Opus passed through rather than transcoded |
+//! | [`playback`] | guest audio, handed on in the format the server sent |
 //! | [`backend`] | dialling, wiring the channels together, and the [`solstice_backend::Backend`] implementation |
 //! | [`mock`] | a deliberately minimal server, for the negative cases a real one never produces |
 //!

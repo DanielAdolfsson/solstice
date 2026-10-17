@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod audio;
 pub mod backend_factory;
 pub mod cli;
 pub mod config;

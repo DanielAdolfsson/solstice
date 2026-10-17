@@ -14,6 +14,8 @@ solstice-vnc = { path = "../crates/solstice-vnc" }
 solstice-backend = { path = "../crates/solstice-backend" }
 solstice-spice = { path = "../crates/solstice-spice" }
 solstice-spice-codec = { path = "../crates/solstice-spice-codec" }
+solstice-audio = { path = "../crates/solstice-audio" }
+bytes = "1"
 tokio = { version = "1", features = ["rt", "macros", "io-util"] }
 
 [[bin]]
@@ -73,5 +75,11 @@ doc = false
 [[bin]]
 name = "enet_host"
 path = "fuzz_targets/enet_host.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "audio_bridge"
+path = "fuzz_targets/audio_bridge.rs"
 test = false
 doc = false

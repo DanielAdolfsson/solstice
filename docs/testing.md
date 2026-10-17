@@ -101,6 +101,13 @@ the probe cannot (they are not in `moonlight-common-c`) and then hands over.
 Both skip with a printed note when the probe has not been built. That README
 is the detail; `docs/roadmap.md` §3 has what the exercise found.
 
+**Audio content** is checked without either flag. The recorder writes the
+Opus packets back to back, which cannot be split again, so the probe also
+dumps each packet behind a length (`audiopackets=`), and reports the decoder
+`moonlight-common-c` configured from DESCRIBE, mapping included. The harness
+decodes every packet with exactly that decoder and asks whether the tone the
+backend played is in the right channels (`docs/roadmap.md` §2.8).
+
 `FEC_VALIDATION_MODE` deserves emphasis given the earlier FEC discussion: it
 converts "did we get the Cauchy matrix right?" from a question into a
 continuously-enforced invariant. It is also the single highest-yield assertion
@@ -420,6 +427,14 @@ real consumer carries the same obligation.
 plays into it. What arrives is Opus, 48 kHz stereo, in **10 ms** packets —
 measured, and asserted by `guest_audio_arrives_as_opus_packets_of_one_fixed_duration`.
 
+That test only reads durations, and `speaker-test -c 2` plays the channels in
+turn, so it is no use for checking the sound itself.
+`the_reference_client_hears_a_real_spice_guest`, in `real_moonlight.rs` and
+behind the `spice` feature, writes one period of a 480 Hz sine into the guest
+with `printf` (exactly 100 samples at 48 kHz, so it repeats without a seam),
+loops it into `aplay`, and checks the real client hears it
+(`docs/roadmap.md` §2.8).
+
 **The GLZ soak** is `glz_soak_keeps_the_screen_exact_across_thousands_of_images`,
 `#[ignore]`d because it is minutes long under TCG. It repaints with changing
 content round after round and holds the screen against QEMU's screendump
@@ -520,7 +535,7 @@ on push:      T0 unit/property                      ~20 s
 nightly:      T4 image-compression × streaming-video × agent sweeps  ~10 min
               T4 loss injection sweep               ~10 min
               T4 encoding cost measurement          ~1 min
-              T5 cargo-fuzz on the ten targets      ~2 h
+              T5 cargo-fuzz on the eleven targets      ~2 h
 ```
 
 `mlc-probe` is the cheapest of these by a wide margin and the highest-yield
