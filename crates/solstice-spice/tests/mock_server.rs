@@ -545,6 +545,79 @@ async fn a_resize_asked_before_the_agent_announces_itself_still_goes_out() {
     assert!(session.request_resize(1920, 1080).await.unwrap());
 }
 
+/// Wait for the server to grant client mouse mode.
+async fn client_mode(session: &solstice_spice::backend::SpiceSession) {
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while session.mouse_mode() != solstice_spice::inputs::MouseMode::Client {
+        if tokio::time::Instant::now() > deadline {
+            panic!("the server never granted client mouse mode");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// In client mode the server sends a position only with a shape, so the
+/// composited pointer must follow the client's own input -- following the
+/// cursor channel alone left it stuck where the shape last changed.
+#[tokio::test]
+async fn in_client_mode_the_pointer_follows_the_clients_input() {
+    let (session, server) = session_with(MockConfig::default()).await;
+    client_mode(&session).await;
+    wait_for_push(
+        &server,
+        MockPush {
+            channel: channel::DISPLAY,
+            message: mock::draw_fill(0, 0, 0, 64, 48, 0x0000_0000),
+        },
+    )
+    .await;
+    wait_for_push(
+        &server,
+        MockPush {
+            channel: channel::CURSOR,
+            message: mock::cursor_set(10, 10, 2, 2, [0xFF, 0xFF, 0xFF, 0xFF]),
+        },
+    )
+    .await;
+    // The shape first: a move handled before it would be undone by the
+    // position the shape carries.
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while session.framebuffer().read().pixel(10, 10) != Some([0xFF, 0xFF, 0xFF, 0xFF]) {
+        if tokio::time::Instant::now() > deadline {
+            panic!("the cursor shape never arrived");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    session
+        .send_input(InputEvent::PointerAbsolute {
+            x: 800,
+            y: 600,
+            ref_width: 1280,
+            ref_height: 720,
+        })
+        .await
+        .unwrap();
+
+    // 800/1280 of 64 and 600/720 of 48.
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        {
+            let fb = session.framebuffer();
+            let fb = fb.read();
+            if fb.pixel(40, 40) == Some([0xFF, 0xFF, 0xFF, 0xFF])
+                && fb.pixel(10, 10) != Some([0xFF, 0xFF, 0xFF, 0xFF])
+            {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("the pointer did not follow the client's input");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 #[tokio::test]
 async fn the_cursor_is_composited_into_the_framebuffer() {
     let (session, server) = session_with(MockConfig::default()).await;

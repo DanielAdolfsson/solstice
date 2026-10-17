@@ -573,6 +573,7 @@ async fn connect_inner(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<S
         counts,
         connected,
         audio: Mutex::new(audio),
+        display_events,
     };
 
     // Give the display channel a moment to deliver the primary surface, so
@@ -775,6 +776,8 @@ pub struct SpiceSession {
     counts: Arc<DisplayCounts>,
     connected: Arc<AtomicBool>,
     audio: Mutex<Option<mpsc::Receiver<AudioFrame>>>,
+    /// The display queue, for moving the composited pointer.
+    display_events: mpsc::Sender<DisplayEvent>,
 }
 
 impl std::fmt::Debug for SpiceSession {
@@ -1003,19 +1006,37 @@ impl Session for SpiceSession {
         if !self.connected.load(Ordering::Relaxed) {
             return Err(BackendError::Disconnected);
         }
-        let messages = {
+        let (messages, pointer) = {
             let mut state = self.input.lock().expect("input lock");
             let (width, height) = self.dimensions();
             if width != 0 && height != 0 {
                 state.resize(width, height);
             }
-            state.encode(&event)
+            let before = state.position();
+            let messages = state.encode(&event);
+            let after = state.position();
+            // In client mode the server never sends the pointer's position:
+            // the client is expected to draw it where *its* pointer is, and
+            // only a shape change carries a position at all. Following the
+            // cursor channel alone left the composited pointer stuck wherever
+            // the shape last changed.
+            let moved = state.mode() == MouseMode::Client && after != before;
+            (messages, moved.then_some(after))
         };
         for message in messages {
             self.inputs_out
                 .send(message)
                 .await
                 .map_err(|_| BackendError::Disconnected)?;
+        }
+        if let Some((x, y)) = pointer {
+            let _ = self
+                .display_events
+                .send(DisplayEvent::Cursor(crate::cursor::CursorUpdate::Move {
+                    x: x as i32,
+                    y: y as i32,
+                }))
+                .await;
         }
         Ok(())
     }
