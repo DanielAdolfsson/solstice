@@ -533,7 +533,7 @@ fn status_lines(context: &Context) -> Vec<String> {
     };
     let mut lines = vec![format!("name: {}", host.config.name)];
     if context.endpoints.is_empty() {
-        lines.push("endpoints: none; Moonlight shows an empty app list".into());
+        lines.push("endpoints: none; Moonlight shows a \"No desktops\" placeholder".into());
     }
     for entry in context.endpoints.list() {
         lines.push(format!("endpoint: {}", endpoint_line(&entry)));

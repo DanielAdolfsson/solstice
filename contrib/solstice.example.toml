@@ -46,7 +46,8 @@ idle_fps       = 5
 enabled = true
 
 # The remote desktops to offer, one Moonlight app each. None is the default,
-# and a valid start: the daemon pairs, and Moonlight shows an empty app list.
+# and a valid start: the daemon pairs, and Moonlight shows a placeholder,
+# "No desktops on this host", until there is one.
 # `solstice run --endpoint 'name=...,kind=...'` adds more, with the same keys,
 # and `solstice endpoint add` / `remove` change a running daemon's until it
 # stops.

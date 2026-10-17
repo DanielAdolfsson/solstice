@@ -19,6 +19,7 @@ use common::{
 use solstice::config::Config;
 use solstice::testpattern::TestPatternBackend;
 use solstice_gamestream::crypto::certs::{ClientStore, HostIdentity, PairedClient};
+use solstice_gamestream::nvhttp::applist::PLACEHOLDER_APP_ID;
 use solstice_gamestream::nvhttp::Host;
 use tokio::process::Command;
 
@@ -327,7 +328,7 @@ async fn status_lists_the_endpoints_from_the_file_and_the_flags() {
     assert!(
         status
             .stdout
-            .contains("endpoints: none; Moonlight shows an empty app list"),
+            .contains("endpoints: none; Moonlight shows a \"No desktops\" placeholder"),
         "{}",
         status.stdout
     );
@@ -366,7 +367,11 @@ async fn endpoints_are_added_and_removed_on_a_running_daemon() {
     assert!(listed.ok, "{}", listed.stderr);
     assert_eq!(listed.stdout.trim(), "no endpoints");
     let applist = https_get(&https, PORTS, "/applist").await;
-    assert!(!applist.contains("<App>"), "{applist}");
+    assert!(
+        applist.contains(&format!("<ID>{PLACEHOLDER_APP_ID}</ID>"))
+            && applist.matches("<App>").count() == 1,
+        "only the placeholder: {applist}"
+    );
 
     let id = solstice::endpoint::app_id("Colour bars");
     let added = run(
@@ -421,7 +426,11 @@ async fn endpoints_are_added_and_removed_on_a_running_daemon() {
     );
     assert!(host.sessions.lock().unwrap().is_empty());
     let applist = https_get(&https, PORTS, "/applist").await;
-    assert!(!applist.contains("<App>"), "{applist}");
+    assert!(
+        applist.contains(&format!("<ID>{PLACEHOLDER_APP_ID}</ID>"))
+            && applist.matches("<App>").count() == 1,
+        "only the placeholder: {applist}"
+    );
 
     let again = run(&config, &["endpoint", "remove", "Colour bars"]).await;
     assert!(!again.ok);

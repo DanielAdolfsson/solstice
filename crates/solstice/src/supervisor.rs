@@ -132,7 +132,9 @@ impl Supervisor {
         if self.endpoints.is_empty() {
             // Legitimate -- pair first, add desktops later -- but a daemon that
             // was meant to have one and does not would otherwise look healthy.
-            tracing::warn!("no endpoints configured; Moonlight will see an empty app list");
+            tracing::warn!(
+                "no endpoints configured; Moonlight will see a \"No desktops\" placeholder"
+            );
         }
 
         // Every stream binds the same fixed ports, so one must have let go of

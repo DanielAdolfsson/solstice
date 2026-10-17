@@ -16,7 +16,8 @@
 //! it; `password_file` is.
 //!
 //! Zero endpoints is a legitimate state -- pair first, add desktops later --
-//! and Moonlight then sees an empty app list.
+//! and Moonlight then sees one placeholder saying so: an empty list it would
+//! ignore, and go on showing what it had cached.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};

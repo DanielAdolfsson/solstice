@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use zeroize::Zeroizing;
 
+use super::applist::NO_APPS_REFUSAL;
 use super::session::{LaunchSession, PING_PAYLOAD_LEN};
 use super::xml::Root;
 use super::{Host, RequestContext};
@@ -25,7 +26,14 @@ pub fn launch(host: &Host, ctx: &RequestContext) -> (u16, String) {
         Err(refusal) => return refusal,
     };
     if !host.has_app(app_id) {
-        return (404, Root::error(404, "No such app").render());
+        // With nothing on offer, say so: the client may be showing the
+        // placeholder, or tiles it cached before the last app went.
+        let refusal = if host.apps().is_empty() {
+            NO_APPS_REFUSAL
+        } else {
+            "No such app"
+        };
+        return (404, Root::error(404, refusal).render());
     }
     let Some(client_cert) = ctx.client_cert else {
         return (
