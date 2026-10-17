@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use clap::Parser;
-use solstice::cli::{Cli, Command};
+use solstice::cli::{Cli, Command, EndpointAction};
 use solstice::config::Config;
 use solstice::management::{self, ClientError, Request};
 use solstice::supervisor::{build_host, Supervisor};
@@ -73,6 +73,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             })?)
         }
         Command::Status => Ok(remote(Request::Status)?),
+        // Nothing to fall back on: endpoints are the running daemon's.
+        Command::Endpoint { action } => Ok(remote(match action {
+            EndpointAction::Add { spec } => Request::EndpointAdd { spec },
+            EndpointAction::Remove { name } => Request::EndpointRemove { name },
+            EndpointAction::List => Request::EndpointList,
+        })?),
         // These two have an answer without a daemon -- the client list is a
         // file -- and revoking a client while the daemon is down is exactly
         // when it is safe to edit that file.

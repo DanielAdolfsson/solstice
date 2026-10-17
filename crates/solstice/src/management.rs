@@ -1,5 +1,5 @@
-//! The management socket: how `solstice pair`, `status`, `list-clients` and
-//! `revoke` reach the running daemon.
+//! The management socket: how `solstice pair`, `status`, `list-clients`,
+//! `revoke` and `endpoint` reach the running daemon.
 //!
 //! The CLI runs in a different process from the daemon, so before this existed
 //! `solstice pair` could only have opened a window against its own throwaway
@@ -21,6 +21,9 @@
 //! -> status
 //! -> list-clients
 //! -> revoke 3fa9c2d1      a prefix of the fingerprint `list-clients` prints
+//! -> endpoint add name=Build box,kind=vnc,host=10.0.0.5
+//! -> endpoint remove Build box
+//! -> endpoint list
 //! <- out <text>           zero or more, shown as they arrive
 //! <- ok [<text>]          exactly one of these two, last
 //! <- err <text>
@@ -31,6 +34,13 @@
 //! command's exit status says whether pairing happened, which is what a script
 //! driving `moonlight pair -pin` needs (`docs/testing.md` §2.1). Closing the
 //! connection early, Ctrl-C on `solstice pair`, closes the window.
+//!
+//! `endpoint add` takes exactly what `--endpoint` takes and goes through the
+//! same resolution, so the socket is no way around the refusals a
+//! configuration file gets (`docs/roadmap.md` §9). The socket is as trusted as
+//! that file -- the daemon's own user or root -- which is also why the daemon
+//! may read a `password_file` on its behalf. What the socket changes lasts
+//! until the daemon stops: a restart is back to the file and the flags.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -45,10 +55,13 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::endpoint::Endpoints;
+use crate::backend_factory;
+use crate::config::Limits;
+use crate::endpoint::{Endpoints, Entry, Spec};
 
-/// The longest request line accepted, newline included.
-const MAX_REQUEST: u64 = 256;
+/// The longest request line accepted, newline included. Room for an
+/// `endpoint add` with a name, a host and two paths.
+const MAX_REQUEST: u64 = 1024;
 /// How long a peer has to send its request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often a waiting `pair` looks at the window.
@@ -85,11 +98,45 @@ pub enum Request {
         /// A prefix of its certificate fingerprint.
         prefix: String,
     },
+    /// Offer one more endpoint.
+    EndpointAdd {
+        /// What `--endpoint` takes, checked to parse.
+        spec: String,
+    },
+    /// Stop offering an endpoint, and end its sessions.
+    EndpointRemove {
+        /// Its name, exactly.
+        name: String,
+    },
+    /// Every endpoint on offer.
+    EndpointList,
 }
 
 impl Request {
     /// Parse a request line, without its newline.
     pub fn parse(line: &str) -> Result<Self, String> {
+        // Names and specs have spaces in them, so these take the rest of the
+        // line rather than a word.
+        if let Some(spec) = line.strip_prefix("endpoint add ") {
+            Spec::parse(spec)?;
+            return Ok(Request::EndpointAdd {
+                spec: spec.to_owned(),
+            });
+        }
+        // Any name, not only one `check_name` would accept: the title of an
+        // old `[backend]` section was never held to it, and the lookup is
+        // exact.
+        if let Some(name) = line
+            .strip_prefix("endpoint remove ")
+            .filter(|n| !n.is_empty())
+        {
+            return Ok(Request::EndpointRemove {
+                name: name.to_owned(),
+            });
+        }
+        if line == "endpoint list" {
+            return Ok(Request::EndpointList);
+        }
         let mut words = line.split(' ');
         let request = match (words.next(), words.next(), words.next()) {
             (Some("pair"), Some(pin), window) => Request::Pair {
@@ -126,6 +173,9 @@ impl Request {
             Request::Status => "status".into(),
             Request::ListClients => "list-clients".into(),
             Request::Revoke { prefix } => format!("revoke {prefix}"),
+            Request::EndpointAdd { spec } => format!("endpoint add {spec}"),
+            Request::EndpointRemove { name } => format!("endpoint remove {name}"),
+            Request::EndpointList => "endpoint list".into(),
         }
     }
 }
@@ -204,8 +254,10 @@ pub struct Context {
     pub host: Arc<Host>,
     /// The window `pair` opens when it is not given one.
     pub pairing_window: Duration,
-    /// What the daemon offers, for `status`.
+    /// What the daemon offers, which `endpoint add` and `remove` change.
     pub endpoints: Arc<Endpoints>,
+    /// The ceilings a test-pattern endpoint renders at.
+    pub limits: Limits,
 }
 
 /// A bound management socket, not yet serving.
@@ -401,7 +453,62 @@ async fn handle(stream: UnixStream, context: &Context) -> std::io::Result<()> {
                 Err(e) => send(&mut write, "err", &e).await,
             }
         }
+        Request::EndpointAdd { spec } => match add_endpoint(context, &spec) {
+            Ok(entry) => {
+                tracing::info!(endpoint = %entry.name, app = entry.id, "added over the management socket: {}", entry.detail);
+                send(
+                    &mut write,
+                    "ok",
+                    &format!("added {}", endpoint_line(&entry)),
+                )
+                .await
+            }
+            Err(e) => send(&mut write, "err", &e).await,
+        },
+        Request::EndpointRemove { name } => match context.endpoints.remove(&name, host) {
+            Some((entry, ended)) => {
+                tracing::info!(endpoint = %entry.name, app = entry.id, ended, "removed over the management socket");
+                let sessions = match ended {
+                    0 => String::new(),
+                    1 => "; its stream was ended".into(),
+                    n => format!("; its {n} streams were ended"),
+                };
+                send(&mut write, "ok", &format!("removed {name}{sessions}")).await
+            }
+            None => send(&mut write, "err", &format!("no endpoint is named `{name}`")).await,
+        },
+        Request::EndpointList => {
+            let entries = context.endpoints.list();
+            if entries.is_empty() {
+                return send(&mut write, "ok", "no endpoints").await;
+            }
+            for entry in entries {
+                send(&mut write, "out", &endpoint_line(&entry)).await?;
+            }
+            send(&mut write, "ok", "").await
+        }
     }
+}
+
+/// Resolve, build and offer one endpoint.
+fn add_endpoint(context: &Context, spec: &str) -> Result<Entry, String> {
+    let spec = Spec::parse(spec)?;
+    spec.require_absolute_paths()?;
+    let endpoint = spec.resolve()?;
+    let backend = backend_factory::build(&endpoint, &context.limits).map_err(|e| e.to_string())?;
+    let entry = Entry {
+        id: endpoint.id,
+        name: endpoint.name,
+        detail: endpoint.target.describe(),
+        backend,
+    };
+    context.endpoints.add(entry.clone(), &context.host)?;
+    Ok(entry)
+}
+
+/// `Build box (app 123): vnc 10.0.0.5:5900, vencrypt`.
+fn endpoint_line(entry: &Entry) -> String {
+    format!("{} (app {}): {}", entry.name, entry.id, entry.detail)
 }
 
 fn status_lines(context: &Context) -> Vec<String> {
@@ -428,11 +535,8 @@ fn status_lines(context: &Context) -> Vec<String> {
     if context.endpoints.is_empty() {
         lines.push("endpoints: none; Moonlight shows an empty app list".into());
     }
-    for entry in context.endpoints.iter() {
-        lines.push(format!(
-            "endpoint: {} (app {}): {}",
-            entry.name, entry.id, entry.detail
-        ));
+    for entry in context.endpoints.list() {
+        lines.push(format!("endpoint: {}", endpoint_line(&entry)));
     }
     lines.extend([
         format!("pairing: {pairing}"),
@@ -721,6 +825,13 @@ mod tests {
             Request::Revoke {
                 prefix: "abcd".into(),
             },
+            Request::EndpointAdd {
+                spec: "name=Build box,kind=vnc,host=10.0.0.5".into(),
+            },
+            Request::EndpointRemove {
+                name: "Build box".into(),
+            },
+            Request::EndpointList,
         ] {
             assert_eq!(Request::parse(&request.to_line()), Ok(request));
         }
@@ -738,6 +849,13 @@ mod tests {
             "revoke a b",
             "reboot",
             "STATUS",
+            "endpoint",
+            "endpoint list now",
+            "endpoint add ",
+            "endpoint add name=A",
+            "endpoint add name=A,kind=vnc,password=x",
+            "endpoint remove ",
+            "endpoint rename A B",
         ] {
             assert!(Request::parse(line).is_err(), "{line:?} parsed");
         }

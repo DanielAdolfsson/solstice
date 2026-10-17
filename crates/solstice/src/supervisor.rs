@@ -37,7 +37,7 @@ pub struct Supervisor {
 impl Supervisor {
     /// Build one, and offer its endpoints as the host's apps.
     pub fn new(config: Config, host: Arc<Host>, endpoints: Endpoints) -> Self {
-        host.set_apps(endpoints.apps());
+        endpoints.publish(&host);
         Self {
             config,
             host,
@@ -92,6 +92,7 @@ impl Supervisor {
             host: self.host.clone(),
             pairing_window: self.config.security.pairing_window,
             endpoints: self.endpoints.clone(),
+            limits: self.config.limits,
         })));
         let (negotiated_tx, mut negotiated_rx) = mpsc::channel(4);
 
@@ -125,7 +126,7 @@ impl Supervisor {
             port = self.config.server.port,
             "solstice is up"
         );
-        for entry in self.endpoints.iter() {
+        for entry in self.endpoints.list() {
             tracing::info!(endpoint = %entry.name, app = entry.id, "{}", entry.detail);
         }
         if self.endpoints.is_empty() {

@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{pair, start_daemon_closed, start_daemon_endpoints, Ports, PIN};
+use common::{
+    https_client, https_get, pair, start_daemon_closed, start_daemon_endpoints, Ports, PIN,
+};
 use solstice::config::Config;
 use solstice::testpattern::TestPatternBackend;
 use solstice_gamestream::crypto::certs::{ClientStore, HostIdentity, PairedClient};
@@ -330,4 +332,117 @@ async fn status_lists_the_endpoints_from_the_file_and_the_flags() {
         status.stdout
     );
     let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+/// `solstice endpoint add`, `list` and `remove` against a running daemon:
+/// what Moonlight is offered follows at once, the startup refusals hold, and
+/// removing an endpoint takes its session with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn endpoints_are_added_and_removed_on_a_running_daemon() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    const PORTS: Ports = Ports::from_base(50189);
+    let mut config = Config::default();
+    config.server.port = PORTS.http;
+    let (host, state_dir) = start_daemon_endpoints(
+        config,
+        "endpoint-socket",
+        solstice::endpoint::Endpoints::new(Vec::new()).unwrap(),
+    );
+    let config = config_file(&state_dir);
+    eventually("the management socket", || {
+        state_dir.join("control.sock").exists()
+    })
+    .await;
+    host.pairing
+        .lock()
+        .unwrap()
+        .open(PIN, Duration::from_secs(60), Instant::now())
+        .unwrap();
+    let client_identity = HostIdentity::generate("client").unwrap();
+    pair(PORTS, &client_identity).await;
+    let https = https_client(&client_identity);
+
+    let listed = run(&config, &["endpoint", "list"]).await;
+    assert!(listed.ok, "{}", listed.stderr);
+    assert_eq!(listed.stdout.trim(), "no endpoints");
+    let applist = https_get(&https, PORTS, "/applist").await;
+    assert!(!applist.contains("<App>"), "{applist}");
+
+    let id = solstice::endpoint::app_id("Colour bars");
+    let added = run(
+        &config,
+        &["endpoint", "add", "name=Colour bars,kind=testpattern"],
+    )
+    .await;
+    assert!(added.ok, "{}", added.stderr);
+    assert_eq!(
+        added.stdout.trim(),
+        format!("added Colour bars (app {id}): testpattern")
+    );
+    let applist = https_get(&https, PORTS, "/applist").await;
+    assert!(
+        applist.contains(&format!("<AppTitle>Colour bars</AppTitle><ID>{id}</ID>")),
+        "{applist}"
+    );
+
+    // The refusals a configuration file gets, from the daemon itself: the
+    // request is sent raw, past the CLI's own checks.
+    for (spec, why) in [
+        ("name=Colour bars,kind=testpattern", "named `Colour bars`"),
+        (
+            "name=Far,kind=spice,host=10.0.0.1,security=plain",
+            "refused against 10.0.0.1",
+        ),
+        ("name=Rel,kind=vnc,password_file=pw", "absolute path"),
+    ] {
+        let refused = raw(&state_dir, &format!("endpoint add {spec}"));
+        assert!(refused.starts_with("err "), "{spec}: {refused}");
+        assert!(refused.contains(why), "{spec}: {refused}");
+    }
+    assert_eq!(host.apps().len(), 1, "a refused add changes nothing");
+
+    // A launch, then the endpoint goes: the session goes with it.
+    let launched = https_get(
+        &https,
+        PORTS,
+        &format!(
+            "/launch?rikey=000102030405060708090a0b0c0d0e0f&rikeyid=1&localAudioPlayMode=0&appid={id}"
+        ),
+    )
+    .await;
+    assert!(launched.contains("sessionUrl0"), "{launched}");
+    assert_eq!(host.sessions.lock().unwrap().len(), 1);
+
+    let removed = run(&config, &["endpoint", "remove", "Colour bars"]).await;
+    assert!(removed.ok, "{}", removed.stderr);
+    assert_eq!(
+        removed.stdout.trim(),
+        "removed Colour bars; its stream was ended"
+    );
+    assert!(host.sessions.lock().unwrap().is_empty());
+    let applist = https_get(&https, PORTS, "/applist").await;
+    assert!(!applist.contains("<App>"), "{applist}");
+
+    let again = run(&config, &["endpoint", "remove", "Colour bars"]).await;
+    assert!(!again.ok);
+    assert!(
+        again.stderr.contains("no endpoint is named `Colour bars`"),
+        "{}",
+        again.stderr
+    );
+
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+/// One request line straight to the socket, and the reply's last line.
+fn raw(state_dir: &Path, line: &str) -> String {
+    use std::io::{BufRead, Write};
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(state_dir.join("control.sock")).unwrap();
+    writeln!(stream, "{line}").unwrap();
+    std::io::BufReader::new(stream)
+        .lines()
+        .map(Result::unwrap)
+        .last()
+        .unwrap_or_default()
 }

@@ -47,7 +47,9 @@ enabled = true
 
 # The remote desktops to offer, one Moonlight app each. None is the default,
 # and a valid start: the daemon pairs, and Moonlight shows an empty app list.
-# `solstice run --endpoint 'name=...,kind=...'` adds more, with the same keys.
+# `solstice run --endpoint 'name=...,kind=...'` adds more, with the same keys,
+# and `solstice endpoint add` / `remove` change a running daemon's until it
+# stops.
 #
 # Each app's id is derived from its name, so a name is also an identity:
 # renaming an endpoint makes it a new app to the client.

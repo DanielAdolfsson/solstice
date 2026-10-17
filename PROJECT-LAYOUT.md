@@ -114,10 +114,10 @@ without starting a daemon.
 src/
 ├── main.rs
 ├── lib.rs            # ▲ also a library, so the end-to-end test can start it
-├── cli.rs            # clap: run [--endpoint ...], pair, status, list-clients, revoke
+├── cli.rs            # clap: run [--endpoint ...], pair, status, list-clients, revoke, endpoint
 ├── management.rs     # ▲ the control socket those subcommands talk to the daemon over
 ├── config.rs         # serde + toml; see §5
-├── endpoint.rs       # ▲ the desktops on offer: one spec for TOML, --endpoint and (later) the socket
+├── endpoint.rs       # ▲ the desktops on offer: one spec for TOML, --endpoint and `endpoint add`
 ├── supervisor.rs     # session lifecycle, resource ceilings, shutdown
 ├── pipeline.rs       # ▲ the frame loop: framebuffer → convert → encode → packetise
 ├── testpattern.rs    # ▲ the colour-bar backend (and a tone), for milestone 1 and the tests

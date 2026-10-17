@@ -103,6 +103,17 @@ None at all is a valid start, so you can pair first and add desktops
 afterwards. `--endpoint` takes no `password`, because every user on the
 machine can read the command line; use `password_file`.
 
+A running daemon takes more, or fewer, without a restart:
+
+```sh
+solstice endpoint add 'name=Scratch VM,kind=spice,host=127.0.0.1,port=5902'
+solstice endpoint list
+solstice endpoint remove 'Scratch VM'   # ends its stream, if one is running
+```
+
+These last until the daemon stops. A restart is back to the configuration
+and the flags.
+
 Pairing is opened from a second shell, as the user the daemon runs as, with
 the PIN Moonlight is showing. The command waits until the client has paired,
 and fails if the window runs out:
@@ -221,9 +232,6 @@ summaries below are just the shape of it.
   the kind of thing that generates bug reports.
 - **HEVC and AV1.** `ServerCodecModeSupport` advertises H.264 only, and the
   DESCRIBE omits the two markers a client reads as "HEVC" and "AV1".
-- **Adding and removing endpoints at runtime.** They are fixed when the
-  daemon starts. The management socket is the planned route,
-  [§9](docs/roadmap.md#9-several-endpoints-one-app-each).
 - **Streaming two endpoints at once.** One stream at a time: every stream
   binds the same fixed UDP ports.
 - **mDNS discovery.** Moonlight accepts a manually typed host.
