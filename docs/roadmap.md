@@ -1575,9 +1575,13 @@ and over VNC, with endpoints added and removed while it watched:
   advertises `MULTI_CODEC`, with no codec under it: without `MULTI_CODEC`
   the server assumes MJPEG and streams anyway. The real-server test holds a
   virtio-gpu guest with `streaming-video=all` to zero stream frames, and a
-  stream a server opens regardless is still decoded. Whether streams are
-  acceptable over QXL, where a video is one stream rather than a column
-  each, is being tried live.
+  stream a server opens regardless is still decoded. Over QXL streams are
+  worse, not just pointless: KWin sends every frame as one full-screen
+  `DRAW_COPY`, so the server took the whole desktop for video and opened a
+  single 1280×720 stream. The screen then ran at a median of 11 frames per
+  second (59 with streams off), every frame ~44 KB of MJPEG, text included,
+  and each cost Solstice 9–10 ms to decode. The Windows guest, which sends
+  only what changed, opened no stream at all.
 
 ### What is left
 
