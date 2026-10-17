@@ -11,11 +11,13 @@
 //! Both are requested; both fall back cleanly.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use solstice_backend::{BackendEvent, Framebuffer, FramebufferHandle, Rect};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc};
 
+use crate::cursor::Pointer;
 use crate::encodings::tight::TightStreams;
 use crate::encodings::zrle::ZlibStream;
 use crate::encodings::{copy_rect, hextile, raw, rre, tight, zrle};
@@ -39,6 +41,7 @@ pub const ENCODINGS: &[i32] = &[
     encoding::PSEUDO_QEMU_EXTENDED_KEY,
     encoding::PSEUDO_EXTENDED_DESKTOP_SIZE,
     encoding::PSEUDO_DESKTOP_SIZE,
+    encoding::PSEUDO_CURSOR,
     encoding::PSEUDO_LAST_RECT,
 ];
 
@@ -133,6 +136,8 @@ pub struct UpdateLoop<R> {
     /// encoder for the length of a network read.
     local: Framebuffer,
     fb: FramebufferHandle,
+    /// Composited at publication; see `crate::cursor`.
+    pointer: Arc<Mutex<Pointer>>,
     events: broadcast::Sender<BackendEvent>,
     outgoing: mpsc::Sender<Vec<u8>>,
     zlib: ZlibStream,
@@ -160,6 +165,7 @@ impl<R: AsyncRead + Unpin> UpdateLoop<R> {
             format,
             local: Framebuffer::new(w, h),
             fb,
+            pointer: Arc::default(),
             events,
             outgoing,
             zlib: ZlibStream::new(),
@@ -168,6 +174,11 @@ impl<R: AsyncRead + Unpin> UpdateLoop<R> {
             continuous: false,
             rectangles: BTreeMap::new(),
         }
+    }
+
+    /// The pointer this loop draws, for the session to move.
+    pub fn pointer(&self) -> Arc<Mutex<Pointer>> {
+        self.pointer.clone()
     }
 
     /// What the server turned out to support.
@@ -245,6 +256,18 @@ impl<R: AsyncRead + Unpin> UpdateLoop<R> {
                     self.caps.qemu_extended_key = true;
                     continue;
                 }
+                encoding::PSEUDO_CURSOR => {
+                    let shape =
+                        crate::cursor::decode(&mut self.reader, &self.format, &header).await?;
+                    let changed = {
+                        let mut pointer = self.pointer.lock().expect("pointer lock");
+                        pointer.set_shape(&mut self.fb.write(), shape)
+                    };
+                    if let Some(rect) = changed {
+                        let _ = self.events.send(BackendEvent::Damage(rect));
+                    }
+                    continue;
+                }
                 _ => {}
             }
 
@@ -272,7 +295,11 @@ impl<R: AsyncRead + Unpin> UpdateLoop<R> {
         if let Some((width, height)) = resized {
             let (width, height) = (width as u32, height as u32);
             self.local.resize(width, height);
-            self.fb.write().resize(width, height);
+            {
+                let mut pointer = self.pointer.lock().expect("pointer lock");
+                self.fb.write().resize(width, height);
+                pointer.forget_drawn();
+            }
             let _ = self.events.send(BackendEvent::Resize { width, height });
             // The framebuffer is new, so everything in it is damage.
             let _ = self
@@ -290,7 +317,11 @@ impl<R: AsyncRead + Unpin> UpdateLoop<R> {
         if let Some(rect) = damage {
             // Publish under a short lock, then announce. The encoder sees a
             // consistent region and never waits on a network read.
-            self.fb.write().copy_from(&self.local, rect);
+            self.pointer.lock().expect("pointer lock").publish(
+                &mut self.fb.write(),
+                &self.local,
+                rect,
+            );
             let _ = self.events.send(BackendEvent::Damage(rect));
         }
         if !self.continuous {

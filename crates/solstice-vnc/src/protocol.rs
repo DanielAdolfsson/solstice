@@ -69,6 +69,7 @@ pub mod encoding {
     pub const ZRLE: i32 = 16;
 
     pub const PSEUDO_DESKTOP_SIZE: i32 = -223;
+    pub const PSEUDO_CURSOR: i32 = -239;
     pub const PSEUDO_LAST_RECT: i32 = -224;
     pub const PSEUDO_QEMU_EXTENDED_KEY: i32 = -258;
     pub const PSEUDO_EXTENDED_DESKTOP_SIZE: i32 = -308;

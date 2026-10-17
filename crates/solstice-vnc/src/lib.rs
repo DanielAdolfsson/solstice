@@ -21,6 +21,7 @@
 
 pub mod auth;
 pub mod backend;
+pub mod cursor;
 pub mod encodings;
 pub mod handshake;
 pub mod input;

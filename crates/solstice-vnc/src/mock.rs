@@ -161,6 +161,22 @@ pub enum MockUpdate {
     /// Reset all four Tight zlib streams: the next Tight rectangle carries the
     /// reset bits, and the mock's own compressors start over.
     ResetTightStreams,
+    /// A Cursor pseudo-rectangle (−239). Refused, ending the connection, if
+    /// the client did not list the encoding: a server must not send it then.
+    Cursor {
+        /// Hot spot.
+        hot_x: u16,
+        /// Hot spot.
+        hot_y: u16,
+        /// Shape width; 0 x 0 is "no pointer".
+        width: u16,
+        /// Shape height.
+        height: u16,
+        /// `width * height` BGRA pixels.
+        pixels: Vec<[u8; 4]>,
+        /// `width * height` flags, true where opaque.
+        mask: Vec<bool>,
+    },
     /// A DesktopSize pseudo-rectangle.
     Resize {
         /// New width.
@@ -217,6 +233,7 @@ impl MockServer {
         let pseudo_reply = self.pseudo_encodings(encodings);
         let mut tight = (self.config.offer_tight && encodings.contains(&encoding::TIGHT))
             .then(TightEncoder::new);
+        let cursor_listed = encodings.contains(&encoding::PSEUDO_CURSOR);
         self.record(second);
 
         // Answer the first update request with the acknowledged
@@ -289,6 +306,45 @@ impl MockServer {
                         tight.reset_all();
                     }
                     continue;
+                }
+                MockUpdate::Cursor {
+                    hot_x,
+                    hot_y,
+                    width,
+                    height,
+                    pixels,
+                    mask,
+                } => {
+                    if !cursor_listed {
+                        return Err(RfbError::Protocol(
+                            "the client did not list the Cursor pseudo-encoding".into(),
+                        ));
+                    }
+                    let (w, h) = (width as usize, height as usize);
+                    assert_eq!(pixels.len(), w * h, "one pixel per position");
+                    assert_eq!(mask.len(), w * h, "one mask flag per position");
+                    let mut frame = vec![server_msg::FRAMEBUFFER_UPDATE, 0];
+                    frame.extend_from_slice(&1u16.to_be_bytes());
+                    frame.extend_from_slice(
+                        &RectHeader {
+                            x: hot_x,
+                            y: hot_y,
+                            width,
+                            height,
+                            encoding: encoding::PSEUDO_CURSOR,
+                        }
+                        .to_bytes(),
+                    );
+                    for &colour in &pixels {
+                        frame.extend_from_slice(&self.encode_pixel(colour));
+                    }
+                    let row = w.div_ceil(8);
+                    let mut bits = vec![0u8; row * h];
+                    for (i, _) in mask.iter().enumerate().filter(|(_, &m)| m) {
+                        bits[(i / w) * row + (i % w) / 8] |= 0x80 >> (i % w % 8);
+                    }
+                    frame.extend_from_slice(&bits);
+                    frame
                 }
                 MockUpdate::Resize { width, height } => {
                     let mut frame = vec![server_msg::FRAMEBUFFER_UPDATE, 0];

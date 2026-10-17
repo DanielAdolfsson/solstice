@@ -173,7 +173,8 @@ pointed at a client before any desktop is involved.
 - **The VNC backend**: RFB 3.3–3.8, `None` / VNC Authentication / VeNCrypt with
   real certificate verification, Raw / CopyRect / RRE / Hextile / ZRLE,
   ContinuousUpdates and Fence where offered, ExtendedDesktopSize resize
-  requests, and both keyboard paths.
+  requests, both keyboard paths, and the server's cursor, drawn where the
+  client points.
 - **The SPICE backend**: the per-channel link handshake with its RSA-OAEP
   ticket, TLS, both message framings and the ack window; a 2D rasteriser with
   binary and ternary raster operations, clip regions, stencil masks, brushes,
