@@ -112,6 +112,7 @@ pub fn build(endpoint: &Endpoint, limits: &Limits) -> Result<Arc<dyn Backend>, F
                     // The operator configured QEMU's `image-compression=`;
                     // a preference from here would silently replace it.
                     preferred_compression: None,
+                    video_streams: spice.video_streams,
                 },
             )))
         }

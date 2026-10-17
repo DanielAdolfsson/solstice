@@ -1546,9 +1546,47 @@ and over VNC, with endpoints added and removed while it watched:
   still fails costs only itself. The real-server MJPEG test had never seen
   a stream frame (fifty draw commands satisfied it first); it now requires
   ten. QEMU itself died on the next reconnect; that one is not understood.
+- **Behind `virtio-vga`, SPICE tears, and no client can fix it.** Video
+  and dragged windows came apart on a Kubuntu guest and on a Windows 11
+  guest, where VNC on the same VMs was clean. The cause is the device, not
+  the protocol. A non-QXL card gives QEMU only a framebuffer, so
+  `ui/spice-display.c` diffs it on every refresh and hands `spice-server`
+  one `DRAW_COPY` per changed 32-pixel-wide column. Traced per command:
+  - With streaming on, the server classified each column as video and
+    opened one MJPEG stream per column (76 streams of 32×523 in one
+    session), each paced and dropped on its own, so neighbouring columns
+    showed different moments of the video.
+  - With streaming off, a Kubuntu refresh is ~40 strips in one burst and
+    arrives whole. A Windows window drag is 250–1000 strips per refresh,
+    and the server sends them about 40–50 every ~44 ms, so one refresh
+    takes 0.2–1 s to arrive and any picture taken meanwhile is part old,
+    part new. SPICE marks no frame boundary for a client to wait for.
+  Batching on a quiet gap was tried and taken out again: it could not
+  bridge the server's pacing, and on QXL it only merged complete frames.
+  **On QXL both guests were clean.** Kubuntu (KWin, kernel `qxl` driver)
+  sends each frame as one full-screen `DRAW_COPY`; Windows needs Red Hat's
+  `qxldod` driver, which is not in dockur's image and has to be installed
+  first, or Windows falls back to VGA mode and the strips return. Use QXL
+  for SPICE guests; a non-QXL guest is better served over VNC.
+- **Video streams are off by default** (`video_streams`, per endpoint).
+  Solstice decodes a stream only to re-encode the whole screen, so a stream
+  adds a lossy MJPEG generation and costs both ends an encode and decode;
+  off, the same pixels arrive losslessly as draw commands. The client still
+  advertises `MULTI_CODEC`, with no codec under it: without `MULTI_CODEC`
+  the server assumes MJPEG and streams anyway. The real-server test holds a
+  virtio-gpu guest with `streaming-video=all` to zero stream frames, and a
+  stream a server opens regardless is still decoded. Whether streams are
+  acceptable over QXL, where a video is one stream rather than a column
+  each, is being tried live.
 
 ### What is left
 
+- **A raw full-screen `DRAW_COPY` costs about 8 ms to execute** at
+  1280×720 (3.6 MB), measured on the QXL Kubuntu guest above with
+  `image-compression=off`. That is far slower than copying 3.6 MB, and it
+  kept the display task busy 14 ms per publish on average there, so it caps
+  the frame rate a QXL guest can reach. An unscaled, unclipped opaque copy
+  could take a row-copy fast path past the general raster loop.
 - **A disconnect ends the session; in Sunshine it does not.** moonlight-qt's
   Ctrl+Alt+Shift+Q leaves the app running for a later resume, and Sunshine
   keeps it. Solstice ends the launch record when the stream stops, so

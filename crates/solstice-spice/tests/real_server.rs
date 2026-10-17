@@ -126,6 +126,10 @@ fn config(port: u16) -> SpiceConfig {
 }
 
 async fn session(port: u16) -> solstice_spice::SpiceSession {
+    session_with(config(port)).await
+}
+
+async fn session_with(config: SpiceConfig) -> solstice_spice::SpiceSession {
     // Warnings on by default: the client reports a display error by logging
     // it and closing the display, and without a subscriber that looked like a
     // server that had simply gone quiet (`docs/roadmap.md` §2.7).
@@ -135,8 +139,8 @@ async fn session(port: u16) -> solstice_spice::SpiceSession {
         )
         .with_test_writer()
         .try_init();
-    let dialer = Arc::new(TcpDialer::new(config(port)));
-    tokio::time::timeout(TIMEOUT, connect(dialer, config(port)))
+    let dialer = Arc::new(TcpDialer::new(config.clone()));
+    tokio::time::timeout(TIMEOUT, connect(dialer, config))
         .await
         .expect("connect timed out")
         .expect("connect failed")
@@ -377,7 +381,13 @@ async fn mjpeg_streams_are_decoded_and_composited_over_the_draw_output() {
     };
     guest.fill("000000").expect("painting the guest black");
 
-    let session = session(guest.spice_port()).await;
+    // Streams are off by default; this is the test of what happens when they
+    // are asked for.
+    let session = session_with(SpiceConfig {
+        video_streams: true,
+        ..config(guest.spice_port())
+    })
+    .await;
     let mut events = session.subscribe();
 
     // Something that changes fast enough for the server's heuristic to call
@@ -393,7 +403,7 @@ async fn mjpeg_streams_are_decoded_and_composited_over_the_draw_output() {
     let deadline = tokio::time::Instant::now() + TIMEOUT;
     let mut damage = 0usize;
     let mut full_surface = 0usize;
-    let mut clipped: Option<solstice_backend::Rect> = None;
+    let mut inside_terminal = 0usize;
     // Until frames have arrived as well: the draws come first, and fifty of
     // them can be done before the server's heuristic has opened a stream.
     while tokio::time::Instant::now() < deadline
@@ -404,13 +414,18 @@ async fn mjpeg_streams_are_decoded_and_composited_over_the_draw_output() {
         {
             damage += 1;
             // QEMU repaints the whole surface once when a client attaches,
-            // which is correct and says nothing about streaming. Unioning it
-            // in would mask the property under test, so it is counted
-            // separately rather than discarded silently.
+            // which is correct and says nothing about streaming. So does the
+            // server once the terminal is up, as four bands around it, and
+            // on a loaded machine those can land in separate publishes whose
+            // union is the whole screen again. Neither is the stream, so the
+            // test asks what most updates look like rather than what all of
+            // them add up to.
             if r.width >= 640 && r.height >= 480 {
                 full_surface += 1;
-            } else {
-                clipped = Some(clipped.map_or(r, |c| c.union(&r)));
+            }
+            // The terminal is about 300x210; the screen is 640x480.
+            if r.width <= 320 && r.height <= 240 {
+                inside_terminal += 1;
             }
         }
     }
@@ -425,10 +440,10 @@ async fn mjpeg_streams_are_decoded_and_composited_over_the_draw_output() {
         "{full_surface} of {damage} updates repainted the whole surface; a \
          stream should be a clipped sub-rectangle layered over the draw output"
     );
-    let covered = clipped.expect("every update repainted the whole surface");
     assert!(
-        covered.width < 640 && covered.height < 480,
-        "the clipped updates still covered the whole screen ({covered:?})"
+        inside_terminal * 4 >= damage * 3,
+        "only {inside_terminal} of {damage} updates fit the terminal; a stream \
+         should be a clipped sub-rectangle layered over the draw output"
     );
     // `spice-server` sends a stream's Huffman tables in its first frame
     // only, so a client that has decoded just that one has not been tested
@@ -440,6 +455,94 @@ async fn mjpeg_streams_are_decoded_and_composited_over_the_draw_output() {
          first carry no Huffman tables"
     );
     session.close().await;
+}
+
+/// Video streams are off unless asked for, and the server honours that: the
+/// same noise that opens a stream above arrives as draw commands, and the
+/// picture is still exact.
+///
+/// On the device that made this the default. Behind virtio-gpu QEMU cuts
+/// every refresh into 32-pixel-wide strips, and with streams on
+/// `spice-server` opened one MJPEG stream per strip -- 38 of them across one
+/// video in a real session -- each paced and dropped on its own, so the
+/// columns of one picture showed different moments of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_video_streams_the_server_sends_draw_commands_even_for_video() {
+    let Some(guest) = Guest::start(
+        GuestConfig::new()
+            .geometry(640, 480)
+            .display(solstice_test_guest::Display::VirtioGpu)
+            .spice(Spice::new().image_compression("off").streaming_video("all")),
+    ) else {
+        return;
+    };
+    guest.fill("000000").expect("painting the guest black");
+    let session = session(guest.spice_port()).await;
+    let mut events = session.subscribe();
+
+    guest
+        .sh("nohup xterm -geometry 50x16+60+60 -bg white -fg black \
+             -e sh -c 'while :; do base64 /dev/urandom | head -1; done' \
+             >/dev/null 2>&1 & echo started")
+        .expect("starting the noise generator");
+
+    // Long enough for the heuristic: the test above sees its stream well
+    // inside this many updates.
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    let mut damage = 0usize;
+    while tokio::time::Instant::now() < deadline && damage < 200 {
+        if let Ok(Ok(BackendEvent::Damage(_))) =
+            tokio::time::timeout(Duration::from_millis(500), events.recv()).await
+        {
+            damage += 1;
+        }
+    }
+    let _ = guest.sh("pkill xterm");
+
+    assert!(damage >= 200, "only {damage} updates arrived");
+    assert_eq!(
+        session.stream_frame_count(),
+        0,
+        "the server streamed video to a client that advertised no codec"
+    );
+    // Exact but for the pointer: this client draws it into the framebuffer,
+    // and QEMU's screendump of a virtio-gpu guest leaves its hardware cursor
+    // out. So everything that differs has to fit in one cursor-sized box;
+    // a stream-shaped hole would not.
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        let box_ = differing_box(&session, &guest);
+        match box_ {
+            None => break,
+            Some((w, h)) if w <= 64 && h <= 64 => break,
+            Some(other) if tokio::time::Instant::now() > deadline => {
+                panic!("the picture without streams differs over {other:?}")
+            }
+            Some(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+        }
+    }
+    session.close().await;
+}
+
+/// The size of the smallest box holding every pixel that differs from QEMU's
+/// screendump, if any does.
+fn differing_box(session: &solstice_spice::SpiceSession, guest: &Guest) -> Option<(u32, u32)> {
+    let dump = guest.screendump().ok()?;
+    let fb = session.framebuffer();
+    let fb = fb.read();
+    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+    for (i, (bgra, rgb)) in fb
+        .data()
+        .chunks_exact(4)
+        .zip(dump.rgb.chunks_exact(3))
+        .enumerate()
+    {
+        if [bgra[2], bgra[1], bgra[0]] != [rgb[0], rgb[1], rgb[2]] {
+            let (x, y) = (i as u32 % fb.width(), i as u32 / fb.width());
+            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+        }
+    }
+    (x0 != u32::MAX).then(|| (x1 - x0 + 1, y1 - y0 + 1))
 }
 
 /// How many pixels differ between the session's framebuffer and QEMU's own

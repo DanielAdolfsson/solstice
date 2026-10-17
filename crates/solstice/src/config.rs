@@ -343,6 +343,11 @@ pub struct Spice {
     /// also what GameStream carries: passed through when the client asked
     /// for what the server sends, re-encoded otherwise.
     pub audio: bool,
+    /// Let the server send video as MJPEG streams. Off by default: Solstice
+    /// re-encodes the whole screen anyway, so a stream only adds a lossy
+    /// generation, and behind a non-QXL card one video becomes many streams
+    /// paced on their own, which tears it.
+    pub video_streams: bool,
 }
 
 impl Default for Spice {
@@ -356,6 +361,7 @@ impl Default for Spice {
             password: None,
             ca_file: None,
             audio: true,
+            video_streams: false,
         }
     }
 }

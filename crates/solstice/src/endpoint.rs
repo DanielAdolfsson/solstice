@@ -60,6 +60,8 @@ pub struct Spec {
     pub ca_file: Option<PathBuf>,
     /// SPICE only: open the playback channel.
     pub audio: Option<bool>,
+    /// SPICE only: let the server send video streams.
+    pub video_streams: Option<bool>,
 }
 
 impl Spec {
@@ -75,6 +77,7 @@ impl Spec {
             password_file: None,
             ca_file: None,
             audio: None,
+            video_streams: None,
         }
     }
 
@@ -111,17 +114,12 @@ impl Spec {
                 }
                 "password_file" => out.password_file = Some(value.into()),
                 "ca_file" => out.ca_file = Some(value.into()),
-                "audio" => {
-                    out.audio = Some(match value {
-                        "true" => true,
-                        "false" => false,
-                        _ => return Err(format!("audio = {value} is not true or false")),
-                    })
-                }
+                "audio" => out.audio = Some(parse_bool(key, value)?),
+                "video_streams" => out.video_streams = Some(parse_bool(key, value)?),
                 _ => {
                     return Err(format!(
                         "unknown key `{key}`; expected name, kind, host, port, security, \
-                         password_file, ca_file or audio"
+                         password_file, ca_file, audio or video_streams"
                     ))
                 }
             }
@@ -151,6 +149,7 @@ impl Spec {
                     ("password_file", self.password_file.is_some()),
                     ("ca_file", self.ca_file.is_some()),
                     ("audio", self.audio.is_some()),
+                    ("video_streams", self.video_streams.is_some()),
                 ] {
                     if given {
                         return refuse(key);
@@ -161,6 +160,9 @@ impl Spec {
             BackendKind::Vnc => {
                 if self.audio.is_some() {
                     return refuse("audio");
+                }
+                if self.video_streams.is_some() {
+                    return refuse("video_streams");
                 }
                 let mut vnc = Vnc::default();
                 if let Some(host) = &self.host {
@@ -186,6 +188,7 @@ impl Spec {
                 spice.password = self.password()?;
                 spice.ca_file = self.ca_file.clone();
                 spice.audio = self.audio.unwrap_or(spice.audio);
+                spice.video_streams = self.video_streams.unwrap_or(spice.video_streams);
                 Target::Spice(spice)
             }
         };
@@ -222,6 +225,15 @@ impl Spec {
             (password, None) => Ok(password.clone()),
             (None, Some(path)) => read_password(path).map(Some),
         }
+    }
+}
+
+/// `true` or `false`, for the `key=value` form.
+fn parse_bool(key: &str, value: &str) -> Result<bool, String> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!("{key} = {value} is not true or false")),
     }
 }
 
@@ -513,7 +525,25 @@ mod tests {
         assert_eq!((spice.host.as_str(), spice.port), ("127.0.0.1", 7878));
         assert_eq!(spice.security, SpiceSecurityKind::Tls, "the sound default");
         assert!(spice.audio);
+        assert!(!spice.video_streams, "streams are off unless asked for");
         assert_eq!(endpoint.id, app_id("My Spice X"));
+    }
+
+    #[test]
+    fn video_streams_is_spice_only() {
+        let spec =
+            Spec::parse("name=A,kind=spice,host=::1,security=plain,video_streams=true").unwrap();
+        let Target::Spice(spice) = spec.resolve().unwrap().target else {
+            panic!("expected spice")
+        };
+        assert!(spice.video_streams);
+        for kind in ["vnc", "testpattern"] {
+            let err = Spec::parse(&format!("name=A,kind={kind},video_streams=false"))
+                .unwrap()
+                .resolve()
+                .unwrap_err();
+            assert!(err.contains("video_streams"), "{kind}: {err}");
+        }
     }
 
     #[test]

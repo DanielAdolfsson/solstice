@@ -86,6 +86,11 @@ enabled = true
 # # ca_file       = "/etc/solstice/spice-ca.pem"
 # # Open the playback channel: guest audio to the client. Off means silence.
 # audio    = true
+# # Let the server send video as MJPEG streams. Solstice re-encodes the whole
+# # screen anyway, so a stream only adds a lossy generation; and behind a
+# # non-QXL card one video becomes many streams, paced on their own, which
+# # tears it apart. Off sends the same pixels losslessly as draw commands.
+# video_streams = false
 #
 # [[endpoint]]
 # name     = "Colour bars"
