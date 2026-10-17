@@ -44,6 +44,10 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.sha2]
 opt-level = 3
+[profile.dev.package.solstice-spice-codec]
+opt-level = 3
+[profile.dev.package.solstice-spice]
+opt-level = 3
 
 [workspace.metadata]
 # `fuzz/` is its own workspace: cargo-fuzz builds it with a nightly toolchain
