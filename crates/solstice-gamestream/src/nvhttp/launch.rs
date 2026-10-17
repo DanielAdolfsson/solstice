@@ -21,11 +21,9 @@ pub fn launch(host: &Host, ctx: &RequestContext) -> (u16, String) {
         return (400, Root::error(400, "Missing launch parameters").render());
     };
 
-    let Ok(rikey_bytes) = hex::decode(rikey_hex) else {
-        return (400, Root::error(400, "rikey is not hex").render());
-    };
-    let Ok(rikey) = <[u8; 16]>::try_from(rikey_bytes.as_slice()) else {
-        return (400, Root::error(400, "rikey is not 16 bytes").render());
+    let rikey = match parse_rikey(rikey_hex) {
+        Ok(rikey) => rikey,
+        Err(refusal) => return refusal,
     };
     if !is_known_app(app_id) {
         return (404, Root::error(404, "No such app").render());
@@ -90,6 +88,11 @@ pub fn launch(host: &Host, ctx: &RequestContext) -> (u16, String) {
 ///
 /// Re-attaching needs the same proof of identity as launching, and the session
 /// being resumed must belong to the *same* certificate.
+///
+/// The client mints a fresh `rikey` for every resume and encrypts with it from
+/// then on, so the session takes the new keys; handing back the launch's would
+/// stream nothing the client could decrypt. Sunshine refuses a resume without
+/// them (`nvhttp.cpp`, `resume`), and so does this host.
 pub fn resume(host: &Host, ctx: &RequestContext) -> (u16, String) {
     let Some(client_cert) = ctx.client_cert else {
         return (
@@ -100,10 +103,26 @@ pub fn resume(host: &Host, ctx: &RequestContext) -> (u16, String) {
     if !host.is_paired(client_cert) {
         return (401, Root::error(401, "Not paired").render());
     }
-    let sessions = host.sessions.lock().expect("session lock");
-    let Some(session) = sessions.iter().find(|s| s.client_cert_der == client_cert) else {
+    let (Some(rikey_hex), Some(rikey_id)) = (
+        ctx.request.param("rikey"),
+        ctx.request.param_num::<i64>("rikeyid"),
+    ) else {
+        return (400, Root::error(400, "Missing resume parameters").render());
+    };
+    let rikey = match parse_rikey(rikey_hex) {
+        Ok(rikey) => rikey,
+        Err(refusal) => return refusal,
+    };
+    let mut sessions = host.sessions.lock().expect("session lock");
+    let Some(session) = sessions
+        .iter_mut()
+        .find(|s| s.client_cert_der == client_cert)
+    else {
         return (404, Root::error(404, "No session to resume").render());
     };
+    session.rikey = Zeroizing::new(rikey);
+    session.rikey_id = rikey_id as i32;
+    tracing::info!(session = %session.id, "resumed");
     let scheme = if session.encrypted_rtsp {
         "rtspenc"
     } else {
@@ -138,6 +157,15 @@ pub fn cancel(host: &Host, ctx: &RequestContext) -> (u16, String) {
     let closed = host.end_sessions_of(client_cert);
     tracing::info!(closed, "cancel");
     (200, Root::ok().child("cancel", 1).render())
+}
+
+/// Decode the hex `rikey` of `/launch` and `/resume`, or the 400 refusing it.
+fn parse_rikey(hex: &str) -> Result<[u8; 16], (u16, String)> {
+    let Ok(bytes) = hex::decode(hex) else {
+        return Err((400, Root::error(400, "rikey is not hex").render()));
+    };
+    <[u8; 16]>::try_from(bytes.as_slice())
+        .map_err(|_| (400, Root::error(400, "rikey is not 16 bytes").render()))
 }
 
 /// Eight random bytes, hex-encoded to the 16 ASCII characters the client
