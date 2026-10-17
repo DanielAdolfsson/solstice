@@ -530,6 +530,21 @@ async fn a_resize_is_refused_without_a_guest_agent_and_accepted_with_one() {
     assert_eq!((width, height), (1920, 1080));
 }
 
+/// The supervisor asks straight after `connect`, and a real agent announces
+/// itself a moment later. A live session decided "no agent" 0.1 ms before the
+/// announcement arrived, and scaled a desktop it could have resized.
+#[tokio::test]
+async fn a_resize_asked_before_the_agent_announces_itself_still_goes_out() {
+    let mock = MockConfig {
+        agent: true,
+        agent_announce_delay: Duration::from_millis(200),
+        ..MockConfig::default()
+    };
+    let (session, _) = session_with(mock).await;
+    assert!(!session.can_resize(), "the delay should outlast connect");
+    assert!(session.request_resize(1920, 1080).await.unwrap());
+}
+
 #[tokio::test]
 async fn the_cursor_is_composited_into_the_framebuffer() {
     let (session, server) = session_with(MockConfig::default()).await;

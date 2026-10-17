@@ -75,6 +75,10 @@ pub struct MockConfig {
     pub link_error: Option<u32>,
     /// Claim a message body longer than the bytes that follow it.
     pub overrun_message: bool,
+    /// How long the guest agent takes to announce itself after
+    /// `AGENT_START`. A real one takes a moment, and `connect` returns before
+    /// it has.
+    pub agent_announce_delay: std::time::Duration,
 }
 
 impl Default for MockConfig {
@@ -98,6 +102,7 @@ impl Default for MockConfig {
             mouse_mode: protocol::mouse_mode::SERVER,
             link_error: None,
             overrun_message: false,
+            agent_announce_delay: std::time::Duration::ZERO,
         }
     }
 }
@@ -219,6 +224,15 @@ impl MockServer {
                     body: body.clone(),
                 });
                 for reply in answer(&config, channel, kind, &body) {
+                    let delay = config.agent_announce_delay;
+                    if kind == crate::protocol::main_msgc::AGENT_START && !delay.is_zero() {
+                        let pushes = self.pushes.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            let _ = push_tx_clone(&pushes, channel, reply);
+                        });
+                        continue;
+                    }
                     let _ = push_tx_clone(&self.pushes, channel, reply);
                 }
             }

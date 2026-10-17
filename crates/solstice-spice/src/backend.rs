@@ -940,6 +940,10 @@ impl SpiceSession {
     }
 }
 
+/// How long `request_resize` waits for the guest agent to say whether it can
+/// resize.
+const RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[async_trait]
 impl Session for SpiceSession {
     fn dimensions(&self) -> (u32, u32) {
@@ -951,6 +955,21 @@ impl Session for SpiceSession {
         // Best-effort, like RFB's: without `spice-vdagent` in the guest
         // there is nothing that can change the mode, and the caller falls
         // back to scaling (`docs/bridging-design.md` §2.2).
+        //
+        // The caller asks straight after `connect`, and the agent announces
+        // itself a moment later -- a real session decided "no agent" 0.1 ms
+        // before the announcement arrived, and scaled a desktop it could have
+        // resized. So wait until the answer is settled, briefly.
+        let deadline = tokio::time::Instant::now() + RESIZE_SETTLE;
+        while !self
+            .main
+            .lock()
+            .expect("main channel lock")
+            .resize_settled()
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         let messages = {
             let mut main = self.main.lock().expect("main channel lock");
             if !main.can_resize() {
