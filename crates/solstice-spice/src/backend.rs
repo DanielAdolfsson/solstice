@@ -392,11 +392,13 @@ pub async fn connect(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<Spi
 }
 
 async fn connect_inner(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<SpiceSession> {
+    // Dropped on any early return below, which closes what has linked so far.
+    let tasks = Tasks::default();
     let (stream, mini) =
         link_channel(dialer.as_ref(), &config.security, 0, channel_type::MAIN, 0).await?;
     let (main_reader, main_writer) = tokio::io::split(stream);
     let (main_out, main_out_rx) = mpsc::channel::<OutMessage>(256);
-    tokio::spawn(channel::writer_task(main_writer, mini, main_out_rx));
+    tasks.spawn(channel::writer_task(main_writer, mini, main_out_rx));
 
     let mut reader = ChannelReader::new(main_reader, mini, main_out.clone(), "main");
     let mut main = MainChannel::new();
@@ -450,7 +452,7 @@ async fn connect_inner(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<S
         )
         .await?;
         let (rx, tx) = tokio::io::split(stream);
-        tokio::spawn(channel::writer_task(tx, mini, display_out_rx));
+        tasks.spawn(channel::writer_task(tx, mini, display_out_rx));
         let display = DisplayChannel::new(
             fb.clone(),
             events.clone(),
@@ -460,11 +462,11 @@ async fn connect_inner(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<S
         .with_preferred_compression(config.preferred_compression);
         dimensions = display.dimensions_handle();
         counts = display.counts_handle();
-        tokio::spawn(display::reader_task(
+        tasks.spawn(display::reader_task(
             ChannelReader::new(rx, mini, display_out.clone(), "display"),
             display_events.clone(),
         ));
-        tokio::spawn(display::display_task(
+        tasks.spawn(display::display_task(
             display,
             display_rx,
             display_out.clone(),
@@ -486,8 +488,8 @@ async fn connect_inner(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<S
         .await?;
         let (rx, tx) = tokio::io::split(stream);
         let (out, out_rx) = mpsc::channel::<OutMessage>(16);
-        tokio::spawn(channel::writer_task(tx, mini, out_rx));
-        tokio::spawn(display::cursor_task(
+        tasks.spawn(channel::writer_task(tx, mini, out_rx));
+        tasks.spawn(display::cursor_task(
             ChannelReader::new(rx, mini, out, "cursor"),
             display_events.clone(),
         ));
@@ -515,8 +517,8 @@ async fn connect_inner(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<S
         )
         .await?;
         let (rx, tx) = tokio::io::split(stream);
-        tokio::spawn(channel::writer_task(tx, mini, inputs_out_rx));
-        tokio::spawn(inputs_task(
+        tasks.spawn(channel::writer_task(tx, mini, inputs_out_rx));
+        tasks.spawn(inputs_task(
             ChannelReader::new(rx, mini, inputs_out.clone(), "inputs"),
             input.clone(),
             inputs_out.clone(),
@@ -540,9 +542,9 @@ async fn connect_inner(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<S
         .await?;
         let (rx, tx) = tokio::io::split(stream);
         let (out, out_rx) = mpsc::channel::<OutMessage>(16);
-        tokio::spawn(channel::writer_task(tx, mini, out_rx));
+        tasks.spawn(channel::writer_task(tx, mini, out_rx));
         let (frames, frames_rx) = mpsc::channel::<AudioFrame>(64);
-        tokio::spawn(playback_task(
+        tasks.spawn(playback_task(
             ChannelReader::new(rx, mini, out, "playback"),
             frames,
         ));
@@ -551,7 +553,7 @@ async fn connect_inner(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<S
 
     let main = Arc::new(Mutex::new(main));
     let (clipboard, _) = broadcast::channel(CLIPBOARD_EVENT_QUEUE);
-    tokio::spawn(main_task(
+    tasks.spawn(main_task(
         reader,
         main.clone(),
         main_out.clone(),
@@ -574,6 +576,7 @@ async fn connect_inner(dialer: Arc<dyn Dialer>, config: SpiceConfig) -> Result<S
         connected,
         audio: Mutex::new(audio),
         display_events,
+        tasks,
     };
 
     // Give the display channel a moment to deliver the primary surface, so
@@ -778,6 +781,41 @@ pub struct SpiceSession {
     audio: Mutex<Option<mpsc::Receiver<AudioFrame>>>,
     /// The display queue, for moving the composited pointer.
     display_events: mpsc::Sender<DisplayEvent>,
+    /// Every channel's tasks; aborting them is what closes the sockets.
+    tasks: Tasks,
+}
+
+/// A session's channel tasks, aborted together: by `close`, by a setup that
+/// fails partway, or when the session is dropped.
+///
+/// Each channel's reader and writer hold the two halves of its socket, and
+/// each reader holds a sender to its writer for acknowledgements, so left
+/// alone they outlive the session: the connection to the guest stayed open
+/// until the next session's connect displaced it (`docs/roadmap.md` §8).
+#[derive(Default)]
+struct Tasks(Mutex<Vec<tokio::task::AbortHandle>>);
+
+impl Tasks {
+    fn spawn<F>(&self, task: F)
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let handle = tokio::spawn(task).abort_handle();
+        self.0.lock().expect("task lock").push(handle);
+    }
+
+    fn abort_all(&self) {
+        for handle in self.0.lock().expect("task lock").drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for Tasks {
+    fn drop(&mut self) {
+        self.abort_all();
+    }
 }
 
 impl std::fmt::Debug for SpiceSession {
@@ -1048,6 +1086,7 @@ impl Session for SpiceSession {
     async fn close(&self) {
         self.connected.store(false, Ordering::Relaxed);
         let _ = self.events.send(BackendEvent::Disconnected);
+        self.tasks.abort_all();
     }
 }
 
