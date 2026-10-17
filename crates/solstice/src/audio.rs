@@ -73,6 +73,7 @@ impl Source {
     fn new(stream_config: &StreamConfig, backend: Option<mpsc::Receiver<AudioFrame>>) -> Self {
         let canned_silence = solstice_gamestream::stream::audio_tx::opus_silence_packet(
             stream_config.audio_channels as u8,
+            stream_config.audio_packet_duration,
         );
         #[cfg(feature = "audio")]
         {

@@ -168,10 +168,23 @@ impl AudioPacketizer {
 /// depending on the configuration, with an empty frame body. The RFB backend
 /// has nothing else to send, and sending nothing at all drives some clients
 /// into their missing-stream paths.
-pub fn opus_silence_packet(channels: u8) -> Vec<u8> {
-    // TOC: config 29 (CELT, 20 ms, fullband), stereo bit, code 0 (one frame).
+///
+/// One CELT frame of the negotiated duration. The client decodes each packet
+/// into a buffer exactly one packet duration long, so the frame must be no
+/// longer than that. This was once a 20 ms frame sent every 5 ms -- every
+/// packet failed to decode, which nobody heard, because it was silence either
+/// way.
+pub fn opus_silence_packet(channels: u8, packet_duration_ms: u32) -> Vec<u8> {
+    // TOC: fullband CELT, config 28-31 for 2.5, 5, 10 and 20 ms; the longest
+    // frame that fits. Stereo bit; code 0, exactly one frame.
+    let config: u8 = match packet_duration_ms {
+        0..=4 => 28,
+        5..=9 => 29,
+        10..=19 => 30,
+        _ => 31,
+    };
     let stereo = if channels >= 2 { 0x04 } else { 0x00 };
-    vec![0xF8 | stereo, 0xFF, 0xFE]
+    vec![(config << 3) | stereo, 0xFF, 0xFE]
 }
 
 #[cfg(test)]
@@ -274,7 +287,7 @@ mod tests {
     fn parity_shards_are_exactly_a_data_payload_long() {
         let key = [3u8; 16];
         let mut p = AudioPacketizer::new(AudioConfig::default(), Some(&key));
-        let silence = opus_silence_packet(2);
+        let silence = opus_silence_packet(2, 5);
         let mut sizes = std::collections::BTreeSet::new();
         for _ in 0..8 {
             for packet in p.packetize(&silence) {
@@ -350,11 +363,21 @@ mod tests {
 
     #[test]
     fn opus_silence_is_a_short_well_formed_packet() {
-        let mono = opus_silence_packet(1);
-        let stereo = opus_silence_packet(2);
+        let mono = opus_silence_packet(1, 5);
+        let stereo = opus_silence_packet(2, 5);
         assert_eq!(mono.len(), 3);
         assert_ne!(mono[0] & 0x04, stereo[0] & 0x04); // the stereo bit differs
         assert_eq!(mono[0] & 0x03, 0); // code 0: exactly one frame
+    }
+
+    /// The client's decode buffer is one negotiated packet long, so the frame
+    /// must be exactly that: CELT fullband configs 29, 30 and 31 are 5, 10
+    /// and 20 ms (RFC 6716 §3.1).
+    #[test]
+    fn opus_silence_lasts_the_negotiated_duration() {
+        for (ms, config) in [(5, 29), (10, 30), (20, 31)] {
+            assert_eq!(opus_silence_packet(2, ms)[0] >> 3, config, "{ms} ms");
+        }
     }
 
     #[test]
