@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{pair, start_daemon_closed, Ports, PIN};
+use common::{pair, start_daemon_closed, start_daemon_endpoints, Ports, PIN};
 use solstice::config::Config;
 use solstice::testpattern::TestPatternBackend;
 use solstice_gamestream::crypto::certs::{ClientStore, HostIdentity, PairedClient};
@@ -106,7 +106,9 @@ async fn pair_status_list_and_revoke_reach_the_running_daemon() {
         status.stdout
     );
     assert!(
-        status.stdout.contains("backend: testpattern"),
+        status
+            .stdout
+            .contains("endpoint: Desktop (app 1): testpattern"),
         "{}",
         status.stdout
     );
@@ -248,5 +250,84 @@ async fn without_a_daemon_the_client_list_is_edited_directly() {
         assert!(run.stderr.contains("not running"), "{}", run.stderr);
     }
 
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+/// Endpoints from the configuration and from `--endpoint`, through the real
+/// binary, and what `status` says about them -- none included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_lists_the_endpoints_from_the_file_and_the_flags() {
+    const PORTS: Ports = Ports::from_base(49989);
+    let state_dir =
+        std::env::temp_dir().join(format!("solstice-e2e-endpoints-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&state_dir);
+    let config = config_file(&state_dir);
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!(
+        "port = {}\n\n[[endpoint]]\nname = \"From the file\"\nkind = \"testpattern\"\n",
+        PORTS.http
+    ));
+    std::fs::write(&config, text).unwrap();
+
+    // A bad flag stops the daemon before it creates anything.
+    let refused = run(
+        &config,
+        &["run", "--endpoint", "name=From the file,kind=testpattern"],
+    )
+    .await;
+    assert!(!refused.ok);
+    assert!(
+        refused
+            .stderr
+            .contains("two endpoints are named `From the file`"),
+        "{}",
+        refused.stderr
+    );
+
+    let daemon = solstice(
+        &config,
+        &["run", "--endpoint", "name=From a flag, kind=testpattern"],
+    )
+    .spawn()
+    .unwrap();
+    let socket = state_dir.join("control.sock");
+    eventually("the management socket", || socket.exists()).await;
+
+    let status = run(&config, &["status"]).await;
+    assert!(status.ok, "{}", status.stderr);
+    for name in ["From the file", "From a flag"] {
+        let id = solstice::endpoint::app_id(name);
+        assert!(
+            status
+                .stdout
+                .contains(&format!("endpoint: {name} (app {id}): testpattern")),
+            "{}",
+            status.stdout
+        );
+    }
+    drop(daemon);
+    let _ = std::fs::remove_dir_all(&state_dir);
+
+    // And with none at all, which is a daemon that still pairs. On ports of
+    // its own, so as not to race the killed one's.
+    let mut config = Config::default();
+    config.server.port = Ports::from_base(50089).http;
+    let (_host, state_dir) = start_daemon_endpoints(
+        config,
+        "no-endpoints",
+        solstice::endpoint::Endpoints::new(Vec::new()).unwrap(),
+    );
+    let config = config_file(&state_dir);
+    let socket = state_dir.join("control.sock");
+    eventually("the management socket", || socket.exists()).await;
+    let status = run(&config, &["status"]).await;
+    assert!(status.ok, "{}", status.stderr);
+    assert!(
+        status
+            .stdout
+            .contains("endpoints: none; Moonlight shows an empty app list"),
+        "{}",
+        status.stdout
+    );
     let _ = std::fs::remove_dir_all(&state_dir);
 }

@@ -40,13 +40,16 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let remote = |request: Request| management::call(&socket, &request, &mut std::io::stdout());
 
     match cli.command {
-        Command::Run => {
+        Command::Run { endpoints } => {
+            // Before anything is created, so that a bad `--endpoint` leaves no
+            // trace.
+            let endpoints = config.endpoints(&endpoints)?;
+            let endpoints = solstice::backend_factory::build_all(&endpoints, &config.limits)?;
             let identity =
                 HostIdentity::load_or_generate(&config.server.state_dir, &config.server.name)?;
             let clients = ClientStore::load(config.server.state_dir.join("clients.tsv"))?;
             let host = Arc::new(build_host(&config, identity, clients));
-            let backend = solstice::backend_factory::build(&config)?;
-            let supervisor = Supervisor::new(config, host, backend);
+            let supervisor = Supervisor::new(config, host, endpoints);
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async move {
                 tokio::select! {

@@ -23,6 +23,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use crate::config::Config;
+use crate::endpoint::Endpoints;
 use crate::net::{control, media, rtsp};
 use crate::pipeline::{self, PipelineConfig};
 
@@ -30,16 +31,17 @@ use crate::pipeline::{self, PipelineConfig};
 pub struct Supervisor {
     config: Config,
     host: Arc<Host>,
-    backend: Arc<dyn Backend>,
+    endpoints: Arc<Endpoints>,
 }
 
 impl Supervisor {
-    /// Build one.
-    pub fn new(config: Config, host: Arc<Host>, backend: Arc<dyn Backend>) -> Self {
+    /// Build one, and offer its endpoints as the host's apps.
+    pub fn new(config: Config, host: Arc<Host>, endpoints: Endpoints) -> Self {
+        host.set_apps(endpoints.apps());
         Self {
             config,
             host,
-            backend,
+            endpoints: Arc::new(endpoints),
         }
     }
 
@@ -89,7 +91,7 @@ impl Supervisor {
         tokio::spawn(management.serve(Arc::new(crate::management::Context {
             host: self.host.clone(),
             pairing_window: self.config.security.pairing_window,
-            backend: self.backend.name(),
+            endpoints: self.endpoints.clone(),
         })));
         let (negotiated_tx, mut negotiated_rx) = mpsc::channel(4);
 
@@ -121,9 +123,16 @@ impl Supervisor {
             name = %self.config.server.name,
             %bind,
             port = self.config.server.port,
-            backend = self.backend.name(),
             "solstice is up"
         );
+        for entry in self.endpoints.iter() {
+            tracing::info!(endpoint = %entry.name, app = entry.id, "{}", entry.detail);
+        }
+        if self.endpoints.is_empty() {
+            // Legitimate -- pair first, add desktops later -- but a daemon that
+            // was meant to have one and does not would otherwise look healthy.
+            tracing::warn!("no endpoints configured; Moonlight will see an empty app list");
+        }
 
         // Every stream binds the same fixed ports, so one must have let go of
         // them before the next binds. A client that relaunches straight after
@@ -145,16 +154,25 @@ impl Supervisor {
                             s.rikey_id,
                             s.av_ping_payload,
                             s.control_connect_data,
+                            s.app_id,
                         )
                     })
             };
-            let Some((key, rikey_id, ping_payload, connect_data)) = session_key else {
+            let Some((key, rikey_id, ping_payload, connect_data, app_id)) = session_key else {
                 tracing::warn!(session = %negotiated.session_id, "no launch session for this PLAY");
                 continue;
             };
+            // `/launch` accepted only an app on offer, so this misses only if
+            // the endpoint went away in between.
+            let Some(entry) = self.endpoints.get(app_id) else {
+                tracing::warn!(session = %negotiated.session_id, app = app_id, "no endpoint for this app");
+                self.host.remove_session(&negotiated.session_id);
+                continue;
+            };
+            tracing::info!(session = %negotiated.session_id, endpoint = %entry.name, "streaming");
 
             let config = self.config.clone();
-            let backend = self.backend.clone();
+            let backend = entry.backend.clone();
             let host = self.host.clone();
             let ports_free = ports_free.clone();
             tokio::spawn(async move {
@@ -451,7 +469,6 @@ pub fn build_host(
     let host_config = HostConfig {
         name: config.server.name.clone(),
         uuid: stable_uuid(&config.server.name),
-        app_title: config.server.app_title.clone(),
         port: config.server.port,
         https_port: config.server.https_port(),
         rtsp_port: config.server.rtsp_port(),
@@ -480,6 +497,27 @@ fn stable_uuid(name: &str) -> String {
 mod tests {
     use super::*;
 
+    fn test_pattern() -> Endpoints {
+        let backend: Arc<dyn Backend> =
+            Arc::new(crate::testpattern::TestPatternBackend::new(320, 240, 60));
+        Endpoints::single("Desktop", backend)
+    }
+
+    #[test]
+    fn the_endpoints_are_what_the_host_offers() {
+        let identity = solstice_gamestream::crypto::certs::HostIdentity::generate("t").unwrap();
+        let config = Config::default();
+        let host = Arc::new(build_host(
+            &config,
+            identity,
+            solstice_gamestream::crypto::certs::ClientStore::new(),
+        ));
+        assert!(host.apps().is_empty(), "nothing until the supervisor says");
+        let _s = Supervisor::new(config, host.clone(), test_pattern());
+        assert_eq!(host.apps().len(), 1);
+        assert!(host.has_app(crate::endpoint::LEGACY_APP_ID));
+    }
+
     #[test]
     fn the_uuid_is_stable_and_differs_per_host() {
         assert_eq!(stable_uuid("a"), stable_uuid("a"));
@@ -496,13 +534,11 @@ mod tests {
             identity,
             solstice_gamestream::crypto::certs::ClientStore::new(),
         ));
-        let backend: Arc<dyn Backend> =
-            Arc::new(crate::testpattern::TestPatternBackend::new(320, 240, 60));
-        let s = Supervisor::new(config.clone(), host.clone(), backend.clone());
+        let s = Supervisor::new(config.clone(), host.clone(), test_pattern());
         assert_eq!(s.required_encryption(), encryption::ALL);
 
         config.security.require_encryption = false;
-        let s = Supervisor::new(config, host, backend);
+        let s = Supervisor::new(config, host, test_pattern());
         assert_eq!(s.required_encryption(), encryption::CONTROL_V2);
     }
 
@@ -516,9 +552,7 @@ mod tests {
             identity,
             solstice_gamestream::crypto::certs::ClientStore::new(),
         ));
-        let backend: Arc<dyn Backend> =
-            Arc::new(crate::testpattern::TestPatternBackend::new(320, 240, 60));
-        let s = Supervisor::new(config, host, backend);
+        let s = Supervisor::new(config, host, test_pattern());
         assert_eq!(
             s.ports(),
             StreamPorts {

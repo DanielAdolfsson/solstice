@@ -4,7 +4,6 @@ use std::time::Instant;
 
 use zeroize::Zeroizing;
 
-use super::applist::is_known_app;
 use super::session::{LaunchSession, PING_PAYLOAD_LEN};
 use super::xml::Root;
 use super::{Host, RequestContext};
@@ -25,7 +24,7 @@ pub fn launch(host: &Host, ctx: &RequestContext) -> (u16, String) {
         Ok(rikey) => rikey,
         Err(refusal) => return refusal,
     };
-    if !is_known_app(app_id) {
+    if !host.has_app(app_id) {
         return (404, Root::error(404, "No such app").render());
     }
     let Some(client_cert) = ctx.client_cert else {

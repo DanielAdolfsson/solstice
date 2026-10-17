@@ -2,13 +2,16 @@
 //!
 //! The defaults are the deployment `docs/security.md` recommends: bound to
 //! loopback, pairing closed, encryption mandatory, one session, and ceilings on
-//! everything the client can ask for.
+//! everything the client can ask for. And no endpoints: a daemon with nothing
+//! to offer still pairs, and Moonlight sees an empty app list.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::Deserialize;
+
+use crate::endpoint::{self, Endpoint, Spec};
 
 /// The whole configuration file.
 #[derive(Clone, Debug, Deserialize)]
@@ -25,8 +28,12 @@ pub struct Config {
     pub video: Video,
     /// Audio settings.
     pub audio: Audio,
-    /// Which remote desktop to bridge.
-    pub backend: Backend,
+    /// The remote desktops to offer, one Moonlight app each.
+    pub endpoint: Vec<Spec>,
+    /// The single remote desktop of configurations from before `[[endpoint]]`.
+    /// Still loaded, as one more endpoint with app id 1, titled
+    /// `server.app_title`.
+    pub backend: Option<Backend>,
 }
 
 /// Listener and identity.
@@ -41,7 +48,8 @@ pub struct Server {
     pub port: u16,
     /// Where keys, certificates and the paired-client list live.
     pub state_dir: PathBuf,
-    /// Title of the single app offered.
+    /// The app title of the old single `[backend]` section. `[[endpoint]]`
+    /// names its own.
     pub app_title: String,
 }
 
@@ -210,7 +218,7 @@ impl Default for Audio {
     }
 }
 
-/// Which remote desktop to bridge.
+/// The old single remote desktop: `[backend]`, superseded by `[[endpoint]]`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Backend {
@@ -232,6 +240,21 @@ impl Default for Backend {
     }
 }
 
+impl Backend {
+    /// The endpoint it describes, before checking.
+    fn to_endpoint(&self, title: &str) -> Endpoint {
+        Endpoint {
+            id: endpoint::LEGACY_APP_ID,
+            name: title.to_owned(),
+            target: match self.kind {
+                BackendKind::Vnc => endpoint::Target::Vnc(self.vnc.clone()),
+                BackendKind::Spice => endpoint::Target::Spice(self.spice.clone()),
+                BackendKind::TestPattern => endpoint::Target::TestPattern,
+            },
+        }
+    }
+}
+
 /// Backend selection.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -242,6 +265,31 @@ pub enum BackendKind {
     Spice,
     /// The built-in colour bars, for bringing the host half up on its own.
     TestPattern,
+}
+
+impl BackendKind {
+    /// The name the configuration uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackendKind::Vnc => "vnc",
+            BackendKind::Spice => "spice",
+            BackendKind::TestPattern => "testpattern",
+        }
+    }
+}
+
+impl std::str::FromStr for BackendKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "vnc" => Ok(BackendKind::Vnc),
+            "spice" => Ok(BackendKind::Spice),
+            "testpattern" => Ok(BackendKind::TestPattern),
+            _ => Err(format!(
+                "kind = {s} is not one of vnc, spice or testpattern"
+            )),
+        }
+    }
 }
 
 /// RFB backend settings.
@@ -322,6 +370,27 @@ pub enum SpiceSecurityKind {
     Plain,
 }
 
+impl SpiceSecurityKind {
+    /// The name the configuration uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SpiceSecurityKind::Tls => "tls",
+            SpiceSecurityKind::Plain => "plain",
+        }
+    }
+}
+
+impl std::str::FromStr for SpiceSecurityKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "tls" => Ok(SpiceSecurityKind::Tls),
+            "plain" => Ok(SpiceSecurityKind::Plain),
+            _ => Err(format!("security = {s} is not tls or plain, for spice")),
+        }
+    }
+}
+
 /// RFB security type.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -332,6 +401,31 @@ pub enum VncSecurityKind {
     VncAuth,
     /// TLS with x509 server certificates.
     VeNCrypt,
+}
+
+impl VncSecurityKind {
+    /// The name the configuration uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VncSecurityKind::None => "none",
+            VncSecurityKind::VncAuth => "vncauth",
+            VncSecurityKind::VeNCrypt => "vencrypt",
+        }
+    }
+}
+
+impl std::str::FromStr for VncSecurityKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "none" => Ok(VncSecurityKind::None),
+            "vncauth" => Ok(VncSecurityKind::VncAuth),
+            "vencrypt" => Ok(VncSecurityKind::VeNCrypt),
+            _ => Err(format!(
+                "security = {s} is not none, vncauth or vencrypt, for vnc"
+            )),
+        }
+    }
 }
 
 impl Config {
@@ -350,6 +444,12 @@ impl Config {
             tracing::warn!(
                 "security.pairing_enabled is ignored and can be removed: \
                  pairing opens only with `solstice pair`"
+            );
+        }
+        if config.backend.is_some() {
+            tracing::warn!(
+                "[backend] still works, as one endpoint named server.app_title; \
+                 [[endpoint]] is its replacement and can declare several"
             );
         }
         Ok(config)
@@ -381,40 +481,40 @@ impl Config {
                 "server.port must be at least 6".into(),
             ));
         }
-        // The weak RFB security types are refused off-loopback by the backend
-        // itself, but catching it here turns a runtime failure into a startup
-        // one (`docs/security.md` §4.1).
-        if self.backend.kind == BackendKind::Vnc
-            && matches!(
-                self.backend.vnc.security,
-                VncSecurityKind::None | VncSecurityKind::VncAuth
-            )
-            && !is_loopback_host(&self.backend.vnc.host)
-        {
-            return Err(ConfigError::Invalid(format!(
-                "backend.vnc.security = \"{:?}\" is refused against {}; \
-                 use vencrypt or an SSH tunnel to loopback",
-                self.backend.vnc.security, self.backend.vnc.host
-            )));
-        }
-        // Same rule, same reason, for SPICE: its ticket is a password check
-        // and not a key exchange, so a plaintext channel carries the display
-        // and every keystroke in the clear (`docs/security.md` §4.2).
-        if self.backend.kind == BackendKind::Spice
-            && self.backend.spice.security == SpiceSecurityKind::Plain
-            && !is_loopback_host(&self.backend.spice.host)
-        {
-            return Err(ConfigError::Invalid(format!(
-                "backend.spice.security = \"plain\" is refused against {}; \
-                 use tls or a tunnel to loopback",
-                self.backend.spice.host
-            )));
-        }
+        // Resolved here as well as at startup, so that a bad endpoint is a
+        // configuration error and not a runtime one.
+        self.endpoints(&[])?;
         Ok(())
+    }
+
+    /// Every endpoint, checked: the old `[backend]` first, then the
+    /// `[[endpoint]]` tables, then `extra` -- the `--endpoint` flags.
+    pub fn endpoints(&self, extra: &[Spec]) -> Result<Vec<Endpoint>, ConfigError> {
+        let mut endpoints = Vec::new();
+        if let Some(backend) = &self.backend {
+            // The title is not held to `check_name`: any title loaded before,
+            // and the comma rule is for `--endpoint`, which this never was.
+            let endpoint = backend.to_endpoint(&self.server.app_title);
+            endpoint
+                .target
+                .check()
+                .map_err(|e| ConfigError::Invalid(format!("[backend]: {e}")))?;
+            endpoints.push(endpoint);
+        }
+        for spec in self.endpoint.iter().chain(extra) {
+            let endpoint = spec
+                .resolve()
+                .map_err(|e| ConfigError::Invalid(format!("endpoint `{}`: {e}", spec.name)))?;
+            endpoints.push(endpoint);
+        }
+        endpoint::check_unique(endpoints.iter().map(|e| (e.id, e.name.as_str())))
+            .map_err(ConfigError::Invalid)?;
+        Ok(endpoints)
     }
 }
 
-fn is_loopback_host(host: &str) -> bool {
+/// Whether `host` is a loopback address, or `localhost`.
+pub fn is_loopback_host(host: &str) -> bool {
     host.parse::<IpAddr>()
         .map(|ip| ip.is_loopback())
         .unwrap_or(host == "localhost")
@@ -475,6 +575,19 @@ mod tests {
         let text = include_str!("../../../contrib/solstice.example.toml");
         let config = Config::parse(text).expect("the shipped example must parse");
         assert_eq!(config.server.port, 47989);
+        assert!(config.endpoints(&[]).unwrap().is_empty());
+
+        // And its commented-out endpoints are valid once uncommented.
+        let uncommented: String = text
+            .lines()
+            .map(|line| line.strip_prefix("# ").unwrap_or(line))
+            .filter(|line| !line.starts_with('#') && !line.starts_with("password"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let start = uncommented.find("\n[[endpoint]]\n").unwrap();
+        let end = uncommented.find("The single [backend]").unwrap();
+        let config = Config::parse(&uncommented[start..end]).unwrap();
+        assert_eq!(config.endpoints(&[]).unwrap().len(), 3);
     }
 
     #[test]
@@ -528,6 +641,78 @@ password = "hunter2"
         assert!(Config::parse("[limits]\nmax_fps = 0\n").is_err());
         assert!(Config::parse("[video]\nidle_fps = 0\n").is_err());
         assert!(Config::parse("[video]\nfec_percentage = 500\n").is_err());
+    }
+
+    #[test]
+    fn no_endpoints_is_the_default_and_is_valid() {
+        let config = Config::default();
+        assert!(config.endpoints(&[]).unwrap().is_empty());
+        assert!(Config::parse("")
+            .unwrap()
+            .endpoints(&[])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn endpoints_come_from_the_old_section_the_tables_and_the_flags_in_order() {
+        let config = Config::parse(
+            r#"
+[server]
+app_title = "Old desktop"
+
+[backend]
+kind = "testpattern"
+
+[[endpoint]]
+name = "Spice X"
+kind = "spice"
+host = "127.0.0.1"
+port = 7878
+security = "plain"
+audio = false
+"#,
+        )
+        .unwrap();
+        let flag = Spec::parse("name=Flagged,kind=vnc,host=::1,security=none").unwrap();
+        let endpoints = config.endpoints(&[flag]).unwrap();
+        let names: Vec<_> = endpoints.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["Old desktop", "Spice X", "Flagged"]);
+        assert_eq!(endpoints[0].id, endpoint::LEGACY_APP_ID);
+        assert_eq!(endpoints[1].id, endpoint::app_id("Spice X"));
+        let endpoint::Target::Spice(spice) = &endpoints[1].target else {
+            panic!("expected spice")
+        };
+        assert_eq!(spice.port, 7878);
+        assert!(!spice.audio);
+    }
+
+    #[test]
+    fn a_bad_endpoint_table_fails_the_whole_file() {
+        for text in [
+            "[[endpoint]]\nname = \"A\"\nkind = \"spice\"\nhost = \"10.0.0.1\"\nsecurity = \"plain\"\n",
+            "[[endpoint]]\nname = \"A\"\nkind = \"vnc\"\ncolour = \"blue\"\n",
+            "[[endpoint]]\nkind = \"vnc\"\n",
+            "[[endpoint]]\nname = \"A\"\nkind = \"testpattern\"\n\
+             [[endpoint]]\nname = \"A\"\nkind = \"testpattern\"\n",
+        ] {
+            assert!(Config::parse(text).is_err(), "accepted:\n{text}");
+        }
+    }
+
+    #[test]
+    fn the_old_section_keeps_any_title_it_had() {
+        let text = "[server]\napp_title = \"Desktop, main\"\n[backend]\nkind = \"testpattern\"\n";
+        let endpoints = Config::parse(text).unwrap().endpoints(&[]).unwrap();
+        assert_eq!(endpoints[0].name, "Desktop, main");
+    }
+
+    #[test]
+    fn the_old_section_cannot_share_a_name_with_a_table() {
+        let text = "[backend]\nkind = \"testpattern\"\n\
+                    [[endpoint]]\nname = \"Desktop\"\nkind = \"testpattern\"\n";
+        let err = Config::parse(text).unwrap_err().to_string();
+        assert!(err.contains("two endpoints are named `Desktop`"), "{err}");
     }
 
     #[test]

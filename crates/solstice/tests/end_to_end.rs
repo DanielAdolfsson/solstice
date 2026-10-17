@@ -15,7 +15,9 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use solstice::config::{BackendKind, Config, Encoder};
+use solstice::config::{Backend, BackendKind, Config, Encoder};
+use solstice::endpoint::{self, Endpoints, Entry};
+use solstice::testpattern::TestPatternBackend;
 use solstice_gamestream::crypto::certs::HostIdentity;
 use solstice_gamestream::crypto::gcm::SessionCrypto;
 use solstice_gamestream::rtsp::encrypted;
@@ -29,7 +31,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
 mod common;
-use common::{http_get, https_client, https_get, pair, start_daemon, Ports};
+use common::{
+    http_get, https_client, https_get, pair, start_daemon, start_daemon_endpoints, Ports, PIN,
+};
 
 // ------------------------------------------------------------------- rtsp --
 
@@ -209,11 +213,13 @@ struct DecodedFrame {
     framebuffer: solstice_backend::Framebuffer,
 }
 
-/// Drive a full client session against an already-running daemon and return
-/// the frames that decoded.
+/// Drive a full client session against an already-running daemon, launching
+/// `app_id`, and return the frames that decoded.
+#[allow(clippy::too_many_arguments)]
 async fn run_client(
     ports: Ports,
     host: &Arc<solstice_gamestream::nvhttp::Host>,
+    app_id: u32,
     width: u32,
     height: u32,
     fps: u32,
@@ -238,7 +244,7 @@ async fn run_client(
     let xml = https_get(&https, ports, "/serverinfo").await;
     assert!(xml.contains("<PairStatus>1</PairStatus>"), "{xml}");
     let xml = https_get(&https, ports, "/applist").await;
-    assert!(xml.contains("<AppTitle>Desktop</AppTitle>"), "{xml}");
+    assert!(xml.contains(&format!("<ID>{app_id}</ID>")), "{xml}");
 
     // --- 4. launch ----------------------------------------------------------
     let rikey: [u8; 16] = std::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(11));
@@ -247,7 +253,7 @@ async fn run_client(
         &https,
         ports,
         &format!(
-            "/launch?rikey={}&rikeyid={rikey_id}&localAudioPlayMode=0&appid=1&mode={width}x{height}x{fps}&corever=1",
+            "/launch?rikey={}&rikeyid={rikey_id}&localAudioPlayMode=0&appid={app_id}&mode={width}x{height}x{fps}&corever=1",
             hex::encode(rikey)
         ),
     )
@@ -435,7 +441,7 @@ async fn a_client_pairs_launches_and_decodes_the_colour_bars() {
     const PORTS: Ports = Ports::from_base(49089);
     let mut config = Config::default();
     config.server.port = PORTS.http;
-    config.backend.kind = BackendKind::TestPattern;
+    config.backend = Some(Backend::default());
     config.video.encoder = Encoder::OpenH264;
     config.limits.max_width = 640;
     config.limits.max_height = 480;
@@ -447,7 +453,7 @@ async fn a_client_pairs_launches_and_decodes_the_colour_bars() {
     // Eight frames rather than three: the clock deliberately emits repeats, so
     // a short window can legitimately contain two copies of the same generator
     // frame and say nothing about whether the picture moves.
-    let frames = run_client(PORTS, &host, 640, 480, 30, 8).await;
+    let frames = run_client(PORTS, &host, 1, 640, 480, 30, 8).await;
 
     // The barcode in the pattern is the generator's frame counter, so it tells
     // duplicate frames from dropped ones and proves the picture is moving.
@@ -469,6 +475,46 @@ async fn a_client_pairs_launches_and_decodes_the_colour_bars() {
         "the picture never changed: {counters:?}"
     );
     assert!(frames.last().unwrap().index > frames[0].index);
+
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+/// Several endpoints are several apps, and a launch dials the one it named
+/// and no other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_streams_from_the_endpoint_it_named() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = tracing_subscriber::fmt().with_env_filter("warn").try_init();
+
+    const PORTS: Ports = Ports::from_base(49889);
+    let mut config = Config::default();
+    config.server.port = PORTS.http;
+    config.video.encoder = Encoder::OpenH264;
+    config.limits.max_width = 320;
+    config.limits.max_height = 240;
+    config.limits.max_fps = 30;
+
+    let first = Arc::new(TestPatternBackend::new(320, 240, 30));
+    let second = Arc::new(TestPatternBackend::new(320, 240, 30));
+    let entry = |name: &str, backend: &Arc<TestPatternBackend>| Entry {
+        id: endpoint::app_id(name),
+        name: name.into(),
+        detail: "testpattern".into(),
+        backend: backend.clone(),
+    };
+    let endpoints = Endpoints::new(vec![entry("First", &first), entry("Second", &second)]).unwrap();
+    let (host, state_dir) = start_daemon_endpoints(config, "endpoints", endpoints);
+    host.pairing
+        .lock()
+        .unwrap()
+        .open(PIN, Duration::from_secs(120), std::time::Instant::now())
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let frames = run_client(PORTS, &host, endpoint::app_id("Second"), 320, 240, 30, 3).await;
+    assert!(!frames.is_empty());
+    assert_eq!(second.sessions_opened(), 1);
+    assert_eq!(first.sessions_opened(), 0, "the other endpoint was dialled");
 
     let _ = std::fs::remove_dir_all(&state_dir);
 }
@@ -517,11 +563,15 @@ async fn a_client_receives_the_pixels_of_a_real_vnc_desktop() {
 
     let mut config = Config::default();
     config.server.port = PORTS.http;
-    config.backend.kind = BackendKind::Vnc;
-    config.backend.vnc.host = "127.0.0.1".into();
-    config.backend.vnc.port = guest.vnc_port();
+    let mut backend = Backend {
+        kind: BackendKind::Vnc,
+        ..Backend::default()
+    };
+    backend.vnc.host = "127.0.0.1".into();
+    backend.vnc.port = guest.vnc_port();
     // Loopback, which is the only place `none` is permitted.
-    config.backend.vnc.security = solstice::config::VncSecurityKind::None;
+    backend.vnc.security = solstice::config::VncSecurityKind::None;
+    config.backend = Some(backend);
     config.video.encoder = Encoder::OpenH264;
     config.limits.max_width = 640;
     config.limits.max_height = 480;
@@ -530,7 +580,7 @@ async fn a_client_receives_the_pixels_of_a_real_vnc_desktop() {
     let (host, state_dir) = start_daemon(config, "vnc");
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let frames = run_client(PORTS, &host, 640, 480, 30, 4).await;
+    let frames = run_client(PORTS, &host, 1, 640, 480, 30, 4).await;
 
     // The desktop is solid blue, so the decoded picture must be too. Tolerance
     // is wide: this has been through BGRA -> I420 -> H.264 -> I420 -> RGB.

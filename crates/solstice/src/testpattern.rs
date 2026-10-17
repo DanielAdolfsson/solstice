@@ -12,7 +12,7 @@
 //! audio path has a signal whose pitch survives a lossy codec and can be
 //! checked at the far end.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -40,6 +40,9 @@ pub struct TestPatternBackend {
     frozen: Arc<AtomicBool>,
     /// A tone to play, in Hz.
     tone: Option<f64>,
+    /// How many sessions it has opened, so a test offering several can tell
+    /// which one a launch dialled.
+    opened: AtomicUsize,
 }
 
 impl TestPatternBackend {
@@ -52,6 +55,7 @@ impl TestPatternBackend {
             received: Arc::new(Mutex::new(Vec::new())),
             frozen: Arc::new(AtomicBool::new(false)),
             tone: None,
+            opened: AtomicUsize::new(0),
         }
     }
 
@@ -70,6 +74,11 @@ impl TestPatternBackend {
         self.frozen.store(frozen, Ordering::Relaxed);
     }
 
+    /// How many sessions this backend has opened.
+    pub fn sessions_opened(&self) -> usize {
+        self.opened.load(Ordering::Relaxed)
+    }
+
     /// Every input event any session of this backend has been handed.
     pub fn received_input(&self) -> Vec<InputEvent> {
         self.received.lock().expect("input lock").clone()
@@ -83,6 +92,7 @@ impl Backend for TestPatternBackend {
     }
 
     async fn connect(&self) -> Result<Box<dyn Session>> {
+        self.opened.fetch_add(1, Ordering::Relaxed);
         Ok(Box::new(TestPatternSession::start_with(
             self.width,
             self.height,

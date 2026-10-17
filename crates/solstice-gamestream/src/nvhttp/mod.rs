@@ -23,6 +23,7 @@ pub mod xml;
 use std::net::IpAddr;
 use std::sync::{Mutex, RwLock};
 
+use applist::App;
 use http::{HttpRequest, HttpResponse};
 use session::LaunchSession;
 use xml::Root;
@@ -37,8 +38,6 @@ pub struct HostConfig {
     pub name: String,
     /// Host UUID.
     pub uuid: String,
-    /// Title of the single app offered.
-    pub app_title: String,
     /// Base port; the plaintext HTTP listener.
     pub port: u16,
     /// The mutual-TLS listener, `port - 5`.
@@ -60,7 +59,6 @@ impl Default for HostConfig {
         Self {
             name: "solstice".into(),
             uuid: "0123456789ABCDEF0123456789ABCDEF".into(),
-            app_title: "Desktop".into(),
             port: 47989,
             https_port: 47984,
             rtsp_port: 48010,
@@ -96,6 +94,8 @@ pub struct Host {
     pub pairing: Mutex<PairingManager>,
     /// Live launch sessions.
     pub sessions: Mutex<Vec<LaunchSession>>,
+    /// What `/applist` offers. Empty until the daemon says otherwise.
+    apps: RwLock<Vec<App>>,
     /// Bumped whenever a session is ended from outside its stream -- by
     /// revocation or `/cancel` -- so a running stream can notice its launch
     /// record has gone and end itself (`docs/security.md` §3.4).
@@ -111,8 +111,30 @@ impl Host {
             clients: RwLock::new(clients),
             pairing: Mutex::new(PairingManager::default()),
             sessions: Mutex::new(Vec::new()),
+            apps: RwLock::new(Vec::new()),
             ended: tokio::sync::watch::Sender::new(0),
         }
+    }
+
+    /// What `/applist` offers, in order.
+    pub fn apps(&self) -> Vec<App> {
+        self.apps.read().expect("app list lock").clone()
+    }
+
+    /// Replace what `/applist` offers. A launch already accepted is not
+    /// affected: whoever removes an app ends its sessions as well, if it
+    /// wants them ended.
+    pub fn set_apps(&self, apps: Vec<App>) {
+        *self.apps.write().expect("app list lock") = apps;
+    }
+
+    /// Whether `/launch` will accept `app_id`.
+    pub fn has_app(&self, app_id: u32) -> bool {
+        self.apps
+            .read()
+            .expect("app list lock")
+            .iter()
+            .any(|app| app.id == app_id)
     }
 
     /// Whether the launch session `id` is still live.
@@ -303,11 +325,16 @@ mod tests {
         });
         use rsa::pkcs8::DecodePrivateKey;
         let key = rsa::RsaPrivateKey::from_pkcs8_pem(pem).unwrap();
-        Host::new(
+        let host = Host::new(
             HostConfig::default(),
             HostIdentity::from_key(key, "solstice-test").unwrap(),
             ClientStore::new(),
-        )
+        );
+        host.set_apps(vec![App {
+            id: 1,
+            title: "Desktop".into(),
+        }]);
+        host
     }
 
     fn request(target: &str) -> HttpRequest {
@@ -443,13 +470,58 @@ mod tests {
     }
 
     #[test]
-    fn applist_offers_exactly_one_app() {
+    fn applist_offers_every_app_in_order_with_titles_escaped() {
         let (h, der) = paired_host();
+        h.set_apps(vec![
+            App {
+                id: 1,
+                title: "Desktop".into(),
+            },
+            App {
+                id: 77,
+                title: "Build <box> & co".into(),
+            },
+        ]);
         let req = request("/applist");
         let xml = body(&handle(&h, &ctx(&req, true, Some(&der))));
-        assert_eq!(xml.matches("<App>").count(), 1);
-        assert!(xml.contains("<AppTitle>Desktop</AppTitle>"));
-        assert!(xml.contains("<ID>1</ID>"));
+        assert_eq!(xml.matches("<App>").count(), 2);
+        let desktop = xml.find("<AppTitle>Desktop</AppTitle><ID>1</ID>").unwrap();
+        let build = xml
+            .find("<AppTitle>Build &lt;box&gt; &amp; co</AppTitle><ID>77</ID>")
+            .unwrap();
+        assert!(desktop < build, "{xml}");
+    }
+
+    /// No apps is an empty list, not an error: a failed fetch reads to the
+    /// client as a broken host.
+    #[test]
+    fn applist_with_no_apps_is_an_empty_success() {
+        let (h, der) = paired_host();
+        h.set_apps(Vec::new());
+        let req = request("/applist");
+        let r = handle(&h, &ctx(&req, true, Some(&der)));
+        assert_eq!(r.status, 200);
+        let xml = body(&r);
+        assert!(xml.contains("<root status_code=\"200\"></root>"), "{xml}");
+    }
+
+    #[test]
+    fn launch_accepts_only_an_app_currently_offered() {
+        let (h, der) = paired_host();
+        h.set_apps(vec![App {
+            id: 77,
+            title: "Other".into(),
+        }]);
+        let launch = |app: u32| {
+            let req = request(&format!(
+                "/launch?rikey=000102030405060708090a0b0c0d0e0f&rikeyid=1&localAudioPlayMode=0&appid={app}"
+            ));
+            handle(&h, &ctx(&req, true, Some(&der))).status
+        };
+        assert_eq!(launch(1), 404, "no longer offered");
+        assert_eq!(launch(77), 200);
+        assert_eq!(h.sessions.lock().unwrap()[0].app_id, 77);
+        assert_eq!(h.current_app_id(), 77);
     }
 
     #[test]

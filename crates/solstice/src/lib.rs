@@ -10,6 +10,7 @@ pub mod audio;
 pub mod backend_factory;
 pub mod cli;
 pub mod config;
+pub mod endpoint;
 pub mod management;
 pub mod net;
 pub mod pipeline;
