@@ -671,10 +671,14 @@ packet per negotiated duration.
 
 #### What is left
 
-- **No Moonlight application has played it.** The probe decodes nothing
-  itself; the tests decode its packets as its configuration says to. A
-  moonlight-qt build hearing a guest is the manual tier
-  (`docs/testing.md` §8).
+- **moonlight-qt has played it, by ear.** 2026-10-17, the Flatpak build over
+  a 220 ms link, at 1080p60 and 15.5 Mbps -- 5 ms packets, so re-encoded --
+  heard the guest in stereo, 5.1 and 7.1 (high quality: 6 and 8 uncoupled
+  streams). Clean, on the right sides, no audible stutter, and the daemon
+  counted no underruns in 100 s of stereo. Each session also logged
+  `dropped=119`: about 1.2 s of audio that queued between the SPICE connect
+  and the audio task starting, trimmed as the jitter buffer should. Starting
+  the task sooner would save decoding it. Nothing measured the latency.
 - **Nothing is resampled.** A backend at a rate other than 48 kHz is
   dropped, with one warning per session. `spice-server` sends 48 kHz in both
   modes, so a resampler would be code with no source to test it.
