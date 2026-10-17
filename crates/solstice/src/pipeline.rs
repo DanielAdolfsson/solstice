@@ -67,6 +67,7 @@ pub async fn run(
     let mut packetizer = VideoPacketizer::new(config.video, key.as_ref());
     let mut clock = FrameClock::new(config.fps, Instant::now()).with_idle_rate(config.idle_fps);
     let mut events = session.subscribe();
+    let mut lag = Lag::default();
     let framebuffer = session.framebuffer();
 
     let (enc_w, enc_h) = encoder.dimensions();
@@ -168,13 +169,54 @@ pub async fn run(
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     // Falling behind on damage is survivable: the next frame is
-                    // simply treated as fully damaged.
-                    tracing::warn!(missed = n, "damage events lagged");
+                    // simply treated as fully damaged. An encoder that cannot
+                    // keep up lags on nearly every tick, so this is counted
+                    // and reported when the pipeline stops, not logged each time.
+                    lag.record(n);
                     clock.damage(solstice_backend::Rect::whole(enc_w, enc_h));
                 }
                 Err(_) => return PipelineExit::BackendDisconnected,
             },
             _ = tokio::time::sleep(sleep) => {}
+        }
+    }
+}
+
+/// Damage events the pipeline fell behind on.
+///
+/// One warning when it first happens and a total when the pipeline stops, by
+/// whichever return: per event, a 1080p120 session once logged 5958 of them.
+#[derive(Default)]
+struct Lag {
+    /// Times the receiver lagged.
+    times: u64,
+    /// Events skipped across all of them.
+    missed: u64,
+}
+
+impl Lag {
+    fn record(&mut self, missed: u64) {
+        if self.times == 0 {
+            tracing::warn!(
+                missed,
+                "the encoder fell behind the backend's damage; the total follows when the stream ends"
+            );
+        } else {
+            tracing::debug!(missed, "damage events lagged");
+        }
+        self.times += 1;
+        self.missed += missed;
+    }
+}
+
+impl Drop for Lag {
+    fn drop(&mut self) {
+        if self.times > 0 {
+            tracing::warn!(
+                times = self.times,
+                missed = self.missed,
+                "the encoder fell behind the backend's damage"
+            );
         }
     }
 }
