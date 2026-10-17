@@ -1,0 +1,7 @@
+SETUP streamid=audio/0/0 RTSP/1.0
+CSeq: 3
+X-GS-ClientVersion: 14
+Host: 0.0.0.0
+Transport: unicast;X-GS-ClientPort=50000-50001
+If-Modified-Since: Thu, 01 Jan 1970 00:00:00 GMT
+

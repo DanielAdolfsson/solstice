@@ -252,7 +252,7 @@ The strategy is in [docs/testing.md](docs/testing.md); what exists today:
 | T3 | The RFB client against **QEMU's RFB server**, on the same guest the SPICE tests use — skipped with a note when QEMU or the guest image is absent | `crates/solstice-vnc/tests/real_server.rs` |
 | T3 | **The whole stack end to end**: pair, launch, RTSP, decrypt, reassemble, decode H.264 — twice, once against the colour-bar generator reading the frame counter off the picture, and once against a real guest desktop checking the pixels are the colour it was painted | `crates/solstice/tests/end_to_end.rs` |
 | T3 | **`solstice pair` and `revoke` as a second process**: the real binary opens a window on a running daemon, a client pairs through it, and a revocation takes effect in the daemon's memory | `crates/solstice/tests/management.rs` |
-| T5 | Five `cargo-fuzz` targets over the parsers the CVEs lived in | `fuzz/fuzz_targets/` |
+| T5 | Ten `cargo-fuzz` targets over the parsers the CVEs lived in, four of them seeded from the captured session; `tests/tools/fuzz.sh` runs them all on stable | `fuzz/fuzz_targets/`, `fuzz/seeds/` |
 
 Two `#[ignore]`d benchmarks measure where the CPU goes --
 `solstice-vnc`'s `encoding_bench` for the backend decoders and

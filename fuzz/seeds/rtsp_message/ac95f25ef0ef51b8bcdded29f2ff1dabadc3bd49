@@ -1,0 +1,5 @@
+OPTIONS rtsp://0.0.0.0:49310 RTSP/1.0
+CSeq: 1
+X-GS-ClientVersion: 14
+Host: 0.0.0.0
+

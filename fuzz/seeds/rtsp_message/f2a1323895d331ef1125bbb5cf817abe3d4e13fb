@@ -1,0 +1,8 @@
+SETUP streamid=video/0/0 RTSP/1.0
+CSeq: 4
+X-GS-ClientVersion: 14
+Host: 0.0.0.0
+Session: 959A9AB469CD43E7
+Transport: unicast;X-GS-ClientPort=50000-50001
+If-Modified-Since: Thu, 01 Jan 1970 00:00:00 GMT
+

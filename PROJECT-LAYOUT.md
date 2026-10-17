@@ -52,6 +52,7 @@ solstice/
 │   ├── solstice-video/           # [lib] colour conversion + encoder abstraction
 │   └── solstice-input/           # [lib] VK → scancode / keysym tables. Pure data.
 ├── fuzz/                         # cargo-fuzz targets, its own workspace
+│   ├── seeds/                    # ▲ committed seed inputs, from the captured session
 │   └── fuzz_targets/
 │       ├── rtsp_message.rs
 │       ├── sdp_announce.rs
@@ -66,6 +67,8 @@ solstice/
 │   └── tools/
 │       ├── capture-session.sh    # captures one, unprivileged; see roadmap §4
 │       ├── control-loss.sh       # the real client with loss on the control port
+│       ├── fuzz.sh               # builds every fuzz target on stable and runs it
+│       ├── gen_fuzz_seeds.py     # seeds four targets from the captured session
 │       ├── gen_capture_vectors.py# decrypts it and checks it against the client
 │       ├── gen_fec_vectors.py    # runs the oracle, freezes the vectors
 │       ├── gen_spice_vectors.py  # the same, for the SPICE image codecs
@@ -559,7 +562,7 @@ ca_file  = "/etc/solstice/vnc-ca.pem"
 | Packetiser | feed Annex-B, reassemble with a port of the client's depacketiser, assert byte equality | ✓ — including shard loss recovered from parity, which is the `FEC_VALIDATION_MODE` invariant run locally |
 | Backends | `Xvnc` and `Xspice` in CI, plus minimal mocks as the opposite pole | both poles ✓ for both backends. `real_server.rs` drives a live `Xspice` across every image codec, MJPEG streams and input; it found two bugs the mock could not (`docs/roadmap.md` §2.6). What `Xspice` cannot reach is a real `spice-vdagent` and a QXL guest driver — §2.7 |
 | Input | exhaustive VK → scancode table tests | ✓ — and VK → keysym, and both paths through the RFB encoder |
-| Parsers | `cargo-fuzz` over nine targets | targets written ✓; no corpus, no nightly run yet. Four of them have found real bugs in short local runs: a 23-byte QUIC header asking for a 151 MiB image (which is why `Limits` exists), an LZ width whose stride overflowed a `u32`, a `COPY_BITS` asking for a 174 GB allocation on a 64 × 48 surface, and a zero-stride stencil mask that indexed an empty row. All four have regression tests |
+| Parsers | `cargo-fuzz` over ten targets | targets written ✓; five seeded from the captured session and all run by `tests/tools/fuzz.sh` on stable; no scheduled run yet. Four of them have found real bugs in short local runs: a 23-byte QUIC header asking for a 151 MiB image (which is why `Limits` exists), an LZ width whose stride overflowed a `u32`, a `COPY_BITS` asking for a 174 GB allocation on a 64 × 48 surface, a zero-stride stencil mask that indexed an empty row, and two blits whose source position overflowed, once in the fixed-point scaling and once before widening. All six have regression tests |
 | SPICE image codecs | differential against the real C encoders | ✓ — 278 vectors from `spice-common` (QUIC, LZ) and `spice-server` (GLZ), frozen by `tests/vectors/spice/` |
 | End-to-end | headless Moonlight client, assert on the elementary stream | ✓ — but with a client of our own rather than `moonlight-embedded`: pair, launch, encrypted RTSP, decrypt, reassemble, decode H.264. Run twice: against the colour-bar generator, reading the frame counter off the decoded picture, and against a real `Xvnc` desktop, checking the pixels are the colour it was painted |
 
