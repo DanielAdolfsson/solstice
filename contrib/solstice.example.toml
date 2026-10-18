@@ -67,6 +67,10 @@ enabled = true
 # # password      = "..."   # or, as --endpoint must:
 # # password_file = "/etc/solstice/build.pw"
 # # ca_file       = "/etc/solstice/vnc-ca.pem"
+# # Lift that refusal for this endpoint. Only for a server on this machine
+# # that is not on loopback -- a VM on a host-only or Docker bridge -- where
+# # the connection never crosses a network. Never for a real network hop.
+# allow_insecure = false
 #
 # [[endpoint]]
 # name     = "Windows VM"
@@ -80,6 +84,9 @@ enabled = true
 # # ticket is a password check, not a key exchange, so without TLS the display
 # # and every keystroke are in the clear (docs/security.md 4.2).
 # security = "tls"
+# # As for vnc: lifts the refusal of "plain" off loopback, for a server on
+# # this machine only.
+# allow_insecure = false
 # # The ticket password, where the server has ticketing enabled. A server run
 # # with --disable-ticketing needs none.
 # # password_file = "/etc/solstice/windows.pw"

@@ -65,6 +65,7 @@ fn config(port: u16) -> VncConfig {
         // below asserts the refusal off-loopback.
         security: VncSecurity::None,
         shared: true,
+        allow_insecure: false,
     }
 }
 

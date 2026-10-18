@@ -114,6 +114,10 @@ pub struct SpiceConfig {
     /// and the columns of one video show different moments of it
     /// (`docs/roadmap.md` §9).
     pub video_streams: bool,
+    /// Permit [`SpiceSecurity::Plain`] against a peer off loopback. The
+    /// operator's explicit opt-in, for a server on the same machine that is
+    /// not on loopback (`docs/security.md` §4.2).
+    pub allow_insecure: bool,
 }
 
 impl Default for SpiceConfig {
@@ -132,6 +136,7 @@ impl Default for SpiceConfig {
             audio: true,
             preferred_compression: None,
             video_streams: false,
+            allow_insecure: false,
         }
     }
 }
@@ -170,7 +175,10 @@ impl Dialer for TcpDialer {
         match &self.config.security {
             SpiceSecurity::Plain { .. } => {
                 let peer = stream.peer_addr()?.ip();
-                if !is_loopback_addr(peer) && !is_loopback(&self.config.host) {
+                if !self.config.allow_insecure
+                    && !is_loopback_addr(peer)
+                    && !is_loopback(&self.config.host)
+                {
                     return Err(SpiceError::Auth(format!(
                         "refusing a plaintext SPICE connection to {peer}: \
                          SPICE's ticket is a password check, not a key exchange, \
