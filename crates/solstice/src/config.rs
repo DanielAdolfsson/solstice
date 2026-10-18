@@ -306,6 +306,10 @@ pub struct Vnc {
     pub password: Option<String>,
     /// PEM file of certificates to trust for VeNCrypt.
     pub ca_file: Option<PathBuf>,
+    /// Permit `none` and `vncauth` against a host off loopback. For a server
+    /// on this machine that is not on loopback -- a VM on a host-only bridge
+    /// -- and nothing else (`docs/security.md` §4.1).
+    pub allow_insecure: bool,
 }
 
 impl Default for Vnc {
@@ -318,6 +322,7 @@ impl Default for Vnc {
             security: VncSecurityKind::VeNCrypt,
             password: None,
             ca_file: None,
+            allow_insecure: false,
         }
     }
 }
@@ -348,6 +353,10 @@ pub struct Spice {
     /// generation, and behind a non-QXL card one video becomes many streams
     /// paced on their own, which tears it.
     pub video_streams: bool,
+    /// Permit `plain` against a host off loopback. For a server on this
+    /// machine that is not on loopback -- a VM on a host-only bridge -- and
+    /// nothing else (`docs/security.md` §4.2).
+    pub allow_insecure: bool,
 }
 
 impl Default for Spice {
@@ -362,6 +371,7 @@ impl Default for Spice {
             ca_file: None,
             audio: true,
             video_streams: false,
+            allow_insecure: false,
         }
     }
 }
@@ -639,6 +649,22 @@ password = "hunter2"
 
         let loopback = text.replace("192.168.1.10", "127.0.0.1");
         assert!(Config::parse(&loopback).is_ok());
+    }
+
+    #[test]
+    fn an_endpoint_table_takes_allow_insecure() {
+        let text = r#"
+[[endpoint]]
+name     = "Windows (Spice)"
+kind     = "spice"
+host     = "172.18.0.10"
+port     = 5930
+security = "plain"
+"#;
+        assert!(matches!(Config::parse(text), Err(ConfigError::Invalid(_))));
+
+        let config = Config::parse(&format!("{text}allow_insecure = true\n")).unwrap();
+        assert_eq!(config.endpoints(&[]).unwrap().len(), 1);
     }
 
     #[test]

@@ -13,6 +13,12 @@
 //! holds the VNC password *and* injects keyboard input into a live desktop, so
 //! a compromise of the backend hop is a compromise of that desktop.
 //!
+//! The one way past the refusal is the operator's: an endpoint configured with
+//! `allow_insecure`, for a peer that is off loopback but still on the same
+//! machine -- a VM on a host-only bridge, say. It is per endpoint and never a
+//! default, and it does nothing about a server offering only weaker methods
+//! than the configured one.
+//!
 //! A refusal test is a security test, so the refusals are tested as carefully
 //! as the acceptances.
 
@@ -65,7 +71,18 @@ impl VncSecurity {
 
     /// Pick the configured method out of what the server offered.
     pub fn choose(&self, offered: &[u8], peer: IpAddr) -> Result<u8> {
-        if !self.is_permitted_against(peer) {
+        self.choose_allowing(offered, peer, false)
+    }
+
+    /// [`choose`](Self::choose), with the operator's `allow_insecure` opt-in:
+    /// when set, the weak methods are permitted against any peer.
+    pub fn choose_allowing(
+        &self,
+        offered: &[u8],
+        peer: IpAddr,
+        allow_insecure: bool,
+    ) -> Result<u8> {
+        if !allow_insecure && !self.is_permitted_against(peer) {
             return Err(RfbError::Auth(format!(
                 "security type {} is refused against a non-loopback peer ({peer}); \
                  use VeNCrypt or an SSH tunnel",
@@ -123,6 +140,28 @@ mod tests {
         assert!(none.choose(&[security::NONE], REMOTE).is_err());
         assert!(vncauth.choose(&[security::VNC_AUTH], REMOTE).is_err());
         assert!(none.choose(&[security::NONE], LOOPBACK).is_ok());
+    }
+
+    #[test]
+    fn allow_insecure_permits_the_weak_methods_off_loopback() {
+        let none = VncSecurity::None;
+        assert!(none
+            .choose_allowing(&[security::NONE], REMOTE, true)
+            .is_ok());
+        assert!(none
+            .choose_allowing(&[security::NONE], REMOTE, false)
+            .is_err());
+    }
+
+    /// The opt-in is for a weak method the operator chose, not a downgrade to
+    /// one the server picked.
+    #[test]
+    fn allow_insecure_does_not_permit_a_downgrade() {
+        let v = VncSecurity::VeNCrypt {
+            password: None,
+            ca_file: None,
+        };
+        assert!(v.choose_allowing(&[security::NONE], REMOTE, true).is_err());
     }
 
     #[test]

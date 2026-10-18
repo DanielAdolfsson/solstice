@@ -62,6 +62,8 @@ pub struct Spec {
     pub audio: Option<bool>,
     /// SPICE only: let the server send video streams.
     pub video_streams: Option<bool>,
+    /// Permit the unencrypted security types off loopback.
+    pub allow_insecure: Option<bool>,
 }
 
 impl Spec {
@@ -78,6 +80,7 @@ impl Spec {
             ca_file: None,
             audio: None,
             video_streams: None,
+            allow_insecure: None,
         }
     }
 
@@ -116,10 +119,11 @@ impl Spec {
                 "ca_file" => out.ca_file = Some(value.into()),
                 "audio" => out.audio = Some(parse_bool(key, value)?),
                 "video_streams" => out.video_streams = Some(parse_bool(key, value)?),
+                "allow_insecure" => out.allow_insecure = Some(parse_bool(key, value)?),
                 _ => {
                     return Err(format!(
                         "unknown key `{key}`; expected name, kind, host, port, security, \
-                         password_file, ca_file, audio or video_streams"
+                         password_file, ca_file, audio, video_streams or allow_insecure"
                     ))
                 }
             }
@@ -150,6 +154,7 @@ impl Spec {
                     ("ca_file", self.ca_file.is_some()),
                     ("audio", self.audio.is_some()),
                     ("video_streams", self.video_streams.is_some()),
+                    ("allow_insecure", self.allow_insecure.is_some()),
                 ] {
                     if given {
                         return refuse(key);
@@ -174,6 +179,7 @@ impl Spec {
                 }
                 vnc.password = self.password()?;
                 vnc.ca_file = self.ca_file.clone();
+                vnc.allow_insecure = self.allow_insecure.unwrap_or(vnc.allow_insecure);
                 Target::Vnc(vnc)
             }
             BackendKind::Spice => {
@@ -189,6 +195,7 @@ impl Spec {
                 spice.ca_file = self.ca_file.clone();
                 spice.audio = self.audio.unwrap_or(spice.audio);
                 spice.video_streams = self.video_streams.unwrap_or(spice.video_streams);
+                spice.allow_insecure = self.allow_insecure.unwrap_or(spice.allow_insecure);
                 Target::Spice(spice)
             }
         };
@@ -317,11 +324,12 @@ impl Target {
                 if matches!(
                     vnc.security,
                     VncSecurityKind::None | VncSecurityKind::VncAuth
-                ) && !is_loopback_host(&vnc.host)
+                ) && !vnc.allow_insecure
+                    && !is_loopback_host(&vnc.host)
                 {
                     return Err(format!(
-                        "security = \"{}\" is refused against {}; use vencrypt or an SSH \
-                         tunnel to loopback",
+                        "security = \"{}\" is refused against {}; use vencrypt, an SSH \
+                         tunnel to loopback, or allow_insecure for a host on this machine",
                         vnc.security.as_str(),
                         vnc.host
                     ));
@@ -335,10 +343,13 @@ impl Target {
             // display and every keystroke in the clear (`docs/security.md`
             // §4.2).
             Target::Spice(spice) => {
-                if spice.security == SpiceSecurityKind::Plain && !is_loopback_host(&spice.host) {
+                if spice.security == SpiceSecurityKind::Plain
+                    && !spice.allow_insecure
+                    && !is_loopback_host(&spice.host)
+                {
                     return Err(format!(
-                        "security = \"plain\" is refused against {}; use tls or a tunnel \
-                         to loopback",
+                        "security = \"plain\" is refused against {}; use tls, a tunnel \
+                         to loopback, or allow_insecure for a host on this machine",
                         spice.host
                     ));
                 }
@@ -350,6 +361,7 @@ impl Target {
 
     /// One line for `status`, without secrets.
     pub fn describe(&self) -> String {
+        let insecure = |allowed: bool| if allowed { ", allow_insecure" } else { "" };
         let address = |host: &str, port: u16| {
             if host.contains(':') {
                 format!("[{host}]:{port}")
@@ -359,14 +371,16 @@ impl Target {
         };
         match self {
             Target::Vnc(vnc) => format!(
-                "vnc {}, {}",
+                "vnc {}, {}{}",
                 address(&vnc.host, vnc.port),
-                vnc.security.as_str()
+                vnc.security.as_str(),
+                insecure(vnc.allow_insecure)
             ),
             Target::Spice(spice) => format!(
-                "spice {}, {}",
+                "spice {}, {}{}",
                 address(&spice.host, spice.port),
-                spice.security.as_str()
+                spice.security.as_str(),
+                insecure(spice.allow_insecure)
             ),
             Target::TestPattern => "testpattern".into(),
         }
@@ -527,6 +541,44 @@ mod tests {
         assert!(spice.audio);
         assert!(!spice.video_streams, "streams are off unless asked for");
         assert_eq!(endpoint.id, app_id("My Spice X"));
+    }
+
+    /// The off-loopback refusal stands unless the endpoint opts out, and the
+    /// opt-out is visible wherever the endpoint is described.
+    #[test]
+    fn allow_insecure_lifts_the_off_loopback_refusal() {
+        for (kind, security) in [("spice", "plain"), ("vnc", "none")] {
+            let base = format!("name=A,kind={kind},host=172.18.0.10,security={security}");
+            let err = Spec::parse(&base).unwrap().resolve().unwrap_err();
+            assert!(err.contains("allow_insecure"), "{kind}: {err}");
+            assert!(Spec::parse(&format!("{base},allow_insecure=false"))
+                .unwrap()
+                .resolve()
+                .is_err());
+
+            let endpoint = Spec::parse(&format!("{base},allow_insecure=true"))
+                .unwrap()
+                .resolve()
+                .unwrap();
+            assert!(
+                endpoint.target.describe().ends_with(", allow_insecure"),
+                "{kind}: {}",
+                endpoint.target.describe()
+            );
+        }
+        let err = Spec::parse("name=A,kind=testpattern,allow_insecure=true")
+            .unwrap()
+            .resolve()
+            .unwrap_err();
+        assert!(err.contains("allow_insecure"), "{err}");
+    }
+
+    #[test]
+    fn a_vnc_auth_endpoint_still_needs_a_password_with_allow_insecure() {
+        let spec =
+            Spec::parse("name=A,kind=vnc,host=172.18.0.10,security=vncauth,allow_insecure=true")
+                .unwrap();
+        assert!(spec.resolve().is_err());
     }
 
     #[test]

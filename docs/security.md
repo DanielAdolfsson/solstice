@@ -268,6 +268,14 @@ any network hop, and verify the certificate properly — do not inherit
 Moonlight's habit of ignoring SSL errors. An SSH tunnel to the VNC host is the
 other acceptable answer.
 
+The one exception is the operator's, per endpoint: `allow_insecure = true`. It
+exists for a server that is on the same machine but not on loopback -- a VM on
+a host-only or Docker bridge, whose traffic never leaves the host -- where the
+alternative is a forwarder to loopback that buys nothing. It is never a
+default, it is shown on the endpoint wherever the endpoint is described, and it
+does not let a server talk Solstice down from a stronger configured method. It
+is not for a network hop.
+
 Note the privilege asymmetry: Solstice holds the VNC password and injects
 keyboard input into a live desktop session. A compromise of Solstice is a
 compromise of that desktop.
@@ -290,7 +298,8 @@ renegotiation → host DoS).
 
 **Rule for Solstice:** require the TLS port for every channel, verify the
 server certificate, prefer SASL where the deployment supports it, and treat a
-plaintext SPICE connection the same as a plaintext VNC one — loopback only.
+plaintext SPICE connection the same as a plaintext VNC one — loopback only,
+short of the same per-endpoint `allow_insecure` exception (§4.1).
 
 ---
 
@@ -368,7 +377,7 @@ In rough order of value:
    the cautionary case.
 8. **Backend on loopback.** Reach the VNC/SPICE server over loopback, a Unix
    socket, or an SSH tunnel. Never a plaintext backend connection across a
-   network.
+   network. `allow_insecure` (§4.1) is for a server on the same host only.
 9. **Fuzz the parsers.** `cargo-fuzz` over the RTSP message parser, the SDP
    attribute parser, the input-packet batch decoder, the ENet envelope and the
    RFB/SPICE message decoders. These are the five places the CVEs above lived.

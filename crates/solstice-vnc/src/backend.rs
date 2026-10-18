@@ -34,6 +34,10 @@ pub struct VncConfig {
     pub security: VncSecurity,
     /// The RFB "shared" flag: whether other clients may stay connected.
     pub shared: bool,
+    /// Permit `None` and `VncAuth` against a peer off loopback. The
+    /// operator's explicit opt-in, for a server on the same machine that is
+    /// not on loopback (`docs/security.md` §4.1).
+    pub allow_insecure: bool,
 }
 
 impl Default for VncConfig {
@@ -46,6 +50,7 @@ impl Default for VncConfig {
                 ca_file: None,
             },
             shared: true,
+            allow_insecure: false,
         }
     }
 }
@@ -96,7 +101,8 @@ pub async fn connect(config: &VncConfig) -> Result<VncSession> {
     let mut stream: Box<dyn RfbTransport> = Box::new(stream);
     let version = handshake::negotiate_version(&mut stream).await?;
     let offered = handshake::read_security_types(&mut stream, version).await?;
-    let chosen = handshake::choose_security(&config.security, &offered, peer)?;
+    let chosen =
+        handshake::choose_security(&config.security, &offered, peer, config.allow_insecure)?;
     tracing::info!(%peer, version = ?version, chosen, "rfb handshake");
 
     if version.has_security_list() {

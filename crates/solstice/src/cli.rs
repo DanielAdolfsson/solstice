@@ -42,9 +42,9 @@ pub enum Command {
         /// for several; none at all is fine.
         ///
         /// The keys are the `[[endpoint]]` keys: name, kind (vnc, spice,
-        /// testpattern), host, port, security, password_file, ca_file and
-        /// audio. Not password, which every user on the machine could read
-        /// here.
+        /// testpattern), host, port, security, password_file, ca_file, audio,
+        /// video_streams and allow_insecure. Not password, which every user
+        /// on the machine could read here.
         #[arg(long = "endpoint", value_name = "SPEC", value_parser = Spec::parse)]
         endpoints: Vec<Spec>,
     },

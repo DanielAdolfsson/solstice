@@ -70,6 +70,7 @@ pub fn build(endpoint: &Endpoint, limits: &Limits) -> Result<Arc<dyn Backend>, F
                     port: vnc.port,
                     security,
                     shared: true,
+                    allow_insecure: vnc.allow_insecure,
                 },
             )))
         }
@@ -88,7 +89,7 @@ pub fn build(endpoint: &Endpoint, limits: &Limits) -> Result<Arc<dyn Backend>, F
                     // Refused off-loopback at dial time, where the resolved
                     // peer address is known; refusing the obvious case here
                     // turns a runtime failure into a startup one.
-                    if !solstice_spice::backend::is_loopback(&spice.host) {
+                    if !spice.allow_insecure && !solstice_spice::backend::is_loopback(&spice.host) {
                         return Err(FactoryError::Config(format!(
                             "security = \"plain\" to {}: SPICE's ticket \
                              is a password check, not a key exchange, so the display \
@@ -113,6 +114,7 @@ pub fn build(endpoint: &Endpoint, limits: &Limits) -> Result<Arc<dyn Backend>, F
                     // a preference from here would silently replace it.
                     preferred_compression: None,
                     video_streams: spice.video_streams,
+                    allow_insecure: spice.allow_insecure,
                 },
             )))
         }
@@ -217,6 +219,23 @@ kind = "testpattern"
             build(&endpoint, &limits).is_ok(),
             "loopback is the exception"
         );
+    }
+
+    #[cfg(feature = "spice")]
+    #[test]
+    fn plaintext_spice_to_a_remote_host_builds_with_allow_insecure() {
+        let spice = crate::config::Spice {
+            security: crate::config::SpiceSecurityKind::Plain,
+            host: "172.18.0.10".into(),
+            allow_insecure: true,
+            ..Default::default()
+        };
+        let endpoint = Endpoint {
+            id: 2,
+            name: "S".into(),
+            target: Target::Spice(spice),
+        };
+        assert!(build(&endpoint, &Config::default().limits).is_ok());
     }
 
     #[cfg(feature = "vnc")]

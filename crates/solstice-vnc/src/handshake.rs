@@ -260,8 +260,13 @@ pub async fn initialise<S: RfbTransport>(stream: &mut S, shared: bool) -> Result
 }
 
 /// Pick the security type to use, applying the policy.
-pub fn choose_security(config: &VncSecurity, offered: &[u8], peer: IpAddr) -> Result<u8> {
-    config.choose(offered, peer)
+pub fn choose_security(
+    config: &VncSecurity,
+    offered: &[u8],
+    peer: IpAddr,
+    allow_insecure: bool,
+) -> Result<u8> {
+    config.choose_allowing(offered, peer, allow_insecure)
 }
 
 #[cfg(test)]
