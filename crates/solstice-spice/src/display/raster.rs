@@ -28,7 +28,7 @@
 //! opcode -- those three constants being exactly the bit patterns of the
 //! three inputs across the eight table positions.
 
-use crate::display::image::{DecodedImage, Mask};
+use crate::display::image::{DecodedImage, Format, Mask};
 use crate::display::surface::Surface;
 use crate::display::types::{Clip, Point, SpiceRect};
 use crate::protocol::ropd;
@@ -435,6 +435,29 @@ pub fn draw(
     rop: Rop,
     source: &Source<'_>,
 ) {
+    if mask.is_none() {
+        if let Source::Bitmap(sampler) = source {
+            if sampler.is_one_to_one()
+                && !sampler.dest.is_empty()
+                && sampler.image.format == Format::Bgra8
+            {
+                draw_unscaled(surface, box_, clip, rop, sampler);
+                return;
+            }
+        }
+    }
+    draw_per_pixel(surface, box_, clip, mask, rop, source);
+}
+
+/// [`draw`] one pixel at a time: any source, any mask.
+fn draw_per_pixel(
+    surface: &mut Surface,
+    box_: &SpiceRect,
+    clip: &Clip,
+    mask: Option<&MaskRef<'_>>,
+    rop: Rop,
+    source: &Source<'_>,
+) {
     let (width, height) = (surface.width(), surface.height());
     let opaque = !surface.has_alpha();
     visit(width, height, box_, clip, mask, |x, y| {
@@ -453,6 +476,118 @@ pub fn draw(
         }
         surface.set_pixel(x as i64, y as i64, out);
     });
+}
+
+/// [`draw`] for an unscaled BGRA bitmap with no mask, a row span at a time.
+///
+/// This is the whole of a frame from a QXL guest: KWin sends each one as a
+/// single full-screen `DRAW_COPY`, and per pixel that cost about 7 ms at
+/// 1280x720. The result is the same as [`draw_per_pixel`]'s, which the tests
+/// hold it to.
+fn draw_unscaled(
+    surface: &mut Surface,
+    box_: &SpiceRect,
+    clip: &Clip,
+    rop: Rop,
+    sampler: &Sampler<'_>,
+) {
+    let image = sampler.image;
+    // Destination `x` reads source `x + dx`. In i64: both terms are i32s
+    // off the wire.
+    let dx = sampler.src.left as i64 - sampler.dest.left as i64;
+    let dy = sampler.src.top as i64 - sampler.dest.top as i64;
+    // Where a destination pixel has no source pixel, the per-pixel path
+    // draws nothing, so the box narrows to where the image is.
+    let left = (box_.left as i64).max(0).max(-dx);
+    let top = (box_.top as i64).max(0).max(-dy);
+    let right = (box_.right as i64)
+        .min(surface.width() as i64)
+        .min(image.width as i64 - dx);
+    let bottom = (box_.bottom as i64)
+        .min(surface.height() as i64)
+        .min(image.height as i64 - dy);
+    if right <= left || bottom <= top {
+        return;
+    }
+    // Within the surface now, so these fit an i32.
+    let visible = SpiceRect {
+        left: left as i32,
+        top: top as i32,
+        right: right as i32,
+        bottom: bottom as i32,
+    };
+
+    let opaque = !surface.has_alpha();
+    let stride = surface.stride();
+    let image_stride = image.stride();
+    let data = surface.data_mut();
+    spans(&visible, clip, |y, x0, x1| {
+        let (y, x0, x1) = (y as i64, x0 as i64, x1 as i64);
+        let to = y as usize * stride + x0 as usize * 4;
+        let from = (y + dy) as usize * image_stride + (x0 + dx) as usize * 4;
+        let len = (x1 - x0) as usize * 4;
+        let dst = &mut data[to..to + len];
+        let src = &image.data[from..from + len];
+        match (rop, opaque) {
+            (Rop::COPY, false) => dst.copy_from_slice(src),
+            // An x8r8g8b8 surface keeps its alpha opaque; see
+            // `draw_per_pixel`. As words, so the loop vectorises.
+            (Rop::COPY, true) => {
+                for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                    let word = u32::from_le_bytes([s[0], s[1], s[2], s[3]]) | 0xFF00_0000;
+                    d.copy_from_slice(&word.to_le_bytes());
+                }
+            }
+            _ => {
+                for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                    let mut out =
+                        rop.apply_pixel([s[0], s[1], s[2], s[3]], [d[0], d[1], d[2], d[3]]);
+                    if opaque {
+                        out[3] = 0xFF;
+                    }
+                    d.copy_from_slice(&out);
+                }
+            }
+        }
+    });
+}
+
+/// Walk the rows of `rect` as the half-open spans `[x0, x1)` that survive
+/// the clip, each pixel once.
+///
+/// `rect` must already lie within the surface. Clip rectangles may overlap,
+/// and a pixel in two of them is still visited once -- [`Clip::contains`]
+/// is "any rectangle", and an XOR drawn twice is not drawn at all.
+fn spans(rect: &SpiceRect, clip: &Clip, mut f: impl FnMut(i32, i32, i32)) {
+    let Some(rects) = &clip.rects else {
+        for y in rect.top..rect.bottom {
+            f(y, rect.left, rect.right);
+        }
+        return;
+    };
+    let mut row: Vec<(i32, i32)> = Vec::new();
+    for y in rect.top..rect.bottom {
+        row.clear();
+        row.extend(rects.iter().filter_map(|r| {
+            let (x0, x1) = (r.left.max(rect.left), r.right.min(rect.right));
+            (y >= r.top && y < r.bottom && x0 < x1).then_some((x0, x1))
+        }));
+        row.sort_unstable();
+        let mut pending: Option<(i32, i32)> = None;
+        for &(x0, x1) in &row {
+            pending = match pending {
+                Some((start, end)) if x0 <= end => Some((start, end.max(x1))),
+                Some((start, end)) => {
+                    f(y, start, end);
+                    Some((x0, x1))
+                }
+                None => Some((x0, x1)),
+            };
+        }
+        if let Some((start, end)) = pending {
+            f(y, start, end);
+        }
+    }
 }
 
 /// Run a ternary raster operation over a rectangle.
@@ -1250,5 +1385,96 @@ mod tests {
         assert!(Rop::INVERT.ignores_source());
         assert!(Rop::NOOP.ignores_source());
         assert!(!Rop::COPY.ignores_source());
+    }
+
+    /// A small deterministic generator, so a failure reproduces.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+
+        fn range(&mut self, low: i32, high: i32) -> i32 {
+            low + (self.next() % (high - low) as u32) as i32
+        }
+
+        fn rect(&mut self, low: i32, high: i32) -> SpiceRect {
+            let (left, top) = (self.range(low, high), self.range(low, high));
+            rect(left, top, left + self.range(0, 8), top + self.range(0, 8))
+        }
+    }
+
+    #[test]
+    fn the_unscaled_blit_matches_the_per_pixel_one() {
+        let mut rng = Lcg(0x5EED);
+        for case in 0..5000 {
+            let format = if rng.next() % 2 == 0 {
+                surface_fmt::RGB32_XRGB
+            } else {
+                surface_fmt::RGB32_ARGB
+            };
+            let mut fast = Surface::new(9, 7, format);
+            for byte in fast.data_mut() {
+                *byte = rng.next() as u8;
+            }
+            let mut slow = fast.clone();
+
+            let (iw, ih) = (rng.range(1, 8) as u32, rng.range(1, 8) as u32);
+            let image = DecodedImage {
+                width: iw,
+                height: ih,
+                format: Format::Bgra8,
+                has_alpha: rng.next() % 2 == 0,
+                data: (0..iw * ih * 4).map(|_| rng.next() as u8).collect(),
+            };
+            // Source and destination the same size, each placed anywhere,
+            // partly or wholly off the image and the surface.
+            let dest = rng.rect(-4, 10);
+            let (sx, sy) = (rng.range(-3, 8), rng.range(-3, 8));
+            let src = rect(sx, sy, sx + dest.width() as i32, sy + dest.height() as i32);
+            let box_ = if rng.next() % 4 == 0 {
+                rng.rect(-4, 10)
+            } else {
+                dest
+            };
+            let clip = match rng.next() % 3 {
+                0 => Clip { rects: None },
+                _ => Clip {
+                    rects: Some((0..rng.range(0, 5)).map(|_| rng.rect(-2, 9)).collect()),
+                },
+            };
+            let rop = Rop(rng.range(0, 16) as u8);
+
+            let sampler = Sampler::new(&image, src, dest, ScaleMode::Nearest);
+            assert!(sampler.is_one_to_one());
+            draw(&mut fast, &box_, &clip, None, rop, &Source::Bitmap(sampler));
+            let sampler = Sampler::new(&image, src, dest, ScaleMode::Nearest);
+            draw_per_pixel(&mut slow, &box_, &clip, None, rop, &Source::Bitmap(sampler));
+            assert_eq!(
+                fast.data(),
+                slow.data(),
+                "case {case}: {rop:?} box {box_:?} dest {dest:?} src {src:?} clip {clip:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_clip_rectangles_visit_each_pixel_once() {
+        let clip = Clip {
+            rects: Some(vec![
+                rect(0, 0, 4, 1),
+                rect(2, 0, 6, 1),
+                rect(5, 0, 6, 1),
+                rect(8, 0, 9, 1),
+            ]),
+        };
+        let mut seen = Vec::new();
+        spans(&rect(1, 0, 9, 1), &clip, |y, x0, x1| seen.push((y, x0, x1)));
+        assert_eq!(seen, [(0, 1, 6), (0, 8, 9)]);
     }
 }

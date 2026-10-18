@@ -1582,15 +1582,34 @@ and over VNC, with endpoints added and removed while it watched:
   second (59 with streams off), every frame ~44 KB of MJPEG, text included,
   and each cost Solstice 9–10 ms to decode. The Windows guest, which sends
   only what changed, opened no stream at all.
+- **A raw full-screen `DRAW_COPY` now costs a tenth of what it did.** On
+  the QXL Kubuntu guest above with `image-compression=off`, each frame took
+  about 8 ms to execute at 1280×720, and the display task was busy 14 ms
+  per publish, which capped the frame rate. Nearly all of it was the
+  blit, a closure per pixel. An unscaled BGRA bitmap with no mask now
+  copies a row span at a time, under any clip and any raster operation, and
+  everything else still goes through the per-pixel loop. Release build,
+  `tests/raster_cost.rs`, before and after:
+
+  | Raw 32-bit `DRAW_COPY` | Before | After |
+  |---|---|---|
+  | 1280×720 | 7.2 ms | 0.6 ms |
+  | 1920×1080 | 15.9 ms | 1.5 ms |
+
+  The blit is 0.4 and 0.8 ms of that; the rest is the bitmap's conversion.
+  `the_unscaled_blit_matches_the_per_pixel_one` holds the span path to the
+  per-pixel one over 5,000 random blits, with overlapping clips, offsets off
+  either edge and all sixteen operations. On the live guest, the display
+  task's busy time per batch fell from a mean of 9.5 ms (p90 15.3) to
+  1.2 ms (p90 1.8). The frame rate did not move, because it was never the
+  client's: KWin draws at about 60 Hz, and the client was keeping up
+  before. The gain is headroom, which 1080p, where the old path cost about
+  a frame, needs. Moonlight's host processing latency does not show it
+  either: that is measured from the frame tick through conversion and
+  encode, and the display task runs before it.
 
 ### What is left
 
-- **A raw full-screen `DRAW_COPY` costs about 8 ms to execute** at
-  1280×720 (3.6 MB), measured on the QXL Kubuntu guest above with
-  `image-compression=off`. That is far slower than copying 3.6 MB, and it
-  kept the display task busy 14 ms per publish on average there, so it caps
-  the frame rate a QXL guest can reach. An unscaled, unclipped opaque copy
-  could take a row-copy fast path past the general raster loop.
 - **A disconnect ends the session; in Sunshine it does not.** moonlight-qt's
   Ctrl+Alt+Shift+Q leaves the app running for a later resume, and Sunshine
   keeps it. Solstice ends the launch record when the stream stops, so
