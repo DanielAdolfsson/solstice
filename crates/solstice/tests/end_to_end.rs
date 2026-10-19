@@ -435,25 +435,35 @@ async fn run_client(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_client_pairs_launches_and_decodes_the_colour_bars() {
+    decodes_the_colour_bars(Encoder::for_this_build(), Ports::from_base(49089), "bars").await;
+}
+
+/// The same through OpenH264, the fallback encoder.
+#[cfg(feature = "openh264")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_decodes_the_colour_bars_through_openh264() {
+    decodes_the_colour_bars(Encoder::OpenH264, Ports::from_base(50289), "bars-openh264").await;
+}
+
+async fn decodes_the_colour_bars(encoder: Encoder, ports: Ports, tag: &str) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let _ = tracing_subscriber::fmt().with_env_filter("warn").try_init();
 
-    const PORTS: Ports = Ports::from_base(49089);
     let mut config = Config::default();
-    config.server.port = PORTS.http;
+    config.server.port = ports.http;
     config.backend = Some(Backend::default());
-    config.video.encoder = Encoder::OpenH264;
+    config.video.encoder = encoder;
     config.limits.max_width = 640;
     config.limits.max_height = 480;
     config.limits.max_fps = 30;
 
-    let (host, state_dir) = start_daemon(config, "bars");
+    let (host, state_dir) = start_daemon(config, tag);
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Eight frames rather than three: the clock deliberately emits repeats, so
     // a short window can legitimately contain two copies of the same generator
     // frame and say nothing about whether the picture moves.
-    let frames = run_client(PORTS, &host, 1, 640, 480, 30, 8).await;
+    let frames = run_client(ports, &host, 1, 640, 480, 30, 8).await;
 
     // The barcode in the pattern is the generator's frame counter, so it tells
     // duplicate frames from dropped ones and proves the picture is moving.
@@ -489,7 +499,7 @@ async fn a_launch_streams_from_the_endpoint_it_named() {
     const PORTS: Ports = Ports::from_base(49889);
     let mut config = Config::default();
     config.server.port = PORTS.http;
-    config.video.encoder = Encoder::OpenH264;
+    config.video.encoder = Encoder::for_this_build();
     config.limits.max_width = 320;
     config.limits.max_height = 240;
     config.limits.max_fps = 30;
@@ -572,7 +582,7 @@ async fn a_client_receives_the_pixels_of_a_real_vnc_desktop() {
     // Loopback, which is the only place `none` is permitted.
     backend.vnc.security = solstice::config::VncSecurityKind::None;
     config.backend = Some(backend);
-    config.video.encoder = Encoder::OpenH264;
+    config.video.encoder = Encoder::for_this_build();
     config.limits.max_width = 640;
     config.limits.max_height = 480;
     config.limits.max_fps = 30;

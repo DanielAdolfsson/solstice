@@ -7,11 +7,15 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-default = ["openh264"]
-# BSD-2 licensed, with Cisco's binary patent grant. The default because it is
-# the lightest encoder to build, not for licence reasons -- Solstice is
-# GPL-3.0-or-later, so a GPL encoder would be compatible too. See
-# PROJECT-LAYOUT.md Sec 4.
+default = ["x264", "openh264"]
+# libx264, the default encoder: faster than OpenH264 on every changed frame,
+# and its rate control turns the bitrate the client asks for into picture
+# quality where OpenH264's settles near 38 dB whatever it is given
+# (docs/roadmap.md Sec 6). Links the system libx264 (libx264-dev to build).
+x264 = ["dep:solstice-x264"]
+# OpenH264, built from vendored source: the fallback for a build without
+# libx264. Install nasm before building, or its SIMD is silently left out and
+# it runs up to three times slower (docs/roadmap.md Sec 6).
 openh264 = ["dep:openh264"]
 
 [dependencies]
@@ -19,6 +23,12 @@ solstice-backend.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 openh264 = { version = "0.9", optional = true }
+solstice-x264 = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The decoder every encoder's output is checked with, whichever encoders are
+# built.
+openh264 = "0.9"
 
 [lints.rust]
 missing_docs = "warn"

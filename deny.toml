@@ -41,14 +41,13 @@ unused-allowed-license = "allow"
 
 [bans]
 multiple-versions = "allow"
-# Now a dependency-weight decision rather than a licence one. Both pull a large
-# native build into what is otherwise a small one -- cc for OpenH264, and
-# CMake for libopus behind the `audio` feature (`opusic-sys`) -- and both
-# belong behind the `ffmpeg` feature when that feature exists. Remove the entry
-# deliberately, with the feature, rather than by accident.
+# A dependency-weight decision rather than a licence one. The video encoder is
+# libx264, linked from the system through `solstice-x264` and `x264-sys`.
+# FFmpeg would bring all of libavcodec along for the same encoder, and is worth
+# that only for the hardware encoders (`docs/roadmap.md` §8). Lift this with
+# that feature, deliberately, rather than by accident.
 deny = [
     { name = "ffmpeg-sys-next" },
-    { name = "x264" },
 ]
 
 [advisories]

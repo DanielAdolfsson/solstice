@@ -241,27 +241,41 @@ mod tests {
         }
     }
 
-    /// Flat blocks must survive a real encode and decode. This is the claim the
-    /// whole barcode approach rests on.
-    #[cfg(feature = "openh264")]
-    #[test]
-    fn barcodes_survive_a_round_trip_through_the_encoder() {
-        use crate::convert::convert_full;
-        use crate::encoder::{EncoderConfig, VideoEncoder};
-        use crate::frame::I420Frame;
-        use crate::openh264::OpenH264Encoder;
-
-        let (w, h) = (640u32, 480u32);
-        let mut fb = Framebuffer::new(w, h);
-        let mut frame = I420Frame::new(w, h);
-        let mut encoder = OpenH264Encoder::new(EncoderConfig {
-            width: w,
-            height: h,
+    #[cfg(any(feature = "openh264", feature = "x264"))]
+    fn round_trip_config() -> crate::encoder::EncoderConfig {
+        crate::encoder::EncoderConfig {
+            width: 640,
+            height: 480,
             fps: 60,
             bitrate_kbps: 8000,
             slices_per_frame: 1,
-        })
-        .unwrap();
+        }
+    }
+
+    /// Flat blocks must survive a real encode and decode. This is the claim the
+    /// whole barcode approach rests on, so it is made of every encoder.
+    #[cfg(feature = "openh264")]
+    #[test]
+    fn barcodes_survive_a_round_trip_through_openh264() {
+        let encoder = crate::openh264::OpenH264Encoder::new(round_trip_config()).unwrap();
+        barcodes_survive_a_round_trip_through(Box::new(encoder));
+    }
+
+    #[cfg(feature = "x264")]
+    #[test]
+    fn barcodes_survive_a_round_trip_through_x264() {
+        let encoder = crate::x264::X264Encoder::new(round_trip_config()).unwrap();
+        barcodes_survive_a_round_trip_through(Box::new(encoder));
+    }
+
+    #[cfg(any(feature = "openh264", feature = "x264"))]
+    fn barcodes_survive_a_round_trip_through(mut encoder: Box<dyn crate::encoder::VideoEncoder>) {
+        use crate::convert::convert_full;
+        use crate::frame::I420Frame;
+
+        let (w, h) = encoder.dimensions();
+        let mut fb = Framebuffer::new(w, h);
+        let mut frame = I420Frame::new(w, h);
         let mut decoder = ::openh264::decoder::Decoder::new().unwrap();
         let mut pattern = TestPattern::new();
 
@@ -295,7 +309,12 @@ mod tests {
                     );
                 }
             }
-            assert_eq!(decode_barcode(&out), Some(expected), "frame {expected}");
+            assert_eq!(
+                decode_barcode(&out),
+                Some(expected),
+                "{} frame {expected}",
+                encoder.name()
+            );
             checked += 1;
         }
         assert!(

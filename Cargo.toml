@@ -9,6 +9,7 @@ members = [
     "crates/solstice-spice-codec",
     "crates/solstice-spice",
     "crates/solstice-video",
+    "crates/solstice-x264",
     "crates/solstice-audio",
     "crates/solstice-input",
     "crates/solstice-test-guest",
@@ -25,7 +26,9 @@ repository = "https://github.com/phyrondev/solstice"
 solstice-backend = { path = "crates/solstice-backend" }
 solstice-gamestream = { path = "crates/solstice-gamestream" }
 solstice-input = { path = "crates/solstice-input" }
-solstice-video = { path = "crates/solstice-video" }
+# Encoders are chosen by the depending crate's features, never by default.
+solstice-video = { path = "crates/solstice-video", default-features = false }
+solstice-x264 = { path = "crates/solstice-x264" }
 solstice-audio = { path = "crates/solstice-audio" }
 solstice-spice-codec = { path = "crates/solstice-spice-codec" }
 solstice-spice = { path = "crates/solstice-spice" }

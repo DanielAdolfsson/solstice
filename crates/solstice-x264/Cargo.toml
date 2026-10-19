@@ -1,0 +1,18 @@
+[package]
+name = "solstice-x264"
+description = "A thin safe wrapper over the system libx264: the workspace's only unsafe code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+# Bindings generated at build time against the system <x264.h>, so the
+# struct layouts are the installed library's own. Needs libx264-dev and
+# libclang.
+x264-sys = "0.2"
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"

@@ -32,7 +32,8 @@ max_fps          = 60
 max_bitrate_kbps = 20000
 
 [video]
-encoder        = "openh264"
+# "x264", the default where it is built in, or "openh264".
+encoder        = "x264"
 fec_percentage = 20
 # Frames per second once the screen has been still for half a second. A repeat
 # frame is a few bytes but nearly a full encode of CPU; any change goes out at

@@ -185,7 +185,7 @@ pub struct Video {
 impl Default for Video {
     fn default() -> Self {
         Self {
-            encoder: Encoder::OpenH264,
+            encoder: Encoder::for_this_build(),
             fec_percentage: 20,
             idle_fps: 5,
         }
@@ -196,10 +196,23 @@ impl Default for Video {
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Encoder {
-    /// OpenH264: BSD-2, software, the default.
+    /// libx264, software: the default in a build with the `x264` feature.
+    X264,
+    /// OpenH264, software: the default in a build without `x264`.
     OpenH264,
     /// A deterministic non-encoder, for testing the plumbing.
     Null,
+}
+
+impl Encoder {
+    /// The default: x264 where it is built in, OpenH264 otherwise.
+    pub const fn for_this_build() -> Self {
+        if cfg!(feature = "x264") {
+            Self::X264
+        } else {
+            Self::OpenH264
+        }
+    }
 }
 
 /// Audio settings.

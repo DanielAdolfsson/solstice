@@ -29,7 +29,9 @@ pub mod testsrc;
 
 #[cfg(feature = "openh264")]
 pub mod openh264;
+#[cfg(feature = "x264")]
+pub mod x264;
 
 pub use clock::{FrameClock, Tick};
-pub use encoder::{EncodedFrame, EncoderConfig, VideoEncoder, VideoError};
+pub use encoder::{EncodedFrame, EncoderConfig, FrameDamage, VideoEncoder, VideoError};
 pub use frame::I420Frame;

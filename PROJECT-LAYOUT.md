@@ -50,6 +50,7 @@ solstice/
 │   ├── solstice-backend/         # [lib] backend trait + neutral types. No I/O.
 │   ├── solstice-vnc/             # [lib] RFB backend, plus the recording mock server
 │   ├── solstice-video/           # [lib] colour conversion + encoder abstraction
+│   ├── solstice-x264/            # [lib] ▲ libx264, made safe: the workspace's only `unsafe`
 │   ├── solstice-audio/           # [lib] ▲ backend audio → the client's Opus stream
 │   └── solstice-input/           # [lib] VK → scancode / keysym tables. Pure data.
 ├── fuzz/                         # cargo-fuzz targets, its own workspace
@@ -311,7 +312,8 @@ src/
 ├── lib.rs
 ├── convert.rs        # BGRA → NV12, incremental per damaged rect
 ├── encoder.rs        # trait VideoEncoder { encode(frame, force_idr) -> AnnexB }
-├── openh264.rs       # #[cfg(feature = "openh264")]
+├── x264.rs           # ▲ #[cfg(feature = "x264")], the default encoder
+├── openh264.rs       # #[cfg(feature = "openh264")], the fallback
 ├── null.rs           # ▲ a deterministic non-encoder, for testing the plumbing
 ├── frame.rs          # ▲ the I420 frame the encoder consumes
 ├── testsrc.rs        # ▲ colour bars and the barcode pattern
@@ -324,7 +326,24 @@ conversion. It has three entry points: whole-frame, per-damaged-rectangle, and
 letterboxed-with-scaling for when the backend declines to resize.
 
 ▲ `ffmpeg.rs` is not written. The `VideoEncoder` trait is the seam it would
-plug into, and the licensing decision in §4 is unchanged.
+plug into, and it is wanted only for the hardware encoders (`docs/roadmap.md`
+§8): for software, libx264 directly does the same job without libavcodec.
+
+### `solstice-x264` — the libx264 boundary
+
+```
+src/
+└── lib.rs            # Settings, Encoder::encode(y, u, v, force_idr) -> Frame
+```
+
+▲ The one crate allowed `unsafe`, and it is small on purpose
+(`docs/security.md` §5.5). Every other crate is `#![forbid(unsafe_code)]`;
+this one is the FFI to the system libx264, through `x264-sys`, and checks a
+frame's planes against the encoder's geometry before any pointer crosses.
+The settings are fixed for live streaming — `zerolatency`, keyframes only on
+request, Annex-B with the parameter sets on every IDR, ABR with half a second
+of VBV — and the policy above that (preset, threads) is in
+`solstice-video/src/x264.rs`.
 
 ### `solstice-audio` — audio path
 
@@ -378,6 +397,9 @@ src/
 
 `solstice-audio` hangs off the binary like the encoder does, and knows
 nothing of GameStream: the daemon translates the negotiated layout for it.
+
+`solstice-x264` hangs off `solstice-video`, behind its `x264` feature, and
+depends on nothing in the workspace.
 
 No cycles; neither backend is reachable from `solstice-gamestream`.
 `solstice-spice-codec` is a leaf — it depends on nothing in the workspace,
@@ -437,7 +459,8 @@ which is what lets it be fuzzed and tested without a SPICE backend existing.
 
 | Crate | Version | Use | Licence note |
 |---|---|---|---|
-| `openh264` | 0.9 | default software encoder | BSD-2; Cisco binary-grant model for patents |
+| `solstice-x264` → `x264-sys` | 0.2 | ▲ default software encoder, the system libx264 | libx264 is GPL-2.0-or-later, linkable from GPL-3.0-or-later; the bindings are MIT and generated against the installed `<x264.h>` |
+| `openh264` | 0.9 | fallback software encoder, vendored source | BSD-2. ▲ Cisco's patent licence covers Cisco's binaries only, and this is built from source |
 
 > OpenH264's README documents **Constrained Baseline only** for the encoder,
 > but High profile encoding was added in later releases (FFmpeg's wrapper
@@ -447,7 +470,7 @@ which is what lets it be fuzzed and tested without a SPICE backend existing.
 > is a superset, but this needs confirming against a real client early — it is
 > cheap to test and expensive to discover late.
 
-| `ffmpeg-next` | 9.0 | optional: libx264, VAAPI, NVENC, QSV | usually GPL — ▲ compatible now that the project is GPL-3.0-or-later, but still a heavy native dependency |
+| `ffmpeg-next` | 9.0 | ▲ not used: wanted only for VAAPI, NVENC, QSV | WTFPL bindings over usually-GPL libraries; a heavy native dependency, and banned in `deny.toml` until the hardware feature exists |
 | `dcv-color-primitives` | 1.0 | BGRA → NV12, SIMD | |
 | `yuvutils-rs` | 0.8 | alternative colour conversion | |
 
@@ -524,8 +547,10 @@ against `moonlight-common-c` built with `FEC_VALIDATION_MODE` — see
 
 ```toml
 [features]
-default  = ["vnc", "openh264", "audio"]
+default  = ["vnc", "x264", "openh264", "audio"]
 vnc      = ["dep:solstice-vnc"]
+# ▲ The encoders. x264 is the default where it is built in.
+x264     = ["solstice-video/x264"]
 openh264 = ["solstice-video/openh264"]
 # SPICE is excludable along with its whole dependency tree.
 spice    = ["dep:solstice-spice", "dep:solstice-spice-codec", "audio"]
@@ -542,9 +567,9 @@ used to say *"`cargo-deny` should fail the build when a GPL dependency appears
 without the `ffmpeg` feature"*. Under GPL-3.0-or-later a GPL dependency is
 compatible, so that check would be enforcing nothing. `deny.toml` now allows
 GPL-3 and LGPL alongside the permissive licences, and keeps `ffmpeg-sys-next`
-and `x264` banned on dependency-weight grounds instead — they belong behind the
-`ffmpeg` feature, and the ban is what makes adding them a decision rather than
-an accident.
+banned on dependency-weight grounds instead — it belongs behind the `ffmpeg`
+feature, and the ban is what makes adding it a decision rather than an
+accident. libx264 itself is linked from the system through `solstice-x264`.
 
 ---
 
@@ -571,7 +596,7 @@ max_fps        = 60
 max_bitrate_kbps = 20000
 
 [video]
-encoder   = "openh264"
+encoder   = "x264"            # or "openh264"
 codecs    = ["h264"]
 fec_percentage = 0
 
@@ -635,7 +660,7 @@ with Solstice as the host. It still found two defects (`docs/roadmap.md` §4).
 | # | Decision | Outcome |
 |---|---|---|
 | 1 | `vnc-rs` vs. a direct RFB implementation | **Direct.** The three things a bridge needs are the three things client crates hide. |
-| 2 | Encoder default | **OpenH264.** The lightest encoder to build — cc and nothing else. (It was chosen for its BSD-2 licence; that stopped mattering when the project became GPL-3.0-or-later, and the choice stands on build weight.) It emits profile_idc 100 (High), which settles the question flagged in §4. |
+| 2 | Encoder default | **libx264**, `ultrafast` with `zerolatency`, linked from the system. ▲ It replaced OpenH264 on measurement (`docs/roadmap.md` §6): faster on every changed frame and every keyframe, and its rate control spends the client's bitrate on picture quality where OpenH264's settles near 38 dB whatever it is given. OpenH264 codes a desktop in fewer bits at equal quality, and stays as the fallback for a build without libx264. |
 | 3 | HEVC and AV1 | **H.264 only.** `ServerCodecModeSupport` advertises `SCM_H264`, and DESCRIBE omits the two markers a client reads as HEVC and AV1. |
 | 4 | Audio beyond Opus silence | **Wired.** SPICE's 10 ms stereo Opus goes to the client untouched when it asked for 10 ms, and through libopus to the client's own layout and duration otherwise, including 5.1 and 7.1, which DESCRIBE now advertises. RFB, which has no audio, gets silence encoded in the negotiated layout. A real guest's tone has been heard by the real client both ways (`docs/roadmap.md` §2.7). |
 | 5 | `rusty_enet` vs. reimplementing ENet | **Reimplemented — the subset.** Once a real client had been captured, what Moonlight uses was a short list: connect, acknowledge, ping, reliable/unreliable/unsequenced sends, bandwidth limit, disconnect, and never a fragment. `stream/enet.rs` is that list, sans-I/O, bounded, and stricter than ENet before authentication. It is held against upstream ENet (via `rusty_enet`, now test-only) under simulated loss, against the captured session byte for byte, and against the real client with netem on the port (`docs/roadmap.md` §7). |

@@ -208,8 +208,20 @@ fn probe_command(probe: &std::path::Path, launched: &Launched) -> std::process::
 
 // -------------------------------------------------------------- the test --
 
+/// Through each encoder in turn: the default, and OpenH264 as the fallback a
+/// build without libx264 uses.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_reference_moonlight_client_streams_from_this_host() {
+    streams_to_the_reference_client(Encoder::for_this_build(), Ports::from_base(49289), "mlc")
+        .await;
+    #[cfg(feature = "openh264")]
+    if Encoder::for_this_build() != Encoder::OpenH264 {
+        streams_to_the_reference_client(Encoder::OpenH264, Ports::from_base(50389), "mlc-openh264")
+            .await;
+    }
+}
+
+async fn streams_to_the_reference_client(encoder: Encoder, ports: Ports, tag: &str) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     // `RUST_LOG` is honoured here because when the reference client refuses
     // something, the host's own view of the exchange is half the diagnosis.
@@ -228,11 +240,10 @@ async fn the_reference_moonlight_client_streams_from_this_host() {
         return;
     }
 
-    const PORTS: Ports = Ports::from_base(49289);
     let mut config = Config::default();
-    config.server.port = PORTS.http;
+    config.server.port = ports.http;
     config.backend = Some(Backend::default());
-    config.video.encoder = Encoder::OpenH264;
+    config.video.encoder = encoder;
     config.limits.max_width = WIDTH;
     config.limits.max_height = HEIGHT;
     config.limits.max_fps = FPS;
@@ -251,11 +262,11 @@ async fn the_reference_moonlight_client_streams_from_this_host() {
     // Built here rather than by the factory so the input the client sends can
     // be read back off the backend at the end.
     let backend = Arc::new(TestPatternBackend::new(WIDTH, HEIGHT, FPS));
-    let (_host, state_dir) = start_daemon_with(config, "mlc", backend.clone());
+    let (_host, state_dir) = start_daemon_with(config, tag, backend.clone());
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // --- pair and launch, exactly as a Moonlight port's app layer would ----
-    let launched = pair_and_launch(PORTS).await;
+    let launched = pair_and_launch(ports).await;
     // Kept for the capture sidecar, after the probe has taken the rest.
     let (rikey, rikey_id) = (launched.rikey, launched.rikey_id);
 
@@ -418,10 +429,14 @@ async fn the_reference_moonlight_client_streams_from_this_host() {
         "no one-click scroll arrived over ENet: {received:?}"
     );
 
-    if let Ok(dir) = std::env::var("SOLSTICE_CAPTURE_DIR") {
+    // One capture per run: the default encoder's session is the one replayed.
+    if let Some(dir) = std::env::var("SOLSTICE_CAPTURE_DIR")
+        .ok()
+        .filter(|_| tag == "mlc")
+    {
         write_capture_sidecar(
             std::path::Path::new(&dir),
-            PORTS,
+            ports,
             host_settings,
             &rikey,
             rikey_id,
@@ -459,7 +474,7 @@ async fn the_reference_client_sits_through_a_still_screen_at_the_idle_rate() {
     let mut config = Config::default();
     config.server.port = PORTS.http;
     config.backend = Some(Backend::default());
-    config.video.encoder = Encoder::OpenH264;
+    config.video.encoder = Encoder::for_this_build();
     config.video.idle_fps = IDLE_FPS;
     config.limits.max_width = WIDTH;
     config.limits.max_height = HEIGHT;
@@ -610,7 +625,7 @@ async fn revoking_the_client_ends_its_running_stream() {
     let mut config = Config::default();
     config.server.port = PORTS.http;
     config.backend = Some(Backend::default());
-    config.video.encoder = Encoder::OpenH264;
+    config.video.encoder = Encoder::for_this_build();
     config.limits.max_width = WIDTH;
     config.limits.max_height = HEIGHT;
     config.limits.max_fps = FPS;
@@ -811,7 +826,7 @@ async fn the_reference_client_hears_the_backends_tone_in_every_layout() {
     let mut config = Config::default();
     config.server.port = PORTS.http;
     config.backend = Some(Backend::default());
-    config.video.encoder = Encoder::OpenH264;
+    config.video.encoder = Encoder::for_this_build();
     config.limits.max_width = WIDTH;
     config.limits.max_height = HEIGHT;
     config.limits.max_fps = FPS;
@@ -956,7 +971,7 @@ async fn the_reference_client_hears_a_real_spice_guest() {
     backend.spice.security = solstice::config::SpiceSecurityKind::Plain;
     backend.spice.audio = true;
     config.backend = Some(backend);
-    config.video.encoder = Encoder::OpenH264;
+    config.video.encoder = Encoder::for_this_build();
     config.limits.max_width = WIDTH;
     config.limits.max_height = HEIGHT;
     config.limits.max_fps = FPS;
