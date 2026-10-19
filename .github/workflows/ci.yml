@@ -30,6 +30,9 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
+      # libx264 for the default encoder (`solstice-x264`), and nasm so the
+      # OpenH264 fallback is built with its SIMD rather than silently without.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libx264-dev nasm
       # cmake is on the runner image already, for opusic-sys (`audio`).
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked

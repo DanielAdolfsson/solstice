@@ -39,15 +39,21 @@ absent.
 
 ## Build and test
 
-Needs a stable Rust toolchain, a C compiler and CMake: OpenH264 and libopus
-are built from vendored source, libopus with CMake. No nasm, no system
-libraries. `--no-default-features --features vnc,openh264` builds without
-CMake, and without the Opus codec: every stream then carries canned stereo
-silence.
+Needs a stable Rust toolchain, a C compiler, CMake, libclang, nasm and
+libx264's headers (`apt install cmake clang nasm libx264-dev` on Debian and
+Ubuntu). The encoder is the system's libx264, bound at build time; libopus and
+OpenH264, the fallback encoder, are built from vendored source.
+
+nasm is not strictly required, and that is the trap: without it OpenH264's
+build quietly leaves out all of its SIMD and runs up to three times slower.
+
+`--no-default-features --features vnc,openh264` builds without libx264, with
+OpenH264 as the encoder, and without CMake and the Opus codec: every stream
+then carries canned stereo silence.
 
 ```sh
 cargo build --release
-cargo test --workspace        # 844 tests
+cargo test --workspace        # 935 tests
 cargo clippy --workspace --all-targets
 ```
 
@@ -77,7 +83,8 @@ client headless, with `FEC_VALIDATION_MODE` and the host-value assertions on.
 it. Same deal: skipped with a printed note when it has not been built.
 [The README](tests/tools/mlc-probe/README.md).
 
-The default features are `vnc` and `openh264`. SPICE is **not** on by default:
+The default features are `vnc`, `x264`, `openh264` and `audio`. SPICE is
+**not** on by default:
 it is excludable at compile time along with its whole dependency tree — the
 image codecs, a JPEG decoder, LZ4 and zlib — none of which an RFB-only build
 needs. So is the encoder:
@@ -177,7 +184,8 @@ client before any desktop is involved.
 - **The video path**: a synthetic frame clock that slows to a keep-alive rate
   on a still screen, BGRA→I420 conversion (whole-frame,
   per-damaged-rectangle, or letterboxed when the backend will not resize),
-  OpenH264 encoding with keyframes on demand, the `NV_VIDEO_PACKET` packetiser,
+  H.264 encoding with keyframes on demand (libx264, or OpenH264 in a build
+  without it), the `NV_VIDEO_PACKET` packetiser,
   Reed–Solomon FEC that matches `nanors` byte-for-byte, and AES-GCM shard
   encryption.
 - **Audio**: the backend's Opus passed through when the client asked for what
@@ -238,7 +246,9 @@ summaries below are just the shape of it.
 - **mDNS discovery.** Moonlight accepts a manually typed host.
 - **Hardware encoders.** The `VideoEncoder` trait is the seam; VAAPI and NVENC
   would arrive behind an `ffmpeg` feature. Licence-compatible — Solstice is
-  GPL-3.0-or-later — but a large native dependency, so it stays opt-in.
+  GPL-3.0-or-later — but a large native dependency, so it stays opt-in. Neither
+  is automatic in FFmpeg either: each is opened by name and needs its own
+  device setup and driver (`docs/roadmap.md` §8).
 
 ---
 
@@ -315,10 +325,11 @@ stability. A release gate still needs a human with a real client.
 
 **GPL-3.0-or-later.** The full text is in [LICENSE](LICENSE).
 
-`deny.toml` enforces that dependency licences stay compatible. `ffmpeg-sys-next`
-and `x264` are banned there on dependency-weight grounds rather than licence
-grounds — under GPL-3 they would be compatible, but they belong behind the
-`ffmpeg` feature when it exists.
+`deny.toml` enforces that dependency licences stay compatible. libx264 is
+GPL-2.0-or-later, which a GPL-3.0-or-later project can link. `ffmpeg-sys-next`
+is banned there on dependency-weight grounds rather than licence grounds: it
+belongs behind the `ffmpeg` feature, for the hardware encoders, when that
+exists.
 
 ---
 

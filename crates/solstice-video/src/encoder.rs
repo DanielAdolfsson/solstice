@@ -24,7 +24,7 @@ pub enum VideoError {
         want_h: usize,
     },
     /// The build has no encoder compiled in.
-    #[error("no encoder available: build with --features openh264")]
+    #[error("no such encoder in this build: build with --features x264 or openh264")]
     NoEncoder,
 }
 
@@ -80,4 +80,50 @@ pub trait VideoEncoder: Send {
 
     /// The geometry this encoder was built for.
     fn dimensions(&self) -> (u32, u32);
+}
+
+/// Whether an Annex-B access unit contains an IDR NAL (type 5).
+///
+/// The frame type goes in `video_short_frame_header_t.frameType`, and the
+/// client uses it to decide whether it can start decoding, so it is read out of
+/// the bitstream rather than inferred from what was requested.
+pub fn contains_idr(annex_b: &[u8]) -> bool {
+    nal_types(annex_b).any(|t| t == 5)
+}
+
+/// The NAL unit types present in an Annex-B buffer.
+pub fn nal_types(annex_b: &[u8]) -> impl Iterator<Item = u8> + '_ {
+    let mut positions = Vec::new();
+    let mut i = 0;
+    while i + 3 <= annex_b.len() {
+        if annex_b[i] == 0 && annex_b[i + 1] == 0 {
+            if annex_b[i + 2] == 1 {
+                positions.push(i + 3);
+                i += 3;
+                continue;
+            }
+            if i + 4 <= annex_b.len() && annex_b[i + 2] == 0 && annex_b[i + 3] == 1 {
+                positions.push(i + 4);
+                i += 4;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    positions
+        .into_iter()
+        .filter_map(move |p| annex_b.get(p).map(|b| b & 0x1F))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nal_type_scanning_handles_both_start_code_lengths() {
+        let buf = [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 9, 0, 0, 0, 1, 0x65];
+        assert_eq!(nal_types(&buf).collect::<Vec<_>>(), vec![7, 8, 5]);
+        assert!(contains_idr(&buf));
+        assert!(!contains_idr(&[0, 0, 0, 1, 0x41]));
+    }
 }

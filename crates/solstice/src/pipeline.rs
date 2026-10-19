@@ -227,6 +227,12 @@ pub fn build_encoder(
     config: EncoderConfig,
 ) -> Result<Box<dyn VideoEncoder>, solstice_video::VideoError> {
     match kind {
+        #[cfg(feature = "x264")]
+        crate::config::Encoder::X264 => {
+            Ok(Box::new(solstice_video::x264::X264Encoder::new(config)?))
+        }
+        #[cfg(not(feature = "x264"))]
+        crate::config::Encoder::X264 => Err(solstice_video::VideoError::NoEncoder),
         #[cfg(feature = "openh264")]
         crate::config::Encoder::OpenH264 => Ok(Box::new(
             solstice_video::openh264::OpenH264Encoder::new(config)?,

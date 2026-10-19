@@ -337,6 +337,14 @@ short of the same per-endpoint `allow_insecure` exception (§4.1).
    the `unsafe` boundary thin, validate before crossing it, and consider
    running the encoder in a separate process if the threat model warrants it.
 
+   The libx264 binding is written that way. `crates/solstice-x264` is the
+   only crate in the workspace that is not `#![forbid(unsafe_code)]`: a
+   handful of calls, with a frame's plane sizes checked against the encoder's
+   geometry before any pointer crosses, and nothing read back past the length
+   x264 reports. What reaches it is pixels, not parsed input: the backend
+   chooses what x264 encodes, never how much, because the geometry is fixed
+   when the encoder opens.
+
    This is the argument that decided against an FFI binding to
    `spice-common` for the image codecs. It is worth being precise about why,
    because the conclusion is not the usual one: the C decoders *do* bound

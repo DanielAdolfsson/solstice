@@ -692,6 +692,17 @@ packet per negotiated duration.
   rather have less.
 - **`cmake` is a build requirement again**, for `opusic-sys`, in any build
   with the `audio` feature, which is on by default (`PROJECT-LAYOUT.md` §4).
+- **The tone test is intermittent.**
+  `the_reference_client_hears_the_backends_tone_in_every_layout` fails on
+  some runs with one layout's purity at 0.27–0.87 against the 0.9 bar.
+  Alternating whole runs of `real_moonlight.rs` on the development host,
+  2026-10-18, it failed 2 of 6 at `dcc6bd1`, with OpenH264, and 3 of 6 with
+  x264: the same defect at about the same rate. That host also runs a Windows
+  VM and a live Solstice, so its load was not controlled, and runs taken at
+  different times disagree by more than the two builds do. It has the shape
+  of the `Delay` defect above, smaller, in the debug build where the encoder
+  shares the runtime. Once, the reference client instead reported a failed
+  session for one layout; that has not recurred. Neither is explained.
 
 ---
 
@@ -1159,6 +1170,76 @@ stage                                  ms/frame   frames/s   core % @60
 That includes the half-second tail. In steady state the 1080p figure is 5 ×
 9.4 ms, **4.7% of a core, down from 56%**.
 
+### The encoder: libx264 replaced OpenH264
+
+Looking for skip hints, 2026-10-18, found that the encoder was the larger
+lever. All figures are 1080p, one core of the 4-vCPU development VM, encode
+only.
+
+- **OpenH264 had been built without SIMD.** `openh264-sys2` assembles its
+  SIMD with nasm and, when nasm is missing, prints one build-script line and
+  compiles the C fallback instead. Every OpenH264 figure above is C-only. With
+  nasm the unchanged frame went from 9.15 to 6.07 ms on the colour bars, and
+  from 19.1 to 5.9 ms on desktop-like content.
+- **OpenH264's scroll detection misfires on an unchanged screen.** A region
+  that has not moved matches its own position, which is reported as a scroll
+  of zero lines, and that switches on the feature-search preprocessing: a
+  hash of every 8×8 block of the reference, every frame, 54% of a still
+  frame. Treating a zero-offset match as no scroll
+  (`ScrollDetectionFuncs.cpp`, `ScrollDetectionCore`) took a still desktop
+  frame from 5.9 to 1.7 ms with identical decoded quality. Upstream has the
+  same code at v2.7.0. A second cost has no such fix: scroll detection scans
+  every row of a region looking for one with colour variety, and a flat
+  region has none. That was 52% of a still frame with a blank area, and the
+  colour bars `encode_cost.rs` uses are the worst case for it.
+- **libx264 is faster on every changed frame.** On a synthetic desktop, text
+  on white under a flat title bar, against OpenH264 with its SIMD:
+
+  | | OpenH264 | OpenH264, scroll patch | x264 `ultrafast` |
+  |---|---|---|---|
+  | Keyframe | 24.3 ms | 25.0 ms | **7.4 ms** |
+  | Still | 6.1 | **2.1** | 3.3 |
+  | Typing | 6.3 | **2.1** | 3.3 |
+  | 320×200 area changing | 8.2 | 3.9 | **3.3** |
+  | Scroll | 6.9 | 7.1 | **3.0** |
+  | Whole-screen pan | 5.1 | 5.3 | **3.8** |
+
+- **OpenH264 codes a desktop in fewer bits, and will not spend more.** At a
+  fixed QP it needs about half of `ultrafast`'s bitrate for the same PSNR:
+  1.13 against 1.97 Mbit/s at 41 dB, 1.83 against 3.93 at 53 dB. But its rate
+  control settles near 1.2 Mbit/s and 38–39 dB whatever the target, from 2
+  to 40 Mbit/s, and lowering its maximum QP changes nothing. x264 at a
+  20 Mbit/s target settles at 64 dB using 6.65 Mbit/s. On the bitrate a client
+  actually asks for, x264 gives the sharper desktop.
+- **Half a second of VBV.** x264's buffer decides what a requested keyframe
+  looks like. One frame of buffer gave a 16.5 dB IDR, a quarter of a second
+  31.4 dB, half a second 36.5 dB at 390 KB, about what OpenH264 sends
+  unconstrained.
+- **Two alternatives measured and rejected.** `rusty_h264`, a pure-Rust
+  encoder, was 4–6× slower than OpenH264 and writes `pic_order_cnt_type` 0
+  with no VUI, which strict decoders may buffer for reordering. FFmpeg drives
+  the same libx264 at the same speed and brings all of libavcodec with it; it
+  is worth that for the hardware encoders only (§8).
+
+It is `crates/solstice-x264`, the workspace's only `unsafe`, under
+`solstice-video/src/x264.rs`, and the default encoder where it is built in.
+The real-client suite runs against it, and against OpenH264 too: the headline
+`real_moonlight.rs` session streams through each in turn, and the
+`end_to_end.rs` colour-bar session has an OpenH264 twin.
+`encode_cost.rs` now measures both:
+
+```
+stage                                          ms/frame   frames/s   core % @60 mean bytes
+1920x1080 convert + x264, moving                  6.220        161         36.8        170
+1920x1080 x264, unchanged frame                   2.422        413         14.6         12
+1920x1080 x264 still, idle_fps 5                  2.474        7.9          1.9
+1920x1080 convert + openh264, moving             13.748         73         82.0        111
+1920x1080 openh264, unchanged frame               9.459        106         56.6         23
+1920x1080 openh264 still, idle_fps 5              9.539        7.9          7.5
+```
+
+The OpenH264 rows there are this build without nasm.
+
 ### What is left
 
 - **No Moonlight *application* is known to have sat through a slowed
@@ -1166,12 +1247,29 @@ That includes the half-second tail. In steady state the 1080p figure is 5 ×
   recorded whether its frame pacer and decoder saw the idle back-off, and
   those are the layers that could plausibly mind a 5 fps idle stream. If one
   does mind, raise `idle_fps`. Do not remove the back-off.
-- **A changed frame still costs a whole-frame analysis.** Typing one character
-  at 1080p is a full encode of a frame that is 99.9% unchanged. Encoder-side
-  region-of-interest or skip hints would be the next lever. OpenH264 exposes
-  neither through the crate.
+- **moonlight-qt has not been shown x264.** The reference client has, in
+  every `real_moonlight.rs` test. A session by hand is the check left.
+- **Damage hints are the next lever, and x264 takes them.**
+  `x264_image_properties_t.mb_info` marks macroblocks unchanged since the
+  last frame (`X264_MBINFO_CONSTANT`, with `analyse.b_mb_info`). Fed an exact
+  change map in the benchmark, quality unchanged at 64 dB:
+
+  | `ultrafast`, 1080p | No hint | With `mb_info` |
+  |---|---|---|
+  | Still | 3.27 ms, 8,818 B | **1.61 ms, 12 B** |
+  | Typing | 3.27 ms, 9,022 B | **1.63 ms, 218 B** |
+  | 320×200 area changing | 3.30 ms, 11.6 KB | **1.76 ms, 3.3 KB** |
+
+  It also stops x264 spending bits re-polishing what has not changed. The map
+  should come from the rectangles `convert_rect` already converts, through a
+  damage argument on `VideoEncoder::encode`: a hint that misses a change
+  leaves stale pixels on screen until that block changes again.
+- **On a link short of bandwidth OpenH264 would be the better encoder**, if
+  its rate control spent the budget. Nothing here exercises such a link.
+- **OpenH264, the fallback, keeps its defects.** The scroll patch above is
+  not carried, and it needs nasm for its SIMD.
 - **The non-reference skip slice** above would make even the keep-alive frames
-  nearly free. It is not worth the bitstream-writing risk at 4.7% of a core.
+  nearly free. It is not worth the bitstream-writing risk at 1.9% of a core.
 
 ---
 
@@ -1374,9 +1472,18 @@ against. The findings are about the old arrangement:
   first.
 - **Hardware encoders.** The `VideoEncoder` trait is the seam. VAAPI and NVENC
   arrive behind an `ffmpeg` feature. Licence-compatible, since Solstice is
-  GPL-3.0-or-later, but `deny.toml` bans `ffmpeg-sys-next` and `x264` on
+  GPL-3.0-or-later, but `deny.toml` bans `ffmpeg-sys-next` on
   dependency-weight grounds: lifting the ban should happen with the feature,
-  not before it. Not testable in hosted CI (no GPU).
+  not before it. `ffmpeg-sys-next` 9 builds against Debian's FFmpeg 7.1 with
+  only its `avcodec` feature, where `ffmpeg-next` 7.1 and 9 do not compile
+  without `format`; both are WTFPL, which the licence list would need. None
+  of it is automatic: every encoder is opened by name, finding one is not
+  being able to open it, and each needs its own setup. NVENC takes ordinary
+  frames but needs the NVIDIA driver's `libcuda.so.1` at run time; VAAPI
+  needs a device and frame pool, NV12 uploaded to the GPU, a readable
+  `/dev/dri/renderD128` and a VA driver. So the feature is a probe in a fixed
+  order with libx264 as the fallback. Not testable in hosted CI (no GPU), nor
+  on the development VM.
 - **mDNS** (`_nvstream._tcp`). Moonlight accepts a typed-in host, so this is
   convenience.
 - **Controllers, touch, pen.** Neither backend protocol has any notion of them.
