@@ -1,5 +1,7 @@
 //! The encoder seam.
 
+use solstice_backend::Rect;
+
 use crate::frame::I420Frame;
 
 /// What went wrong in the encode path.
@@ -55,6 +57,22 @@ impl Default for EncoderConfig {
     }
 }
 
+/// What changed in a frame since the previous one given to the encoder.
+///
+/// An encoder may trust this and code everything outside the damage as
+/// unchanged, so it must be a superset of what changed. The pipeline's comes
+/// from the rectangles it converted, which is exactly what changed in the
+/// frame; when it cannot say, it says [`FrameDamage::Unknown`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameDamage {
+    /// No claim.
+    Unknown,
+    /// Nothing changed: a repeat of the previous frame.
+    Nothing,
+    /// Nothing changed outside this rectangle.
+    Within(Rect),
+}
+
 /// One encoded access unit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EncodedFrame {
@@ -77,6 +95,18 @@ pub trait VideoEncoder: Send {
 
     /// Encode one frame.
     fn encode(&mut self, frame: &I420Frame, force_idr: bool) -> Result<EncodedFrame, VideoError>;
+
+    /// Encode one frame, told what changed since the last. An encoder that can
+    /// skip what did not change does so; the default ignores `damage`.
+    fn encode_with_damage(
+        &mut self,
+        frame: &I420Frame,
+        force_idr: bool,
+        damage: FrameDamage,
+    ) -> Result<EncodedFrame, VideoError> {
+        let _ = damage;
+        self.encode(frame, force_idr)
+    }
 
     /// The geometry this encoder was built for.
     fn dimensions(&self) -> (u32, u32);

@@ -1240,6 +1240,54 @@ stage                                          ms/frame   frames/s   core % @60 
 
 The OpenH264 rows there are this build without nasm.
 
+### Damage hints: x264 skips what did not change
+
+The question this section ended on, skip hints, has an answer in x264.
+`x264_image_properties_t.mb_info` marks macroblocks unchanged since the last
+frame (`X264_MBINFO_CONSTANT`, with `analyse.b_mb_info`), and x264 stops
+analysing them. The pipeline already knows: the rectangle it converts into the
+I420 frame is exactly what changed in it. So `VideoEncoder::encode_with_damage`
+takes a `FrameDamage` — `Nothing` for a keep-alive repeat, `Within(rect)` for
+what was converted, `Unknown` for a letterboxed or fully re-converted frame —
+and `solstice-x264` rounds the rectangle out to whole macroblocks. OpenH264
+ignores it. On the desktop sequence, damage as the bounding box of what
+changed, `ultrafast` at 1080p:
+
+| | No hint | Hinted |
+|---|---|---|
+| Still | 3.24 ms, 8,601 B | **1.63 ms, 12 B** |
+| Typing | 3.24 ms, 8,804 B | **1.62 ms, 217 B** |
+| 320×200 area changing | 3.30 ms, 11.4 KB | **1.73 ms, 3.3 KB** |
+| Scroll, pan | 2.9, 3.8 ms | 2.9, 3.7 ms |
+| Whole sequence | 5.99 Mbit/s, 3.24 ms | **3.37 Mbit/s, 2.01 ms** |
+
+PSNR is within 0.4 dB of the unhinted run in every phase, 64.6 against 64.7
+mean and 55.7 worst over the sequence. The bits saved are the ones x264
+spent re-polishing a static screen.
+
+The obvious worry is that a hinted block is frozen at whatever quality it was
+last coded at: a starved keyframe, or the end of a pan, would stay soft until
+that block changed again. It is not. A hinted still screen sharpened after a
+keyframe as an unhinted one did, at 20 Mbit/s (36.5 dB at the IDR, 59.2
+mean over the next two seconds against 58.8) and at 5 (21.7 dB, 37.2
+against 37.4), and at 5 after the pan too (54.2 against 54.4). A settling delay
+before a block is hinted was built and measured, and only cost bytes. x264
+evidently keeps refining a hinted block that is below what it would code now;
+`a_hinted_still_screen_sharpens_after_a_keyframe` holds it to that, so a
+libx264 that changes this fails a test.
+
+The hint is trusted, though. A change outside the damage stays off the screen
+(`a_damage_hint_is_trusted`), so the damage must cover everything that
+changed. It does by construction: the pipeline converts only the damaged
+rectangle into the frame x264 reads, so a change the backend never reported
+was never in that frame either. `encode_cost.rs`, 1080p:
+
+```
+1920x1080 x264, unchanged frame                   2.250        444         13.6         12
+1920x1080 x264, unchanged, told so                1.414        707          8.4         12
+1920x1080 x264 still, idle_fps 5                  1.412        7.9          1.1
+```
+
 ### What is left
 
 - **No Moonlight *application* is known to have sat through a slowed
@@ -1249,27 +1297,17 @@ The OpenH264 rows there are this build without nasm.
   does mind, raise `idle_fps`. Do not remove the back-off.
 - **moonlight-qt has not been shown x264.** The reference client has, in
   every `real_moonlight.rs` test. A session by hand is the check left.
-- **Damage hints are the next lever, and x264 takes them.**
-  `x264_image_properties_t.mb_info` marks macroblocks unchanged since the
-  last frame (`X264_MBINFO_CONSTANT`, with `analyse.b_mb_info`). Fed an exact
-  change map in the benchmark, quality unchanged at 64 dB:
-
-  | `ultrafast`, 1080p | No hint | With `mb_info` |
-  |---|---|---|
-  | Still | 3.27 ms, 8,818 B | **1.61 ms, 12 B** |
-  | Typing | 3.27 ms, 9,022 B | **1.63 ms, 218 B** |
-  | 320×200 area changing | 3.30 ms, 11.6 KB | **1.76 ms, 3.3 KB** |
-
-  It also stops x264 spending bits re-polishing what has not changed. The map
-  should come from the rectangles `convert_rect` already converts, through a
-  damage argument on `VideoEncoder::encode`: a hint that misses a change
-  leaves stale pixels on screen until that block changes again.
 - **On a link short of bandwidth OpenH264 would be the better encoder**, if
   its rate control spent the budget. Nothing here exercises such a link.
 - **OpenH264, the fallback, keeps its defects.** The scroll patch above is
   not carried, and it needs nasm for its SIMD.
 - **The non-reference skip slice** above would make even the keep-alive frames
-  nearly free. It is not worth the bitstream-writing risk at 1.9% of a core.
+  nearly free. It is not worth the bitstream-writing risk at 1.1% of a core.
+- **The damage is one rectangle per frame.** The clock unions everything
+  since the last tick, so two small changes in opposite corners mark the
+  whole span between them as changed. A list of rectangles would hint more;
+  the union is never less than what changed, which is the property that
+  matters.
 
 ---
 

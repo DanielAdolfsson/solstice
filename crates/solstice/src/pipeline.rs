@@ -20,7 +20,7 @@ use solstice_backend::{BackendEvent, Session};
 use solstice_gamestream::stream::video_tx::{VideoConfig, VideoPacketizer};
 use solstice_gamestream::wire::video::FrameType;
 use solstice_video::convert::{convert_full, convert_rect, convert_scaled};
-use solstice_video::encoder::{EncoderConfig, VideoEncoder};
+use solstice_video::encoder::{EncoderConfig, FrameDamage, VideoEncoder};
 use solstice_video::{FrameClock, I420Frame};
 use tokio::sync::mpsc;
 
@@ -104,23 +104,34 @@ pub async fn run(
             // conversion can cost as much as the encode.
             let started = Instant::now();
             // Convert only what changed, unless the geometries disagree -- a
-            // scaled frame has no one-to-one rectangle mapping.
-            if let Some(rect) = tick.damage {
-                let fb = framebuffer.read();
-                if scaling {
-                    convert_scaled(&fb, &mut frame);
-                } else if !convert_rect(&fb, rect, &mut frame) {
-                    // The damage rectangle no longer fits -- a resize raced us.
-                    convert_full(&fb, &mut frame);
+            // scaled frame has no one-to-one rectangle mapping. What was
+            // converted is exactly what changed in the frame, so it is also
+            // what the encoder is told: x264 skips the rest (§6). Converting
+            // rounds out to even pixels for the chroma, which stays inside the
+            // whole macroblocks the encoder rounds to.
+            let damage = match tick.damage {
+                None => FrameDamage::Nothing,
+                Some(rect) => {
+                    let fb = framebuffer.read();
+                    if scaling {
+                        convert_scaled(&fb, &mut frame);
+                        FrameDamage::Unknown
+                    } else if convert_rect(&fb, rect, &mut frame) {
+                        FrameDamage::Within(rect)
+                    } else {
+                        // The damage rectangle no longer fits -- a resize raced us.
+                        convert_full(&fb, &mut frame);
+                        FrameDamage::Unknown
+                    }
                 }
-            }
+            };
 
             let frame_type = if tick.force_idr {
                 FrameType::Idr
             } else {
                 FrameType::P
             };
-            let encoded = match encoder.encode(&frame, tick.force_idr) {
+            let encoded = match encoder.encode_with_damage(&frame, tick.force_idr, damage) {
                 Ok(encoded) => encoded,
                 Err(e) => {
                     tracing::error!(error = %e, "encode failed");
@@ -448,6 +459,132 @@ mod tests {
             Ok(())
         }
         async fn close(&self) {}
+    }
+
+    /// An encoder that records the damage it is told, and otherwise is the
+    /// null encoder.
+    struct Recording {
+        inner: Box<dyn VideoEncoder>,
+        told: std::sync::Arc<std::sync::Mutex<Vec<FrameDamage>>>,
+    }
+
+    impl VideoEncoder for Recording {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+        fn encode(
+            &mut self,
+            frame: &I420Frame,
+            force_idr: bool,
+        ) -> Result<solstice_video::EncodedFrame, solstice_video::VideoError> {
+            self.encode_with_damage(frame, force_idr, FrameDamage::Unknown)
+        }
+        fn encode_with_damage(
+            &mut self,
+            frame: &I420Frame,
+            force_idr: bool,
+            damage: FrameDamage,
+        ) -> Result<solstice_video::EncodedFrame, solstice_video::VideoError> {
+            self.told.lock().unwrap().push(damage);
+            self.inner.encode(frame, force_idr)
+        }
+        fn dimensions(&self) -> (u32, u32) {
+            self.inner.dimensions()
+        }
+    }
+
+    /// Run a still 320x240 session into an encoder of `encoder_size`, damage
+    /// `rect` once the clock is running, and return what the encoder was told.
+    async fn damage_told_for(
+        encoder_size: (u32, u32),
+        rect: solstice_backend::Rect,
+    ) -> Vec<FrameDamage> {
+        let (events, _) = tokio::sync::broadcast::channel(16);
+        let session = StillSession {
+            fb: solstice_backend::FramebufferHandle::with_size(320, 240),
+            events: events.clone(),
+        };
+        let (width, height) = encoder_size;
+        let told = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let encoder = Box::new(Recording {
+            inner: build_encoder(
+                crate::config::Encoder::Null,
+                EncoderConfig {
+                    width,
+                    height,
+                    fps: 60,
+                    bitrate_kbps: 4000,
+                    slices_per_frame: 1,
+                },
+            )
+            .unwrap(),
+            told: told.clone(),
+        });
+        let config = PipelineConfig {
+            width,
+            height,
+            ..pipeline_config()
+        };
+        let (tx, mut rx) = mpsc::channel(256);
+        let (_idr_tx, idr_rx) = mpsc::channel(4);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let session = session;
+            run(&session, config, encoder, None, tx, idr_rx, stop_rx).await
+        });
+        count_frames(&mut rx, Duration::from_millis(100)).await;
+        events.send(BackendEvent::Damage(rect)).unwrap();
+        count_frames(&mut rx, Duration::from_millis(100)).await;
+        let _ = stop_tx.send(());
+        assert_eq!(handle.await.unwrap(), PipelineExit::Stopped);
+        let told = told.lock().unwrap().clone();
+        told
+    }
+
+    /// The encoder is told what was converted, and that a repeat is a repeat.
+    #[tokio::test]
+    async fn the_encoder_is_told_what_changed() {
+        let rect = solstice_backend::Rect {
+            x: 17,
+            y: 33,
+            width: 40,
+            height: 8,
+        };
+        let told = damage_told_for((320, 240), rect).await;
+        assert_eq!(
+            told.iter()
+                .filter(|d| **d == FrameDamage::Within(rect))
+                .count(),
+            1,
+            "{told:?}"
+        );
+        assert!(
+            told.iter()
+                .all(|d| matches!(d, FrameDamage::Nothing | FrameDamage::Within(_))),
+            "{told:?}"
+        );
+        assert!(
+            told.iter().filter(|d| **d == FrameDamage::Nothing).count() > 5,
+            "{told:?}"
+        );
+    }
+
+    /// A letterboxed frame has no one-to-one mapping from the backend's
+    /// rectangles, so nothing is claimed about it.
+    #[tokio::test]
+    async fn a_scaled_frame_claims_nothing() {
+        let rect = solstice_backend::Rect {
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 16,
+        };
+        let told = damage_told_for((640, 480), rect).await;
+        assert!(told.contains(&FrameDamage::Unknown), "{told:?}");
+        assert!(
+            !told.iter().any(|d| matches!(d, FrameDamage::Within(_))),
+            "{told:?}"
+        );
     }
 
     /// Frames that arrive within `window`.

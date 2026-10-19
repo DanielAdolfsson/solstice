@@ -11,7 +11,7 @@
 //! compared against `solstice-vnc`'s `encoding_bench`, which measures the
 //! first. Optimising the cheap stage is not optimising.
 //!
-//! The last two rows per resolution are per second of a still session rather
+//! The last two rows per encoder are per second of a still session rather
 //! than per frame: `frames/s` is how many frames the clock emitted, and
 //! `core %` is what they cost, at the stream's rate and at the keep-alive
 //! rate (`docs/roadmap.md` §6).
@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use solstice_backend::{Framebuffer, Rect};
 use solstice_video::convert::{convert_full, convert_rect};
-use solstice_video::encoder::{EncoderConfig, VideoEncoder};
+use solstice_video::encoder::{EncoderConfig, FrameDamage, VideoEncoder};
 use solstice_video::testsrc::TestPattern;
 use solstice_video::{FrameClock, I420Frame};
 
@@ -133,6 +133,25 @@ fn what_the_encode_path_costs() {
                 Some(still as f64 / FRAMES as f64),
             );
 
+            // The same, told so, as the pipeline tells it.
+            let mut still = 0usize;
+            let cpu0 = cpu_seconds();
+            let t0 = Instant::now();
+            for _ in 0..FRAMES {
+                still += encoder
+                    .encode_with_damage(&frame, false, FrameDamage::Nothing)
+                    .unwrap()
+                    .data
+                    .len();
+            }
+            report(
+                &format!("{w}x{h} {name}, unchanged, told so"),
+                t0,
+                cpu0,
+                FRAMES,
+                Some(still as f64 / FRAMES as f64),
+            );
+
             // What a still screen costs per second of session, with the frame
             // clock deciding how many of those unchanged frames there are.
             for idle_fps in [60, 5] {
@@ -140,7 +159,9 @@ fn what_the_encode_path_costs() {
                 let cpu0 = cpu_seconds();
                 let t0 = Instant::now();
                 for_each_still_tick(idle_fps, SESSION, || {
-                    encoder.encode(&frame, false).unwrap();
+                    encoder
+                        .encode_with_damage(&frame, false, FrameDamage::Nothing)
+                        .unwrap();
                     encodes += 1;
                 });
                 report_session(

@@ -12,9 +12,11 @@
 //! The FFI lives in `solstice-x264`, which owns the workspace's only `unsafe`.
 //! This module is the policy: preset, threads, and the geometry check.
 
-use solstice_x264::{Encoder, Settings};
+use solstice_x264::{Change, Encoder, Settings};
 
-use crate::encoder::{contains_idr, EncodedFrame, EncoderConfig, VideoEncoder, VideoError};
+use crate::encoder::{
+    contains_idr, EncodedFrame, EncoderConfig, FrameDamage, VideoEncoder, VideoError,
+};
 use crate::frame::I420Frame;
 
 /// The fastest preset. It codes Constrained Baseline: no CABAC, no B-frames,
@@ -71,6 +73,19 @@ impl VideoEncoder for X264Encoder {
     }
 
     fn encode(&mut self, frame: &I420Frame, force_idr: bool) -> Result<EncodedFrame, VideoError> {
+        self.encode_with_damage(frame, force_idr, FrameDamage::Unknown)
+    }
+
+    /// x264 skips the macroblocks `damage` says are unchanged instead of
+    /// analysing them: at 1080p a still or typing frame in half the time, and
+    /// a few bytes where it would re-polish a static screen
+    /// (`docs/roadmap.md` §6).
+    fn encode_with_damage(
+        &mut self,
+        frame: &I420Frame,
+        force_idr: bool,
+        damage: FrameDamage,
+    ) -> Result<EncodedFrame, VideoError> {
         if frame.width() != self.config.width as usize
             || frame.height() != self.config.height as usize
         {
@@ -83,7 +98,7 @@ impl VideoEncoder for X264Encoder {
         }
         let out = self
             .encoder
-            .encode(frame.y(), frame.u(), frame.v(), force_idr)
+            .encode(frame.y(), frame.u(), frame.v(), force_idr, change(damage))
             .map_err(|e| VideoError::Encode(e.to_string()))?;
         // Read out of the bitstream, as for OpenH264, rather than trusting the
         // flag: the client decides whether it can start decoding on this.
@@ -96,6 +111,19 @@ impl VideoEncoder for X264Encoder {
 
     fn dimensions(&self) -> (u32, u32) {
         (self.config.width, self.config.height)
+    }
+}
+
+fn change(damage: FrameDamage) -> Change {
+    match damage {
+        FrameDamage::Unknown => Change::Unknown,
+        FrameDamage::Nothing => Change::Nothing,
+        FrameDamage::Within(r) => Change::Within {
+            x: r.x,
+            y: r.y,
+            width: r.width,
+            height: r.height,
+        },
     }
 }
 
@@ -302,6 +330,185 @@ mod tests {
             let slices = nal_types(&out.data).filter(|t| matches!(t, 1 | 5)).count();
             assert_eq!(slices, 4, "frame {i}");
         }
+    }
+
+    /// A 320x240 frame of fine detail, which is what makes skipping matter:
+    /// flat grey costs x264 nothing to analyse anyway.
+    fn detailed() -> Framebuffer {
+        let mut fb = Framebuffer::new(320, 240);
+        let mut seed = 0x9E37_79B9u32;
+        for px in fb.data_mut().chunks_exact_mut(4) {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let v = (seed >> 24) as u8;
+            px.copy_from_slice(&[v, v / 2 + 64, 255 - v, 255]);
+        }
+        fb
+    }
+
+    /// Luma PSNR of what the decoder made of `annex_b` against `source`.
+    fn decoded_psnr(
+        decoder: &mut ::openh264::decoder::Decoder,
+        annex_b: &[u8],
+        source: &I420Frame,
+    ) -> f64 {
+        use ::openh264::formats::YUVSource;
+        let picture = decoder.decode(annex_b).unwrap().expect("no picture");
+        let (stride, _, _) = picture.strides();
+        let w = source.width();
+        let se: f64 = (0..source.height())
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let e = f64::from(picture.y()[y * stride + x]) - f64::from(source.y()[y * w + x]);
+                e * e
+            })
+            .sum();
+        let mse = se / (w * source.height()) as f64;
+        if mse == 0.0 {
+            99.0
+        } else {
+            10.0 * (255.0f64 * 255.0 / mse).log10()
+        }
+    }
+
+    /// The decoder's luma plane for `annex_b`, tightly packed.
+    fn decoded_luma(decoder: &mut ::openh264::decoder::Decoder, annex_b: &[u8]) -> Vec<u8> {
+        use ::openh264::formats::YUVSource;
+        let picture = decoder.decode(annex_b).unwrap().expect("no picture");
+        let (stride, _, _) = picture.strides();
+        let (w, h) = picture.dimensions();
+        (0..h)
+            .flat_map(|y| picture.y()[y * stride..y * stride + w].to_vec())
+            .collect()
+    }
+
+    /// The mean of a 320-wide luma plane inside `r`.
+    fn mean_in(luma: &[u8], r: Rect) -> f64 {
+        let sum: u32 = (r.y..r.y + r.height)
+            .flat_map(|y| (r.x..r.x + r.width).map(move |x| (x, y)))
+            .map(|(x, y)| u32::from(luma[(y * 320 + x) as usize]))
+            .sum();
+        f64::from(sum) / f64::from(r.width * r.height)
+    }
+
+    /// Every change the damage covers reaches the picture, however little of
+    /// the frame it is.
+    #[test]
+    fn damage_hints_lose_no_change() {
+        let mut fb = detailed();
+        let mut frame = I420Frame::new(320, 240);
+        convert_full(&fb, &mut frame);
+        let mut e = X264Encoder::new(config()).unwrap();
+        let mut decoder = ::openh264::decoder::Decoder::new().unwrap();
+        let first = e.encode(&frame, false).unwrap();
+        decoder.decode(&first.data).unwrap();
+        for i in 0..40u32 {
+            let rect = Rect {
+                x: (i * 23) % 300,
+                y: (i * 37) % 228,
+                width: 20,
+                height: 12,
+            };
+            let v = (i * 61 % 200) as u8 + 40;
+            fb.fill(rect, [v, v, v, 255]);
+            crate::convert::convert_rect(&fb, rect, &mut frame);
+            let out = e
+                .encode_with_damage(&frame, false, FrameDamage::Within(rect))
+                .unwrap();
+            let psnr = decoded_psnr(&mut decoder, &out.data, &frame);
+            // A missed rectangle is a 240-pixel block of the wrong colour,
+            // far below this.
+            assert!(psnr > 30.0, "frame {i}: {psnr:.1} dB");
+        }
+    }
+
+    /// x264 believes the hint: a change outside the damage stays off the
+    /// screen. This is why the damage must cover everything that changed.
+    #[test]
+    fn a_damage_hint_is_trusted() {
+        let mut fb = Framebuffer::new(320, 240);
+        fb.fill(Rect::whole(320, 240), [0, 0, 0, 255]);
+        let mut frame = I420Frame::new(320, 240);
+        convert_full(&fb, &mut frame);
+        let mut e = X264Encoder::new(config()).unwrap();
+        let mut decoder = ::openh264::decoder::Decoder::new().unwrap();
+        for _ in 0..10 {
+            let out = e
+                .encode_with_damage(&frame, false, FrameDamage::Nothing)
+                .unwrap();
+            decoder.decode(&out.data).unwrap();
+        }
+        let told = Rect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+        };
+        let untold = Rect {
+            x: 192,
+            y: 128,
+            width: 64,
+            height: 64,
+        };
+        fb.fill(told, [255, 255, 255, 255]);
+        fb.fill(untold, [255, 255, 255, 255]);
+        convert_full(&fb, &mut frame);
+        let out = e
+            .encode_with_damage(&frame, false, FrameDamage::Within(told))
+            .unwrap();
+        let luma = decoded_luma(&mut decoder, &out.data);
+        // Studio swing: white is 235, black 16.
+        let (told, untold) = (mean_in(&luma, told), mean_in(&luma, untold));
+        assert!(
+            told > 200.0,
+            "the change it was told of is missing: {told:.0}"
+        );
+        assert!(
+            untold < 40.0,
+            "x264 coded a change it was told had not happened: {untold:.0}"
+        );
+    }
+
+    /// A requested keyframe at a starved bitrate is soft, and an unchanged
+    /// screen after it must still sharpen with hints, as it does without.
+    #[test]
+    fn a_hinted_still_screen_sharpens_after_a_keyframe() {
+        let fb = detailed();
+        let mut frame = I420Frame::new(320, 240);
+        convert_full(&fb, &mut frame);
+        let starved = EncoderConfig {
+            bitrate_kbps: 300,
+            ..config()
+        };
+        let mut finals = Vec::new();
+        for hinted in [false, true] {
+            let mut e = X264Encoder::new(starved).unwrap();
+            let mut decoder = ::openh264::decoder::Decoder::new().unwrap();
+            let damage = if hinted {
+                FrameDamage::Nothing
+            } else {
+                FrameDamage::Unknown
+            };
+            let first = e.encode(&frame, true).unwrap();
+            let keyframe = decoded_psnr(&mut decoder, &first.data, &frame);
+            let mut last = keyframe;
+            for _ in 0..90 {
+                let out = e.encode_with_damage(&frame, false, damage).unwrap();
+                last = decoded_psnr(&mut decoder, &out.data, &frame);
+            }
+            assert!(
+                last > keyframe + 3.0,
+                "hinted={hinted}: {keyframe:.1} dB at the keyframe, {last:.1} dB after"
+            );
+            finals.push(last);
+        }
+        assert!(
+            finals[1] > finals[0] - 1.0,
+            "hinted {:.1} dB against unhinted {:.1} dB",
+            finals[1],
+            finals[0]
+        );
     }
 
     #[test]
